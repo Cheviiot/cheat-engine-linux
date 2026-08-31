@@ -184,10 +184,38 @@ fn build_window(application: &adw::Application) {
 
     let header = adw::HeaderBar::new();
     let window_title = adw::WindowTitle::builder()
-        .title("Engine UI")
-        .subtitle(format!("libcecore {core_version} · GTK development build"))
+        .title("LCH")
+        .subtitle(format!("Memory scanner · libcecore {core_version}"))
         .build();
     header.set_title_widget(Some(&window_title));
+
+    let main_menu_model = gtk::gio::Menu::new();
+    let file_menu = gtk::gio::Menu::new();
+    file_menu.append(Some("Open table…"), Some("main.open-table"));
+    file_menu.append(Some("Save table…"), Some("main.save-table"));
+    file_menu.append(Some("Quit"), Some("main.quit"));
+    main_menu_model.append_submenu(Some("File"), &file_menu);
+
+    let process_menu = gtk::gio::Menu::new();
+    process_menu.append(Some("Open process…"), Some("main.open-process"));
+    process_menu.append(Some("Attach / Detach"), Some("main.toggle-session"));
+    main_menu_model.append_submenu(Some("Process"), &process_menu);
+
+    let table_menu = gtk::gio::Menu::new();
+    table_menu.append(Some("Add address…"), Some("main.add-address"));
+    table_menu.append(Some("New group"), Some("main.add-group"));
+    main_menu_model.append_submenu(Some("Table"), &table_menu);
+
+    let tools_menu = gtk::gio::Menu::new();
+    tools_menu.append(Some("Memory View"), Some("main.memory-view"));
+    tools_menu.append(Some("Lua Console"), Some("main.lua-console"));
+    main_menu_model.append_submenu(Some("Tools"), &tools_menu);
+
+    let help_menu = gtk::gio::Menu::new();
+    help_menu.append(Some("About this build"), Some("main.about"));
+    main_menu_model.append_submenu(Some("Help"), &help_menu);
+    let main_menu_bar = gtk::PopoverMenuBar::from_model(Some(&main_menu_model));
+    let main_action_group = gtk::gio::SimpleActionGroup::new();
     let lua_console_button = gtk::Button::builder()
         .label("Lua Console")
         .icon_name("utilities-terminal-symbolic")
@@ -204,23 +232,21 @@ fn build_window(application: &adw::Application) {
 
     let session_details = gtk::Label::builder()
         .label("Choose a running process to begin.")
-        .wrap(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .xalign(0.0)
         .selectable(true)
         .css_classes(["dim-label"])
         .build();
 
     let process_button = gtk::Button::builder()
-        .label("Open process")
         .icon_name("system-search-symbolic")
         .tooltip_text("Choose a running process")
-        .css_classes(["pill"])
         .halign(Align::Start)
         .build();
 
     let session_button = gtk::Button::builder()
         .label("Attach")
-        .css_classes(["suggested-action", "pill"])
+        .css_classes(["suggested-action"])
         .sensitive(false)
         .halign(Align::Start)
         .build();
@@ -236,11 +262,11 @@ fn build_window(application: &adw::Application) {
 
     let session_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(10)
-        .margin_bottom(10)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(8)
+        .margin_top(5)
+        .margin_bottom(5)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     session_actions.append(&process_button);
     session_actions.append(&process_identity);
@@ -292,7 +318,8 @@ fn build_window(application: &adw::Application) {
 
     let scan_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
+        .spacing(6)
+        .homogeneous(true)
         .build();
     scan_actions.append(&first_scan_button);
     scan_actions.append(&next_scan_button);
@@ -411,7 +438,7 @@ fn build_window(application: &adw::Application) {
         .build();
 
     let page_label = gtk::Label::builder()
-        .label("No results")
+        .label("Found: 0")
         .xalign(0.0)
         .hexpand(true)
         .css_classes(["dim-label"])
@@ -419,45 +446,32 @@ fn build_window(application: &adw::Application) {
 
     let memory_view_button = gtk::Button::builder()
         .label("Memory View")
-        .icon_name("document-properties-symbolic")
         .tooltip_text("Open the disassembler and hex dump")
         .sensitive(false)
         .build();
 
-    let address_title = gtk::Label::builder()
-        .label("Address list")
-        .css_classes(["title-3"])
-        .halign(Align::Start)
-        .hexpand(true)
-        .build();
     let add_address_button = gtk::Button::builder()
-        .label("Add manually")
-        .icon_name("list-add-symbolic")
+        .label("Add Address")
         .css_classes(["flat"])
         .build();
     let open_table_button = gtk::Button::builder()
         .label("Open")
-        .icon_name("document-open-symbolic")
         .css_classes(["flat"])
         .tooltip_text("Open a cheat table")
         .build();
     let save_table_button = gtk::Button::builder()
         .label("Save")
-        .icon_name("document-save-symbolic")
         .css_classes(["flat"])
         .tooltip_text("Save the current cheat table")
         .build();
     let address_header = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
+        .spacing(6)
         .build();
-    address_header.append(&address_title);
+    address_header.set_hexpand(true);
     address_header.append(&open_table_button);
     address_header.append(&save_table_button);
-    let add_group_button = gtk::Button::builder()
-        .label("New group")
-        .icon_name("folder-new-symbolic")
-        .build();
+    let add_group_button = gtk::Button::builder().label("New group").build();
     let group_selected_button = gtk::Button::builder()
         .label("Group selected")
         .sensitive(false)
@@ -475,7 +489,7 @@ fn build_window(application: &adw::Application) {
         .build();
     let address_structure_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
+        .spacing(6)
         .build();
     address_structure_actions.append(&add_group_button);
     address_structure_actions.append(&group_selected_button);
@@ -483,8 +497,9 @@ fn build_window(application: &adw::Application) {
     address_structure_actions.append(&script_trust_button);
     let address_summary = gtk::Label::builder()
         .label("Add scan results here to edit or freeze their live values.")
-        .wrap(true)
         .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["dim-label"])
         .build();
     let address_list_model =
@@ -504,7 +519,12 @@ fn build_window(application: &adw::Application) {
     // Keep Cheat Engine's proven information architecture while using native
     // GTK/libadwaita widgets: process across the top, found addresses beside a
     // fixed-width scan panel, and the cheat table across the full lower pane.
-    let process_frame = gtk::Frame::builder().child(&session_actions).build();
+    let process_bar = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .build();
+    process_bar.append(&session_actions);
+    process_bar.append(&gtk::Separator::new(Orientation::Horizontal));
 
     let result_columns = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -527,26 +547,24 @@ fn build_window(application: &adw::Application) {
         .spacing(8)
         .margin_top(6)
         .build();
-    results_footer.append(&page_label);
+    results_footer.append(&gtk::Box::builder().hexpand(true).build());
     results_footer.append(&memory_view_button);
     results_footer.append(&add_address_button);
 
     let results_panel = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(8)
-        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
         .build();
+    results_panel.append(&page_label);
     results_panel.append(&result_columns);
     results_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     results_panel.append(&scan_results_scrolled);
     results_panel.append(&results_footer);
-    let results_frame = gtk::Frame::builder()
-        .label("Found addresses")
-        .child(&results_panel)
-        .build();
+    let results_frame = gtk::Frame::builder().child(&results_panel).build();
 
     let scan_form = gtk::Grid::builder()
         .column_spacing(8)
@@ -558,11 +576,11 @@ fn build_window(application: &adw::Application) {
 
     let scan_controls = gtk::Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(10)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
         .build();
     scan_controls.append(&scan_actions);
     scan_controls.append(&scan_form);
@@ -574,10 +592,7 @@ fn build_window(application: &adw::Application) {
         .min_content_width(330)
         .child(&scan_controls)
         .build();
-    let scan_controls_frame = gtk::Frame::builder()
-        .label("Scan controls")
-        .child(&scan_controls_scrolled)
-        .build();
+    let scan_controls_frame = gtk::Frame::builder().child(&scan_controls_scrolled).build();
 
     let top_paned = gtk::Paned::new(Orientation::Horizontal);
     top_paned.set_wide_handle(true);
@@ -608,26 +623,27 @@ fn build_window(application: &adw::Application) {
     address_columns.append(&compact_column_header("Actions", 12, false));
 
     let address_toolbar = gtk::Box::builder()
-        .orientation(Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
-        .margin_bottom(6)
-        .margin_start(8)
-        .margin_end(8)
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     address_toolbar.append(&address_header);
     address_toolbar.append(&address_structure_actions);
+    address_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     address_toolbar.append(&address_summary);
 
     let address_panel = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
         .build();
-    address_panel.append(&address_toolbar);
-    address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     address_panel.append(&address_columns);
     address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     address_panel.append(&address_list_scrolled);
+    address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
+    address_panel.append(&address_toolbar);
     let address_frame = gtk::Frame::builder().child(&address_panel).build();
 
     let workspace_paned = gtk::Paned::new(Orientation::Vertical);
@@ -642,17 +658,21 @@ fn build_window(application: &adw::Application) {
 
     let content = gtk::Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(8)
-        .margin_end(8)
+        .spacing(4)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
         .build();
-    content.append(&process_frame);
+    content.append(&process_bar);
     content.append(&workspace_paned);
 
     MAIN_LAYOUT_SMOKE_OK.store(
-        top_paned.orientation() == Orientation::Horizontal
+        main_menu_model.n_items() == 5
+            && process_bar.last_child().is_some()
+            && memory_view_button.label().as_deref() == Some("Memory View")
+            && add_address_button.label().as_deref() == Some("Add Address")
+            && top_paned.orientation() == Orientation::Horizontal
             && top_paned.start_child().is_some()
             && top_paned.end_child().is_some()
             && workspace_paned.orientation() == Orientation::Vertical
@@ -663,15 +683,40 @@ fn build_window(application: &adw::Application) {
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
+    toolbar_view.add_top_bar(&main_menu_bar);
     toolbar_view.set_content(Some(&content));
 
     let window = adw::ApplicationWindow::builder()
         .application(application)
-        .title("Engine UI — development preview")
+        .title("LCH — Memory Scanner")
         .default_width(1100)
         .default_height(760)
         .content(&toolbar_view)
         .build();
+    window.insert_action_group("main", Some(&main_action_group));
+
+    add_main_button_action(&main_action_group, "open-table", &open_table_button);
+    add_main_button_action(&main_action_group, "save-table", &save_table_button);
+    add_main_action(&main_action_group, "quit", {
+        let window = window.clone();
+        move || window.close()
+    });
+    add_main_button_action(&main_action_group, "open-process", &process_button);
+    add_main_button_action(&main_action_group, "toggle-session", &session_button);
+    add_main_button_action(&main_action_group, "add-address", &add_address_button);
+    add_main_button_action(&main_action_group, "add-group", &add_group_button);
+    add_main_button_action(&main_action_group, "memory-view", &memory_view_button);
+    add_main_button_action(&main_action_group, "lua-console", &lua_console_button);
+    add_main_action(&main_action_group, "about", {
+        let window = window.clone();
+        move || {
+            show_message(
+                &window,
+                "LCH GTK development build",
+                "A native GTK4/libadwaita rewrite using the shared libcecore engine.",
+            )
+        }
+    });
 
     let widgets = SessionWidgets {
         selected_process,
@@ -1196,7 +1241,7 @@ fn session_description(session: &Session) -> String {
         session.summary, session.endianness, session.yama_scope
     )];
     lines.extend(session.notes.iter().map(|note| format!("• {note}")));
-    lines.join("\n")
+    lines.join(" · ")
 }
 
 fn start_scan(
@@ -1683,20 +1728,17 @@ fn show_scan_results(
         .configure(generation, total_count, loader, issue_handler);
 
     if total_count == 0 {
-        widgets.page_label.set_label("No results");
+        widgets.page_label.set_label("Found: 0");
         return;
     }
+    widgets
+        .page_label
+        .set_label(&format!("Found: {total_count}"));
     let displayed_count = u64::from(widgets.scan_result_model.displayed_count());
     let cache_capacity = widgets.scan_result_model.cached_row_capacity();
-    if widgets.scan_result_model.total_count() > displayed_count {
-        widgets.page_label.set_label(&format!(
-            "Virtualized first {displayed_count} of {total_count} results · pages load while scrolling · cache up to {cache_capacity} rows"
-        ));
-    } else {
-        widgets.page_label.set_label(&format!(
-            "{total_count} results · pages load while scrolling · cache up to {cache_capacity} rows"
-        ));
-    }
+    widgets.page_label.set_tooltip_text(Some(&format!(
+        "{displayed_count} virtual rows currently exposed · pages load while scrolling · cache up to {cache_capacity} rows"
+    )));
 }
 
 fn present_add_address_dialog(
@@ -4026,7 +4068,8 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
 fn reset_scan_pages(state: &SessionState, widgets: &SessionWidgets) {
     state.scan_generation.set(0);
     widgets.scan_result_model.clear();
-    widgets.page_label.set_label("No results");
+    widgets.page_label.set_label("Found: 0");
+    widgets.page_label.set_tooltip_text(None);
 }
 
 fn show_message(window: &adw::ApplicationWindow, heading: &str, body: &str) {
@@ -4036,4 +4079,27 @@ fn show_message(window: &adw::ApplicationWindow, heading: &str, body: &str) {
         .build();
     dialog.add_response("close", "Close");
     dialog.present(Some(window));
+}
+
+fn add_main_action<F>(group: &gtk::gio::SimpleActionGroup, name: &str, callback: F)
+where
+    F: Fn() + 'static,
+{
+    let action = gtk::gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| callback());
+    group.add_action(&action);
+}
+
+fn add_main_button_action(group: &gtk::gio::SimpleActionGroup, name: &str, button: &gtk::Button) {
+    let action = gtk::gio::SimpleAction::new(name, None);
+    action.set_enabled(button.is_sensitive());
+    action.connect_activate({
+        let button = button.clone();
+        move |_, _| button.emit_clicked()
+    });
+    button.connect_sensitive_notify({
+        let action = action.clone();
+        move |button| action.set_enabled(button.is_sensitive())
+    });
+    group.add_action(&action);
 }

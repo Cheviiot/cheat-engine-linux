@@ -62,6 +62,7 @@ struct Viewer {
     bookmarks: Rc<RefCell<BTreeSet<u64>>>,
     last_search: Rc<RefCell<Option<SearchPattern>>>,
     search_serial: Rc<Cell<u64>>,
+    classic_layout: bool,
 }
 
 impl Viewer {
@@ -183,6 +184,7 @@ impl Viewer {
         self.update_bookmark_button();
 
         if std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some()
+            && self.classic_layout
             && !self.bytes.borrow().is_empty()
             && !self.instructions.borrow().is_empty()
             && self.selected_instruction.get().is_some()
@@ -935,7 +937,6 @@ pub fn present(
         .build();
     let go_button = gtk::Button::builder()
         .label("Go")
-        .icon_name("go-jump-symbolic")
         .css_classes(["suggested-action"])
         .build();
     let refresh_button = gtk::Button::builder()
@@ -969,13 +970,57 @@ pub fn present(
         .popover(&bookmarks_popover)
         .build();
 
+    // Keep the original Memory Viewer's recognizable command map, but expose it
+    // through GTK4's native popover menu bar. Every visible item below is wired to
+    // the same action as its toolbar/button counterpart; this is layout parity,
+    // not a decorative compatibility shell.
+    let menu_model = gtk::gio::Menu::new();
+    let file_menu = gtk::gio::Menu::new();
+    file_menu.append(Some("Add address to table"), Some("memory.add-address"));
+    file_menu.append(Some("Close"), Some("memory.close-view"));
+    menu_model.append_submenu(Some("File"), &file_menu);
+
+    let search_menu = gtk::gio::Menu::new();
+    search_menu.append(Some("Find memory…"), Some("memory.find-memory"));
+    search_menu.append(Some("Find next"), Some("memory.find-next"));
+    search_menu.append(Some("Find previous"), Some("memory.find-previous"));
+    menu_model.append_submenu(Some("Search"), &search_menu);
+
+    let view_menu = gtk::gio::Menu::new();
+    view_menu.append(Some("Back"), Some("memory.go-back"));
+    view_menu.append(Some("Forward"), Some("memory.go-forward"));
+    view_menu.append(Some("Previous 512 bytes"), Some("memory.page-previous"));
+    view_menu.append(Some("Next 512 bytes"), Some("memory.page-next"));
+    view_menu.append(Some("Refresh"), Some("memory.refresh-view"));
+    view_menu.append(Some("Toggle bookmark"), Some("memory.toggle-bookmark"));
+    menu_model.append_submenu(Some("View"), &view_menu);
+
+    let debug_menu = gtk::gio::Menu::new();
+    debug_menu.append(Some("Follow target"), Some("memory.follow-target"));
+    debug_menu.append(
+        Some("Assemble instruction…"),
+        Some("memory.assemble-instruction"),
+    );
+    debug_menu.append(
+        Some("Replace instruction with NOPs"),
+        Some("memory.nop-instruction"),
+    );
+    menu_model.append_submenu(Some("Debug"), &debug_menu);
+
+    let tools_menu = gtk::gio::Menu::new();
+    tools_menu.append(Some("Copy instruction"), Some("memory.copy-instruction"));
+    tools_menu.append(Some("Edit memory…"), Some("memory.edit-memory"));
+    menu_model.append_submenu(Some("Tools"), &tools_menu);
+    let menu_bar = gtk::PopoverMenuBar::from_model(Some(&menu_model));
+    let action_group = gtk::gio::SimpleActionGroup::new();
+
     let navigation = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(8)
-        .margin_end(8)
+        .spacing(4)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
         .build();
     navigation.append(&back_button);
     navigation.append(&forward_button);
@@ -990,21 +1035,21 @@ pub fn present(
 
     let disassembly_header = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(10)
+        .margin_top(3)
+        .margin_bottom(3)
+        .margin_start(6)
+        .margin_end(6)
         .css_classes(["dim-label"])
         .build();
     disassembly_header.append(&column_header("Address", 20, false));
-    disassembly_header.append(&column_header("Bytes", 32, false));
+    disassembly_header.append(&column_header("Bytes", 22, false));
     let instruction_header = column_header("Instruction", 24, true);
     disassembly_header.append(&instruction_header);
 
     let disassembly = gtk::ListBox::new();
     disassembly.set_selection_mode(gtk::SelectionMode::Single);
-    disassembly.add_css_class("boxed-list");
+    disassembly.set_show_separators(true);
     let disassembly_scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vexpand(true)
@@ -1020,7 +1065,6 @@ pub fn present(
         .build();
     let follow_button = gtk::Button::builder()
         .label("Follow")
-        .icon_name("go-jump-symbolic")
         .tooltip_text("Follow the selected branch or memory operand (Enter)")
         .sensitive(false)
         .css_classes(["flat"])
@@ -1051,18 +1095,30 @@ pub fn present(
         .build();
     let instruction_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(4)
-        .margin_bottom(4)
-        .margin_start(12)
+        .spacing(4)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(6)
         .margin_end(6)
         .build();
     instruction_actions.append(&instruction_status);
-    instruction_actions.append(&follow_button);
-    instruction_actions.append(&assemble_button);
-    instruction_actions.append(&nop_button);
-    instruction_actions.append(&copy_button);
-    instruction_actions.append(&add_button);
+
+    // The source viewer has a second, debugger-oriented toolbar. Preserve that
+    // strong silhouette while using flat Adwaita buttons for the actions already
+    // backed by the Rust/C++ bridge.
+    let debug_toolbar = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .margin_top(2)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    debug_toolbar.append(&assemble_button);
+    debug_toolbar.append(&nop_button);
+    debug_toolbar.append(&follow_button);
+    debug_toolbar.append(&copy_button);
+    debug_toolbar.append(&add_button);
     let disassembly_panel = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
@@ -1072,10 +1128,7 @@ pub fn present(
     disassembly_panel.append(&disassembly_scrolled);
     disassembly_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     disassembly_panel.append(&instruction_actions);
-    let disassembly_frame = gtk::Frame::builder()
-        .label("Disassembler")
-        .child(&disassembly_panel)
-        .build();
+    let disassembly_frame = gtk::Frame::builder().child(&disassembly_panel).build();
 
     let hex_buffer = gtk::TextBuffer::new(None);
     let hex_view = gtk::TextView::builder()
@@ -1084,10 +1137,10 @@ pub fn present(
         .cursor_visible(true)
         .monospace(true)
         .wrap_mode(gtk::WrapMode::None)
-        .top_margin(8)
-        .bottom_margin(8)
-        .left_margin(12)
-        .right_margin(12)
+        .top_margin(4)
+        .bottom_margin(4)
+        .left_margin(6)
+        .right_margin(6)
         .build();
     let hex_scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1101,10 +1154,10 @@ pub fn present(
         .selectable(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["caption", "dim-label", "monospace"])
-        .margin_top(5)
-        .margin_bottom(5)
-        .margin_start(12)
-        .margin_end(12)
+        .margin_top(3)
+        .margin_bottom(3)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     let edit_button = gtk::Button::builder()
         .label("Edit")
@@ -1126,10 +1179,7 @@ pub fn present(
     hex_panel.append(&hex_scrolled);
     hex_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     hex_panel.append(&data_actions);
-    let hex_frame = gtk::Frame::builder()
-        .label("Hex dump")
-        .child(&hex_panel)
-        .build();
+    let hex_frame = gtk::Frame::builder().child(&hex_panel).build();
 
     let panes = gtk::Paned::new(Orientation::Vertical);
     panes.set_wide_handle(true);
@@ -1156,15 +1206,17 @@ pub fn present(
     let content = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
-        .margin_start(8)
-        .margin_end(8)
+        .margin_start(4)
+        .margin_end(4)
         .build();
     content.append(&navigation);
+    content.append(&debug_toolbar);
     content.append(&panes);
     content.append(&status);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&menu_bar);
     toolbar.set_content(Some(&content));
     let window = adw::Window::builder()
         .title("Memory View")
@@ -1174,6 +1226,7 @@ pub fn present(
         .default_height(720)
         .content(&toolbar)
         .build();
+    window.insert_action_group("memory", Some(&action_group));
 
     let viewer = Viewer {
         window: window.clone(),
@@ -1207,6 +1260,7 @@ pub fn present(
         bookmarks: Rc::new(RefCell::new(BTreeSet::new())),
         last_search: Rc::new(RefCell::new(None)),
         search_serial: Rc::new(Cell::new(0)),
+        classic_layout: menu_model.n_items() == 5 && debug_toolbar.first_child().is_some(),
     };
     viewer.rebuild_bookmarks();
 
@@ -1316,6 +1370,26 @@ pub fn present(
         let viewer = viewer.clone();
         move |_| viewer.inspect_hex_cursor()
     });
+
+    add_button_action(&action_group, "add-address", &add_button);
+    add_window_action(&action_group, "close-view", {
+        let window = window.clone();
+        move || window.close()
+    });
+    add_button_action(&action_group, "find-memory", &find_button);
+    add_button_action(&action_group, "find-next", &find_next_button);
+    add_button_action(&action_group, "find-previous", &find_previous_button);
+    add_button_action(&action_group, "go-back", &back_button);
+    add_button_action(&action_group, "go-forward", &forward_button);
+    add_button_action(&action_group, "page-previous", &previous_page_button);
+    add_button_action(&action_group, "page-next", &next_page_button);
+    add_button_action(&action_group, "refresh-view", &refresh_button);
+    add_button_action(&action_group, "toggle-bookmark", &bookmark_button);
+    add_button_action(&action_group, "follow-target", &follow_button);
+    add_button_action(&action_group, "assemble-instruction", &assemble_button);
+    add_button_action(&action_group, "nop-instruction", &nop_button);
+    add_button_action(&action_group, "copy-instruction", &copy_button);
+    add_button_action(&action_group, "edit-memory", &edit_button);
 
     let key_controller = gtk::EventControllerKey::new();
     key_controller.connect_key_pressed({
@@ -1491,6 +1565,29 @@ fn clear_list(list: &gtk::ListBox) {
     }
 }
 
+fn add_window_action<F>(group: &gtk::gio::SimpleActionGroup, name: &str, callback: F)
+where
+    F: Fn() + 'static,
+{
+    let action = gtk::gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| callback());
+    group.add_action(&action);
+}
+
+fn add_button_action(group: &gtk::gio::SimpleActionGroup, name: &str, button: &gtk::Button) {
+    let action = gtk::gio::SimpleAction::new(name, None);
+    action.set_enabled(button.is_sensitive());
+    action.connect_activate({
+        let button = button.clone();
+        move |_, _| button.emit_clicked()
+    });
+    button.connect_sensitive_notify({
+        let action = action.clone();
+        move |button| action.set_enabled(button.is_sensitive())
+    });
+    group.add_action(&action);
+}
+
 fn column_header(title: &str, width_chars: i32, expand: bool) -> gtk::Label {
     gtk::Label::builder()
         .label(title)
@@ -1512,8 +1609,8 @@ fn disassembly_row(address: u64, bytes: &str, mnemonic: &str, operands: &str) ->
     let bytes = gtk::Label::builder()
         .label(bytes)
         .xalign(0.0)
-        .width_chars(32)
-        .max_width_chars(32)
+        .width_chars(22)
+        .max_width_chars(22)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .tooltip_text(bytes)
         .css_classes(["monospace", "dim-label"])
@@ -1533,11 +1630,11 @@ fn disassembly_row(address: u64, bytes: &str, mnemonic: &str, operands: &str) ->
         .build();
     let row = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(4)
-        .margin_bottom(4)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(10)
+        .margin_top(1)
+        .margin_bottom(1)
+        .margin_start(6)
+        .margin_end(6)
         .valign(Align::Center)
         .build();
     row.append(&address);

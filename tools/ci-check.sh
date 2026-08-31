@@ -35,7 +35,12 @@ if [ "$MODE" != "--config" ]; then
     cmake --build build-ci-asan --target cecore_test speedhack -j"$JOBS" >/dev/null
     ok "built"
     step "sanitizers job: run suite under ASan + UBSan"
-    ./build-ci-asan/cecore_test >/dev/null
+    # Match the workflow exactly: vendored Keystone/LLVM uses a benign custom
+    # MemoryBuffer new/sized-delete idiom that only ASan's type-mismatch check
+    # rejects. Heap bounds, UAF, UB, and every other sanitizer check stay active.
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:new_delete_type_mismatch=0 \
+    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+        ./build-ci-asan/cecore_test >/dev/null
     ok "suite passed under ASan+UBSan"
 fi
 

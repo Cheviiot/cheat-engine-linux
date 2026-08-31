@@ -27,7 +27,10 @@ Completed in the foundation and first vertical slices:
   libadwaita widgets: the process bar spans the top, virtual scan results stay
   on the left, scan controls stay on the right, and the address table occupies
   the full lower pane; horizontal and vertical splitters remain user-resizable,
-  while compact column rows replace the earlier single-column prototype;
+  while compact column rows replace the earlier single-column prototype; the
+  parity pass also restores a functional File/Process/Table/Tools/Help menu,
+  removes the oversized card treatment, moves address-table actions back under
+  the lower table, and keeps LCH explicitly marked as a development codename;
 - a bounded native GTK Memory View that preserves the original two-pane mental
   model: disassembly above, a 16-byte-wide hexadecimal/ASCII dump below, address
   navigation and 512-byte paging around them; reads are capped at 4 KiB and 256
@@ -44,7 +47,10 @@ Completed in the foundation and first vertical slices:
   support bounded Keystone previews and explicit NOP replacement: preview never
   writes, a second destructive confirmation compares old/new bytes, shorter
   encodings receive NOP padding, and longer encodings warn that following bytes
-  will be overwritten before using the same verified write path;
+  will be overwritten before using the same verified write path; its parity
+  pass restores the source viewer's File/Search/View/Debug/Tools command map,
+  a separate compact action toolbar, dense table-like disassembly rows, and a
+  flat split-pane silhouette without introducing any unwired placeholder action;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -142,7 +148,8 @@ Completed in the foundation and first vertical slices:
   Lua-console, and 600-record virtual address-list smokes, Qt smoke, and core
   regression tests.
 
-The application ID and window title are explicitly development placeholders.
+The application ID and `LCH` window title are explicitly development
+placeholders.
 The scan-result view now uses a custom virtual `gio::ListModel`: GTK sees the
 complete result count up to its `u32` position limit while only requested
 256-row pages are materialized, at most eight pages remain cached, and stale
