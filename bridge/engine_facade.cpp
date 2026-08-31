@@ -47,6 +47,10 @@ constexpr std::uint32_t kDefaultMemoryViewBytes = 512;
 constexpr std::uint32_t kMaxMemoryViewBytes = 4096;
 constexpr std::uint32_t kDefaultDisassemblyRows = 128;
 constexpr std::uint32_t kMaxDisassemblyRows = 256;
+constexpr std::size_t kMaxMemoryPatternSize = 4096;
+constexpr std::uint32_t kDefaultMemorySearchPageBytes = 1u << 20;
+constexpr std::uint32_t kMaxMemorySearchPageBytes = 8u << 20;
+constexpr std::size_t kMaxMemoryWriteSize = 4096;
 constexpr std::uint32_t kMaxAddressPageSize = 256;
 constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
@@ -152,6 +156,12 @@ std::string memory_region_description(const ce::MemoryRegion& region) {
             << " · " << type;
     if (!region.path.empty()) summary << " · " << region.path;
     return summary.str();
+}
+
+std::uintptr_t memory_region_end(const ce::MemoryRegion& region) {
+    return region.size > std::numeric_limits<std::uintptr_t>::max() - region.base
+        ? std::numeric_limits<std::uintptr_t>::max()
+        : region.base + region.size;
 }
 
 AttachResult base_attach_result(std::int32_t pid, const std::string& name) {
@@ -1422,6 +1432,279 @@ MemoryViewResult EngineFacade::memory_view(std::uint64_t address,
             std::numeric_limits<std::uint64_t>::max() - result.address
         ? std::numeric_limits<std::uint64_t>::max()
         : result.address + static_cast<std::uint64_t>(bytes.size());
+    result.accepted = true;
+    return result;
+}
+
+MemorySearchResult EngineFacade::memory_search(
+        rust::Slice<const std::uint8_t> pattern,
+        rust::Slice<const std::uint8_t> mask,
+        std::uint64_t start,
+        bool backward,
+        std::uint32_t page_bytes) const {
+    MemorySearchResult result;
+    result.accepted = false;
+    result.found = false;
+    result.complete = false;
+    result.address = 0;
+    result.next_address = 0;
+    result.scanned_bytes = 0;
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!process_) {
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before searching memory.";
+        return result;
+    }
+    if (pattern.empty()) {
+        result.error_code = "empty_pattern";
+        result.error_message = "The memory search pattern cannot be empty.";
+        return result;
+    }
+    if (pattern.size() > kMaxMemoryPatternSize) {
+        result.error_code = "pattern_too_large";
+        result.error_message = "Memory search patterns are limited to 4096 bytes.";
+        return result;
+    }
+    if (!mask.empty() && mask.size() != pattern.size()) {
+        result.error_code = "invalid_mask";
+        result.error_message = "The wildcard mask must match the pattern length.";
+        return result;
+    }
+    if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+        if (start > std::numeric_limits<std::uintptr_t>::max()) {
+            result.error_code = "address_out_of_range";
+            result.error_message = "The search address does not fit this host architecture.";
+            return result;
+        }
+    }
+
+    const auto pageSize = std::max<std::size_t>(pattern.size(), std::min<std::uint32_t>(
+        page_bytes == 0 ? kDefaultMemorySearchPageBytes : page_bytes,
+        kMaxMemorySearchPageBytes));
+    const auto overlap = pattern.size() - 1;
+    auto regions = process_->queryRegions();
+    std::sort(regions.begin(), regions.end(), [](const auto& left, const auto& right) {
+        return left.base < right.base;
+    });
+    const auto usable = [&](const ce::MemoryRegion& region) {
+        return region.size >= pattern.size() && (region.protection & ce::MemProt::Read);
+    };
+    const auto matches = [&](const std::uint8_t* bytes) {
+        for (std::size_t index = 0; index < pattern.size(); ++index) {
+            if ((mask.empty() || mask[index] != 0) && bytes[index] != pattern[index])
+                return false;
+        }
+        return true;
+    };
+    const auto next_forward_region = [&](std::size_t index) -> std::optional<std::uintptr_t> {
+        for (std::size_t next = index + 1; next < regions.size(); ++next)
+            if (usable(regions[next])) return regions[next].base;
+        return std::nullopt;
+    };
+    const auto next_backward_region = [&](std::size_t index) -> std::optional<std::uintptr_t> {
+        while (index > 0) {
+            --index;
+            if (!usable(regions[index])) continue;
+            const auto end = memory_region_end(regions[index]);
+            if (end > regions[index].base) return end - 1;
+        }
+        return std::nullopt;
+    };
+
+    const auto target = static_cast<std::uintptr_t>(start);
+    if (!backward) {
+        for (std::size_t index = 0; index < regions.size(); ++index) {
+            const auto& region = regions[index];
+            if (!usable(region)) continue;
+            const auto end = memory_region_end(region);
+            if (end <= target) continue;
+            const auto position = std::max(region.base, target);
+            if (end - position < pattern.size()) continue;
+            const auto wanted = std::min<std::size_t>(pageSize, end - position);
+            std::vector<std::uint8_t> buffer(wanted);
+            const auto read = process_->read(position, buffer.data(), buffer.size());
+            const auto received = read ? *read : 0;
+            result.scanned_bytes = static_cast<std::uint64_t>(received);
+            if (received >= pattern.size()) {
+                for (std::size_t offset = 0; offset + pattern.size() <= received; ++offset) {
+                    if (!matches(buffer.data() + offset)) continue;
+                    result.accepted = true;
+                    result.found = true;
+                    result.complete = true;
+                    result.address = static_cast<std::uint64_t>(position + offset);
+                    return result;
+                }
+            }
+            if (read && received == wanted && position + received < end && received > overlap) {
+                result.accepted = true;
+                result.next_address = static_cast<std::uint64_t>(position + received - overlap);
+                return result;
+            }
+            if (const auto next = next_forward_region(index)) {
+                result.accepted = true;
+                result.next_address = static_cast<std::uint64_t>(*next);
+                return result;
+            }
+            result.accepted = true;
+            result.complete = true;
+            return result;
+        }
+        result.accepted = true;
+        result.complete = true;
+        return result;
+    }
+
+    for (std::size_t reverse = regions.size(); reverse > 0; --reverse) {
+        const auto index = reverse - 1;
+        const auto& region = regions[index];
+        if (!usable(region) || region.base > target) continue;
+        const auto end = memory_region_end(region);
+        const auto upper = target == std::numeric_limits<std::uintptr_t>::max()
+            ? end
+            : std::min(end, target + 1);
+        if (upper <= region.base || upper - region.base < pattern.size()) continue;
+        const auto wanted = std::min<std::size_t>(pageSize, upper - region.base);
+        const auto position = upper - wanted;
+        std::vector<std::uint8_t> buffer(wanted);
+        const auto read = process_->read(position, buffer.data(), buffer.size());
+        const auto received = read ? *read : 0;
+        result.scanned_bytes = static_cast<std::uint64_t>(received);
+        if (received >= pattern.size()) {
+            for (std::size_t candidate = received - pattern.size() + 1; candidate > 0;) {
+                --candidate;
+                if (!matches(buffer.data() + candidate)) continue;
+                result.accepted = true;
+                result.found = true;
+                result.complete = true;
+                result.address = static_cast<std::uint64_t>(position + candidate);
+                return result;
+            }
+        }
+        if (read && received == wanted && position > region.base && received > overlap) {
+            const auto nextUpper = position + overlap;
+            result.accepted = true;
+            result.next_address = static_cast<std::uint64_t>(nextUpper - 1);
+            return result;
+        }
+        if (const auto next = next_backward_region(index)) {
+            result.accepted = true;
+            result.next_address = static_cast<std::uint64_t>(*next);
+            return result;
+        }
+        result.accepted = true;
+        result.complete = true;
+        return result;
+    }
+    result.accepted = true;
+    result.complete = true;
+    return result;
+}
+
+MemoryWriteResult EngineFacade::memory_write(
+        std::uint64_t address,
+        rust::Slice<const std::uint8_t> bytes,
+        bool allow_protection_change) {
+    MemoryWriteResult result;
+    result.accepted = false;
+    result.written = 0;
+    result.protection_changed = false;
+    result.protection_restored = true;
+    result.warning = "";
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!process_) {
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before writing memory.";
+        return result;
+    }
+    if (bytes.empty()) {
+        result.error_code = "empty_write";
+        result.error_message = "Enter at least one byte to write.";
+        return result;
+    }
+    if (bytes.size() > kMaxMemoryWriteSize) {
+        result.error_code = "write_too_large";
+        result.error_message = "A single Memory View edit is limited to 4096 bytes.";
+        return result;
+    }
+    if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+        if (address > std::numeric_limits<std::uintptr_t>::max()) {
+            result.error_code = "address_out_of_range";
+            result.error_message = "The write address does not fit this host architecture.";
+            return result;
+        }
+    }
+    const auto target = static_cast<std::uintptr_t>(address);
+    const auto region = process_->queryRegion(target);
+    if (!region || target < region->base || region->size == 0) {
+        result.error_code = "address_unmapped";
+        result.error_message = "The write address is not inside a mapped memory region.";
+        return result;
+    }
+    const auto offset = target - region->base;
+    if (offset >= region->size || bytes.size() > region->size - offset) {
+        result.error_code = "write_crosses_region";
+        result.error_message = "The edit would cross the current memory-region boundary.";
+        return result;
+    }
+    if (!(region->protection & ce::MemProt::Read)) {
+        result.error_code = "region_unreadable";
+        result.error_message = "The target region is not readable, so the edit cannot be verified.";
+        return result;
+    }
+
+    const bool originallyWritable = region->protection & ce::MemProt::Write;
+    if (!originallyWritable) {
+        if (!allow_protection_change) {
+            result.error_code = "region_not_writable";
+            result.error_message = "The target region is read-only.";
+            return result;
+        }
+        const auto changed = process_->protect(
+            target, bytes.size(), region->protection | ce::MemProt::Write);
+        if (!changed) {
+            result.error_code = "protection_change_failed";
+            result.error_message = "Could not temporarily make the target region writable.";
+            return result;
+        }
+        result.protection_changed = true;
+    }
+
+    const auto write = process_->write(target, bytes.data(), bytes.size());
+    if (write) result.written = static_cast<std::uint32_t>(*write);
+    if (result.protection_changed) {
+        const auto restored = process_->protect(target, bytes.size(), region->protection);
+        result.protection_restored = restored.has_value();
+        if (!result.protection_restored) {
+            result.warning = "The bytes were written, but the original page protection could not be restored.";
+        }
+    }
+    if (!write || *write != bytes.size()) {
+        result.error_code = "memory_write_failed";
+        std::string message = write
+            ? "The target accepted only part of the requested memory edit."
+            : "Could not write process memory: " + write.error().message() + ".";
+        if (!result.protection_restored)
+            message += " The original page protection could not be restored.";
+        result.error_message = message;
+        return result;
+    }
+
+    std::vector<std::uint8_t> verification(bytes.size());
+    const auto read = process_->read(target, verification.data(), verification.size());
+    if (!read || *read != verification.size() ||
+        !std::equal(verification.begin(), verification.end(), bytes.begin())) {
+        result.error_code = "memory_write_verification_failed";
+        std::string message = "The edit was written but could not be verified by reading it back.";
+        if (!result.protection_restored)
+            message += " The original page protection could not be restored.";
+        result.error_message = message;
+        return result;
+    }
+
     result.accepted = true;
     return result;
 }

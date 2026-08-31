@@ -11,22 +11,35 @@ use crate::bridge::{DisassemblyRow, Engine, MemoryView, ScanValueType};
 
 const PAGE_BYTES: u32 = 512;
 const INSTRUCTION_LIMIT: u32 = 128;
+const SEARCH_PAGE_BYTES: u32 = 4 << 20;
+const MAX_PATTERN_BYTES: usize = 4096;
 static MEMORY_VIEW_SMOKE_OK: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchPattern {
+    expression: String,
+    bytes: Vec<u8>,
+    mask: Vec<u8>,
+}
 
 #[derive(Clone)]
 struct Viewer {
+    window: adw::Window,
     engine: Rc<RefCell<Option<Engine>>>,
     address_entry: gtk::Entry,
     back_button: gtk::Button,
     forward_button: gtk::Button,
     bookmark_button: gtk::Button,
     bookmarks_box: gtk::Box,
+    find_previous_button: gtk::Button,
+    find_next_button: gtk::Button,
     status: gtk::Label,
     instruction_status: gtk::Label,
     data_inspector: gtk::Label,
     follow_button: gtk::Button,
     copy_button: gtk::Button,
     add_button: gtk::Button,
+    edit_button: gtk::Button,
     disassembly: gtk::ListBox,
     hex_buffer: gtk::TextBuffer,
     current_address: Rc<Cell<u64>>,
@@ -34,9 +47,12 @@ struct Viewer {
     instructions: Rc<RefCell<Vec<DisassemblyRow>>>,
     bytes: Rc<RefCell<Vec<u8>>>,
     selected_instruction: Rc<Cell<Option<usize>>>,
+    selected_byte_offset: Rc<Cell<Option<usize>>>,
     back_stack: Rc<RefCell<Vec<u64>>>,
     forward_stack: Rc<RefCell<Vec<u64>>>,
     bookmarks: Rc<RefCell<BTreeSet<u64>>>,
+    last_search: Rc<RefCell<Option<SearchPattern>>>,
+    search_serial: Rc<Cell<u64>>,
 }
 
 impl Viewer {
@@ -66,6 +82,7 @@ impl Viewer {
     }
 
     fn navigate(&self, requested_address: u64) {
+        self.cancel_search();
         let previous = self.current_address.get();
         if self.load(requested_address) {
             let current = self.current_address.get();
@@ -78,6 +95,7 @@ impl Viewer {
     }
 
     fn go_back(&self) {
+        self.cancel_search();
         let Some(target) = self.back_stack.borrow_mut().pop() else {
             return;
         };
@@ -93,6 +111,7 @@ impl Viewer {
     }
 
     fn go_forward(&self) {
+        self.cancel_search();
         let Some(target) = self.forward_stack.borrow_mut().pop() else {
             return;
         };
@@ -143,11 +162,10 @@ impl Viewer {
             self.disassembly.select_row(Some(&row));
         }
         if !self.bytes.borrow().is_empty() {
-            if let Some(iter) = self.hex_buffer.iter_at_line_offset(0, 18) {
-                self.hex_buffer.place_cursor(&iter);
-            }
-            self.inspect_hex_cursor();
+            self.set_hex_cursor(0);
         } else {
+            self.selected_byte_offset.set(None);
+            self.edit_button.set_sensitive(false);
             self.data_inspector.set_label("No readable bytes.");
         }
         self.update_navigation();
@@ -158,6 +176,7 @@ impl Viewer {
             && !self.instructions.borrow().is_empty()
             && self.selected_instruction.get().is_some()
             && self.copy_button.is_sensitive()
+            && self.edit_button.is_sensitive()
             && self.data_inspector.label().contains("byte=0x")
         {
             MEMORY_VIEW_SMOKE_OK.store(true, Ordering::SeqCst);
@@ -277,13 +296,33 @@ impl Viewer {
             iter.line_offset() as usize,
             self.bytes.borrow().len(),
         ) else {
+            self.selected_byte_offset.set(None);
+            self.edit_button.set_sensitive(false);
             return;
         };
+        self.selected_byte_offset.set(Some(offset));
+        self.edit_button.set_sensitive(true);
         self.data_inspector.set_label(&format_data_inspector(
             self.current_address.get(),
             &self.bytes.borrow(),
             offset,
         ));
+    }
+
+    fn set_hex_cursor(&self, offset: usize) {
+        let (line, column) = text_position_for_byte_offset(offset);
+        if let Some(iter) = self
+            .hex_buffer
+            .iter_at_line_offset(line as i32, column as i32)
+        {
+            self.hex_buffer.place_cursor(&iter);
+        }
+        self.inspect_hex_cursor();
+    }
+
+    fn cancel_search(&self) {
+        self.search_serial
+            .set(self.search_serial.get().wrapping_add(1));
     }
 
     fn toggle_bookmark(&self) {
@@ -349,6 +388,234 @@ impl Viewer {
         }
     }
 
+    fn present_find_dialog(&self) {
+        let entry = gtk::Entry::builder()
+            .placeholder_text("48 8B ?? 05 or \"text\"")
+            .text(
+                self.last_search
+                    .borrow()
+                    .as_ref()
+                    .map_or("", |pattern| pattern.expression.as_str()),
+            )
+            .hexpand(true)
+            .activates_default(true)
+            .css_classes(["monospace"])
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Find in memory")
+            .body("Enter hexadecimal bytes, use ?? as a wildcard, or wrap UTF-8 text in quotes. Search runs in bounded pages and can be cancelled by navigating away.")
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("find", "Find");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("find"));
+        dialog.set_response_appearance("find", adw::ResponseAppearance::Suggested);
+        dialog.connect_response(Some("find"), {
+            let viewer = self.clone();
+            let entry = entry.clone();
+            move |_, _| match parse_search_pattern(&entry.text()) {
+                Ok(pattern) => viewer.start_search(pattern, false, false),
+                Err(message) => {
+                    viewer.status.add_css_class("error");
+                    viewer.status.set_label(&message);
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+        entry.grab_focus();
+    }
+
+    fn repeat_search(&self, backward: bool) {
+        let Some(pattern) = self.last_search.borrow().clone() else {
+            self.present_find_dialog();
+            return;
+        };
+        self.start_search(pattern, backward, true);
+    }
+
+    fn start_search(&self, pattern: SearchPattern, backward: bool, skip_current: bool) {
+        let current = self.current_address.get();
+        let start = if skip_current {
+            if backward {
+                current.saturating_sub(1)
+            } else if let Some(next) = current.checked_add(1) {
+                next
+            } else {
+                self.status
+                    .set_label("There is no higher address to search.");
+                return;
+            }
+        } else {
+            current
+        };
+        *self.last_search.borrow_mut() = Some(pattern.clone());
+        self.find_previous_button.set_sensitive(true);
+        self.find_next_button.set_sensitive(true);
+        self.status.remove_css_class("error");
+        let serial = self.search_serial.get().wrapping_add(1);
+        self.search_serial.set(serial);
+        self.continue_search(pattern, start, backward, serial, 0);
+    }
+
+    fn continue_search(
+        &self,
+        pattern: SearchPattern,
+        start: u64,
+        backward: bool,
+        serial: u64,
+        scanned_total: u64,
+    ) {
+        if self.search_serial.get() != serial {
+            return;
+        }
+        self.status.set_label(&format!(
+            "Searching {} from 0x{start:016X}… {} scanned",
+            if backward { "backward" } else { "forward" },
+            format_byte_count(scanned_total)
+        ));
+        let result = {
+            let engine_slot = self.engine.borrow();
+            let Some(engine) = engine_slot.as_ref() else {
+                self.status.add_css_class("error");
+                self.status
+                    .set_label("The memory engine is temporarily busy.");
+                return;
+            };
+            engine.memory_search(
+                &pattern.bytes,
+                &pattern.mask,
+                start,
+                backward,
+                SEARCH_PAGE_BYTES,
+            )
+        };
+        let page = match result {
+            Ok(page) => page,
+            Err(error) => {
+                self.status.add_css_class("error");
+                self.status
+                    .set_label(&format!("{} ({})", error.message, error.code));
+                return;
+            }
+        };
+        let scanned_total = scanned_total.saturating_add(page.scanned_bytes);
+        if page.found {
+            self.navigate(page.address);
+            self.status.set_label(&format!(
+                "Found {} at 0x{:016X} after scanning {}.",
+                pattern.expression,
+                page.address,
+                format_byte_count(scanned_total)
+            ));
+            self.set_hex_cursor(0);
+            return;
+        }
+        if page.complete || page.next_address == start {
+            self.status.set_label(&format!(
+                "{} was not found searching {} from this address ({} scanned).",
+                pattern.expression,
+                if backward { "backward" } else { "forward" },
+                format_byte_count(scanned_total)
+            ));
+            return;
+        }
+        let viewer = self.clone();
+        adw::glib::idle_add_local_once(move || {
+            viewer.continue_search(pattern, page.next_address, backward, serial, scanned_total)
+        });
+    }
+
+    fn present_edit_dialog(&self) {
+        let Some(offset) = self.selected_byte_offset.get() else {
+            return;
+        };
+        let Some(byte) = self.bytes.borrow().get(offset).copied() else {
+            return;
+        };
+        let address = self.current_address.get().saturating_add(offset as u64);
+        let entry = gtk::Entry::builder()
+            .text(format!("{byte:02X}"))
+            .placeholder_text("90 90 C3 or \"text\"")
+            .hexpand(true)
+            .activates_default(true)
+            .css_classes(["monospace"])
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Edit memory at 0x{address:016X}"))
+            .body("This writes directly into the attached process. Read-only pages may be made writable temporarily; their original protection is restored immediately afterward. Maximum edit: 4096 bytes.")
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("write", "Write bytes");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("write"));
+        dialog.set_response_appearance("write", adw::ResponseAppearance::Destructive);
+        dialog.connect_response(Some("write"), {
+            let viewer = self.clone();
+            let entry = entry.clone();
+            move |_, _| {
+                let bytes = match parse_write_bytes(&entry.text()) {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        viewer.status.add_css_class("error");
+                        viewer.status.set_label(&message);
+                        return;
+                    }
+                };
+                let result = {
+                    let mut engine_slot = viewer.engine.borrow_mut();
+                    let Some(engine) = engine_slot.as_mut() else {
+                        viewer.status.add_css_class("error");
+                        viewer
+                            .status
+                            .set_label("The memory engine is temporarily busy.");
+                        return;
+                    };
+                    engine.memory_write(address, &bytes, true)
+                };
+                match result {
+                    Ok(write) => {
+                        viewer.status.remove_css_class("error");
+                        let page_address = viewer.current_address.get();
+                        viewer.load(page_address);
+                        viewer.set_hex_cursor(offset);
+                        let protection = if write.protection_changed {
+                            if write.protection_restored {
+                                " Page protection was restored."
+                            } else {
+                                " WARNING: page protection was not restored."
+                            }
+                        } else {
+                            ""
+                        };
+                        viewer.status.set_label(&format!(
+                            "Wrote and verified {} byte{} at 0x{address:016X}.{}{}",
+                            write.written,
+                            if write.written == 1 { "" } else { "s" },
+                            protection,
+                            if write.warning.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", write.warning)
+                            }
+                        ));
+                    }
+                    Err(error) => {
+                        viewer.status.add_css_class("error");
+                        viewer.status.set_label(&format!(
+                            "Could not edit memory: {} ({})",
+                            error.message, error.code
+                        ));
+                    }
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+        entry.select_region(0, -1);
+        entry.grab_focus();
+    }
+
     fn show_error(&self, message: &str) {
         clear_list(&self.disassembly);
         self.instructions.borrow_mut().clear();
@@ -358,6 +625,8 @@ impl Viewer {
         self.follow_button.set_sensitive(false);
         self.copy_button.set_sensitive(false);
         self.add_button.set_sensitive(false);
+        self.edit_button.set_sensitive(false);
+        self.selected_byte_offset.set(None);
         self.instruction_status
             .set_label("No instruction selected.");
         self.data_inspector.set_label("No readable bytes.");
@@ -381,6 +650,23 @@ pub fn present(
         .subtitle("Disassembler and hex dump")
         .build();
     header.set_title_widget(Some(&title));
+    let find_button = gtk::Button::builder()
+        .icon_name("edit-find-symbolic")
+        .tooltip_text("Find in memory (Ctrl+F)")
+        .build();
+    let find_previous_button = gtk::Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text("Find previous (Shift+F3)")
+        .sensitive(false)
+        .build();
+    let find_next_button = gtk::Button::builder()
+        .icon_name("go-down-symbolic")
+        .tooltip_text("Find next (F3)")
+        .sensitive(false)
+        .build();
+    header.pack_end(&find_next_button);
+    header.pack_end(&find_previous_button);
+    header.pack_end(&find_button);
 
     let back_button = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
@@ -548,6 +834,7 @@ pub fn present(
     let data_inspector = gtk::Label::builder()
         .label("Select a byte to inspect its value.")
         .xalign(0.0)
+        .hexpand(true)
         .selectable(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["caption", "dim-label", "monospace"])
@@ -556,13 +843,26 @@ pub fn present(
         .margin_start(12)
         .margin_end(12)
         .build();
+    let edit_button = gtk::Button::builder()
+        .label("Edit")
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Edit bytes at the selected address")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let data_actions = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    data_actions.append(&data_inspector);
+    data_actions.append(&edit_button);
     let hex_panel = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
         .build();
     hex_panel.append(&hex_scrolled);
     hex_panel.append(&gtk::Separator::new(Orientation::Horizontal));
-    hex_panel.append(&data_inspector);
+    hex_panel.append(&data_actions);
     let hex_frame = gtk::Frame::builder()
         .label("Hex dump")
         .child(&hex_panel)
@@ -613,18 +913,22 @@ pub fn present(
         .build();
 
     let viewer = Viewer {
+        window: window.clone(),
         engine,
         address_entry: address_entry.clone(),
         back_button: back_button.clone(),
         forward_button: forward_button.clone(),
         bookmark_button: bookmark_button.clone(),
         bookmarks_box,
+        find_previous_button: find_previous_button.clone(),
+        find_next_button: find_next_button.clone(),
         status,
         instruction_status,
         data_inspector,
         follow_button: follow_button.clone(),
         copy_button: copy_button.clone(),
         add_button: add_button.clone(),
+        edit_button: edit_button.clone(),
         disassembly: disassembly.clone(),
         hex_buffer: hex_buffer.clone(),
         current_address: Rc::new(Cell::new(initial_address)),
@@ -632,9 +936,12 @@ pub fn present(
         instructions: Rc::new(RefCell::new(Vec::new())),
         bytes: Rc::new(RefCell::new(Vec::new())),
         selected_instruction: Rc::new(Cell::new(None)),
+        selected_byte_offset: Rc::new(Cell::new(None)),
         back_stack: Rc::new(RefCell::new(Vec::new())),
         forward_stack: Rc::new(RefCell::new(Vec::new())),
         bookmarks: Rc::new(RefCell::new(BTreeSet::new())),
+        last_search: Rc::new(RefCell::new(None)),
+        search_serial: Rc::new(Cell::new(0)),
     };
     viewer.rebuild_bookmarks();
 
@@ -709,6 +1016,22 @@ pub fn present(
         let viewer = viewer.clone();
         move |_| viewer.add_selected_address()
     });
+    edit_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.present_edit_dialog()
+    });
+    find_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.present_find_dialog()
+    });
+    find_previous_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.repeat_search(true)
+    });
+    find_next_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.repeat_search(false)
+    });
     hex_buffer.connect_cursor_position_notify({
         let viewer = viewer.clone();
         move |_| viewer.inspect_hex_cursor()
@@ -720,6 +1043,7 @@ pub fn present(
         move |_, key, _, modifiers| {
             let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
             let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             match key {
                 gtk::gdk::Key::Left if alt => {
                     viewer.go_back();
@@ -750,6 +1074,18 @@ pub fn present(
                     viewer.copy_selected();
                     adw::glib::Propagation::Stop
                 }
+                gtk::gdk::Key::f | gtk::gdk::Key::F if control => {
+                    viewer.present_find_dialog();
+                    adw::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::F3 if shift => {
+                    viewer.repeat_search(true);
+                    adw::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::F3 => {
+                    viewer.repeat_search(false);
+                    adw::glib::Propagation::Stop
+                }
                 _ => adw::glib::Propagation::Proceed,
             }
         }
@@ -771,6 +1107,102 @@ fn parse_address(text: &str) -> Result<u64, String> {
     }
     u64::from_str_radix(digits, 16)
         .map_err(|_| "The address must contain hexadecimal digits (0–9, A–F).".to_owned())
+}
+
+fn parse_search_pattern(text: &str) -> Result<SearchPattern, String> {
+    let expression = text.trim();
+    if expression.is_empty() {
+        return Err("Enter hexadecimal bytes or quoted text to search for.".to_owned());
+    }
+    if expression.starts_with('"') || expression.ends_with('"') {
+        if !(expression.len() >= 2 && expression.starts_with('"') && expression.ends_with('"')) {
+            return Err("Quoted search text must have both opening and closing quotes.".to_owned());
+        }
+        let bytes = expression.as_bytes()[1..expression.len() - 1].to_vec();
+        if bytes.is_empty() {
+            return Err("Quoted search text cannot be empty.".to_owned());
+        }
+        if bytes.len() > MAX_PATTERN_BYTES {
+            return Err("Search patterns are limited to 4096 bytes.".to_owned());
+        }
+        return Ok(SearchPattern {
+            expression: expression.to_owned(),
+            bytes,
+            mask: Vec::new(),
+        });
+    }
+
+    let tokens: Vec<String> = if expression.chars().any(char::is_whitespace) {
+        expression.split_whitespace().map(str::to_owned).collect()
+    } else {
+        let compact = expression
+            .strip_prefix("0x")
+            .or_else(|| expression.strip_prefix("0X"))
+            .unwrap_or(expression);
+        if !compact.len().is_multiple_of(2) {
+            return Err(
+                "A compact hexadecimal pattern must contain complete byte pairs.".to_owned(),
+            );
+        }
+        compact
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect()
+    };
+    if tokens.is_empty() || tokens.len() > MAX_PATTERN_BYTES {
+        return Err("Search patterns must contain between 1 and 4096 bytes.".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(tokens.len());
+    let mut mask = Vec::with_capacity(tokens.len());
+    let mut has_wildcard = false;
+    for token in tokens {
+        if token == "?" || token == "??" || token == "*" || token.eq_ignore_ascii_case("xx") {
+            bytes.push(0);
+            mask.push(0);
+            has_wildcard = true;
+            continue;
+        }
+        let digits = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(&token);
+        if digits.len() != 2 {
+            return Err(format!("{token} is not a complete hexadecimal byte."));
+        }
+        let byte = u8::from_str_radix(digits, 16)
+            .map_err(|_| format!("{token} is not a hexadecimal byte."))?;
+        bytes.push(byte);
+        mask.push(1);
+    }
+    if !has_wildcard {
+        mask.clear();
+    }
+    Ok(SearchPattern {
+        expression: expression.to_owned(),
+        bytes,
+        mask,
+    })
+}
+
+fn parse_write_bytes(text: &str) -> Result<Vec<u8>, String> {
+    let pattern = parse_search_pattern(text)?;
+    if !pattern.mask.is_empty() {
+        return Err("Wildcards cannot be used when writing memory.".to_owned());
+    }
+    Ok(pattern.bytes)
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GiB", bytes as f64 / (1_u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.1} MiB", bytes as f64 / (1_u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KiB", bytes as f64 / (1_u64 << 10) as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn clear_list(list: &gtk::ListBox) {
@@ -865,6 +1297,13 @@ fn byte_offset_for_text_position(line: usize, column: usize, byte_len: usize) ->
     (offset < byte_len).then_some(offset)
 }
 
+fn text_position_for_byte_offset(offset: usize) -> (usize, usize) {
+    let line = offset / 16;
+    let byte = offset % 16;
+    let column = 18 + byte * 3 + usize::from(byte >= 8);
+    (line, column)
+}
+
 fn format_data_inspector(base: u64, bytes: &[u8], offset: usize) -> String {
     let Some(byte) = bytes.get(offset) else {
         return "Select a byte to inspect its value.".to_owned();
@@ -947,6 +1386,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_exact_wildcard_and_quoted_memory_patterns() {
+        assert_eq!(
+            parse_search_pattern("48 8B 05").unwrap(),
+            SearchPattern {
+                expression: "48 8B 05".to_owned(),
+                bytes: vec![0x48, 0x8B, 0x05],
+                mask: Vec::new(),
+            }
+        );
+        let wildcard = parse_search_pattern("488B??05").unwrap();
+        assert_eq!(wildcard.bytes, [0x48, 0x8B, 0, 0x05]);
+        assert_eq!(wildcard.mask, [1, 1, 0, 1]);
+        assert_eq!(parse_search_pattern("\"Health\"").unwrap().bytes, b"Health");
+        assert!(parse_search_pattern("4").is_err());
+        assert!(parse_write_bytes("90 ?? C3").is_err());
+        assert_eq!(parse_write_bytes("\"OK\"").unwrap(), b"OK");
+    }
+
+    #[test]
     fn formats_hex_and_ascii_columns() {
         let dump = format_hex_dump(0x1000, b"Hello\0world");
         assert!(dump.contains("0000000000001000"));
@@ -963,6 +1421,13 @@ mod tests {
         assert_eq!(byte_offset_for_text_position(1, 70, 32), Some(16));
         assert_eq!(byte_offset_for_text_position(1, 85, 32), Some(31));
         assert_eq!(byte_offset_for_text_position(2, 70, 32), None);
+        for offset in 0..32 {
+            let (line, column) = text_position_for_byte_offset(offset);
+            assert_eq!(
+                byte_offset_for_text_position(line, column, 32),
+                Some(offset)
+            );
+        }
     }
 
     #[test]

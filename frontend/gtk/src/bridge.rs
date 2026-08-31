@@ -114,6 +114,27 @@ mod ffi {
         error_message: String,
     }
 
+    struct MemorySearchResult {
+        accepted: bool,
+        found: bool,
+        complete: bool,
+        address: u64,
+        next_address: u64,
+        scanned_bytes: u64,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct MemoryWriteResult {
+        accepted: bool,
+        written: u32,
+        protection_changed: bool,
+        protection_restored: bool,
+        warning: String,
+        error_code: String,
+        error_message: String,
+    }
+
     struct AddressRow {
         id: i32,
         description: String,
@@ -256,6 +277,20 @@ mod ffi {
             byte_count: u32,
             instruction_limit: u32,
         ) -> MemoryViewResult;
+        fn memory_search(
+            self: &EngineFacade,
+            pattern: &[u8],
+            mask: &[u8],
+            start: u64,
+            backward: bool,
+            page_bytes: u32,
+        ) -> MemorySearchResult;
+        fn memory_write(
+            self: Pin<&mut EngineFacade>,
+            address: u64,
+            bytes: &[u8],
+            allow_protection_change: bool,
+        ) -> MemoryWriteResult;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
         fn visible_address_rows(
             self: Pin<&mut EngineFacade>,
@@ -667,6 +702,23 @@ pub struct MemoryView {
     pub instructions: Vec<DisassemblyRow>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemorySearch {
+    pub found: bool,
+    pub complete: bool,
+    pub address: u64,
+    pub next_address: u64,
+    pub scanned_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryWrite {
+    pub written: u32,
+    pub protection_changed: bool,
+    pub protection_restored: bool,
+    pub warning: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FreezeMode {
@@ -1059,6 +1111,56 @@ impl Engine {
                     follow_target: row.follow_target,
                 })
                 .collect(),
+        })
+    }
+
+    pub fn memory_search(
+        &self,
+        pattern: &[u8],
+        mask: &[u8],
+        start: u64,
+        backward: bool,
+        page_bytes: u32,
+    ) -> Result<MemorySearch, AddressError> {
+        let result = self
+            .inner
+            .memory_search(pattern, mask, start, backward, page_bytes);
+        if !result.accepted {
+            return Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            });
+        }
+        Ok(MemorySearch {
+            found: result.found,
+            complete: result.complete,
+            address: result.address,
+            next_address: result.next_address,
+            scanned_bytes: result.scanned_bytes,
+        })
+    }
+
+    pub fn memory_write(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        allow_protection_change: bool,
+    ) -> Result<MemoryWrite, AddressError> {
+        let result = self
+            .inner
+            .pin_mut()
+            .memory_write(address, bytes, allow_protection_change);
+        if !result.accepted {
+            return Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            });
+        }
+        Ok(MemoryWrite {
+            written: result.written,
+            protection_changed: result.protection_changed,
+            protection_restored: result.protection_restored,
+            warning: result.warning,
         })
     }
 
@@ -1487,6 +1589,108 @@ mod tests {
             .memory_view(0x1000, 256, 64)
             .expect_err("memory view without a process must fail");
         assert_eq!(error.code, "no_session");
+    }
+
+    #[test]
+    fn memory_search_pages_forward_backward_and_supports_wildcards() {
+        let marker = [0xD3_u8, 0x71, 0xA9, 0x4C, 0xE2, 0x86, 0x5B, 0xF0];
+        let mut fixture = vec![0x11_u8; 320].into_boxed_slice();
+        fixture[173..181].copy_from_slice(&marker);
+        let base = fixture.as_ptr() as u64;
+        let expected = base + 173;
+        let mut engine = attached_engine();
+
+        let mut cursor = base;
+        let mut found = None;
+        for _ in 0..8 {
+            let page = engine
+                .memory_search(&marker, &[], cursor, false, 64)
+                .expect("search memory page");
+            assert!(page.scanned_bytes <= 64);
+            if page.found {
+                found = Some(page.address);
+                break;
+            }
+            assert!(
+                !page.complete,
+                "fixture should remain inside the search range"
+            );
+            assert!(page.next_address > cursor);
+            cursor = page.next_address;
+        }
+        assert_eq!(found, Some(expected));
+
+        let wildcard_mask = [1_u8, 1, 0, 1, 1, 1, 1, 1];
+        let mut wildcard = marker;
+        wildcard[2] = 0;
+        let hit = engine
+            .memory_search(&wildcard, &wildcard_mask, base, false, 512)
+            .expect("wildcard memory search");
+        assert!(hit.found);
+        assert_eq!(hit.address, expected);
+
+        let hit = engine
+            .memory_search(&marker, &[], expected + marker.len() as u64, true, 512)
+            .expect("backward memory search");
+        assert!(hit.found);
+        assert_eq!(hit.address, expected);
+        assert_eq!(
+            engine
+                .memory_search(&marker, &[1], base, false, 64)
+                .expect_err("mismatched wildcard masks must fail")
+                .code,
+            "invalid_mask"
+        );
+        std::hint::black_box(&fixture);
+    }
+
+    #[test]
+    fn memory_write_is_bounded_and_verified() {
+        let mut fixture = Box::new([0x11_u8, 0x22, 0x33, 0x44]);
+        let address = fixture.as_mut_ptr() as u64;
+        let mut engine = attached_engine();
+
+        let write = engine
+            .memory_write(address + 1, &[0xAA, 0xBB], false)
+            .expect("write self memory");
+        assert_eq!(write.written, 2);
+        assert!(!write.protection_changed);
+        assert!(write.protection_restored);
+        assert!(write.warning.is_empty());
+        assert_eq!(*fixture, [0x11, 0xAA, 0xBB, 0x44]);
+
+        let error = engine
+            .memory_write(address, &[], false)
+            .expect_err("empty writes must fail");
+        assert_eq!(error.code, "empty_write");
+        let oversized = vec![0x90; 4097];
+        assert_eq!(
+            engine
+                .memory_write(address, &oversized, false)
+                .expect_err("oversized writes must fail")
+                .code,
+            "write_too_large"
+        );
+        std::hint::black_box(&fixture);
+    }
+
+    #[test]
+    fn memory_search_and_write_require_an_attached_process() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .memory_search(&[0x90], &[], 0x1000, false, 4096)
+                .expect_err("search without a process must fail")
+                .code,
+            "no_session"
+        );
+        assert_eq!(
+            engine
+                .memory_write(0x1000, &[0x90], false)
+                .expect_err("write without a process must fail")
+                .code,
+            "no_session"
+        );
     }
 
     #[test]

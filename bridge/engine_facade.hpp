@@ -28,6 +28,8 @@ struct ScanRequest;
 struct ScanStatus;
 struct ScanPage;
 struct MemoryViewResult;
+struct MemorySearchResult;
+struct MemoryWriteResult;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
@@ -63,6 +65,13 @@ public:
                        std::uint32_t limit) const;
     MemoryViewResult memory_view(std::uint64_t address, std::uint32_t byte_count,
                                  std::uint32_t instruction_limit) const;
+    MemorySearchResult memory_search(rust::Slice<const std::uint8_t> pattern,
+                                     rust::Slice<const std::uint8_t> mask,
+                                     std::uint64_t start, bool backward,
+                                     std::uint32_t page_bytes) const;
+    MemoryWriteResult memory_write(std::uint64_t address,
+                                   rust::Slice<const std::uint8_t> bytes,
+                                   bool allow_protection_change);
     void cancel_scan() noexcept;
     AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
                              bool refresh_values);

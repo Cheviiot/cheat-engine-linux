@@ -35,7 +35,12 @@ Completed in the foundation and first vertical slices:
   corresponding memory location; the interactive pass adds independent Back/
   Forward history, direct-branch and RIP-relative Follow, row selection and
   copying, one-click address-table insertion, per-window bookmarks, Page Up/
-  Page Down navigation, and a cursor-driven byte/integer/float inspector;
+  Page Down navigation, and a cursor-driven byte/integer/float inspector; its
+  search pass accepts exact AOB, `??` wildcards, or quoted UTF-8, walks memory in
+  cancellable 4 MiB UI steps over a bridge capped at 8 MiB per request, and
+  supports Find Next/Previous; destructive byte edits are capped at 4 KiB,
+  region-checked, read-back verified, and temporarily restore read-only page
+  protection after an explicitly confirmed write;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -493,6 +498,8 @@ recorded in a short decision note before public release.
     Memory View with disassembly/hex panes and direct address navigation.~~
 13. ~~Make GTK Memory View interactive with Back/Forward history, bounded page
     navigation, operand following, instruction copy/add actions, bookmarks, and
-    a hex-cursor scalar inspector.~~ Next add bounded memory search/edit and
-    assembler/debugger integration, continue Lua GUI/form parity, and complete
-    the branding review.
+    a hex-cursor scalar inspector.~~
+14. ~~Add incremental forward/backward GTK memory search with AOB wildcards and
+    quoted text, plus confirmed, bounded, verified byte editing with temporary
+    page-protection restoration.~~ Next add assembler/debugger integration,
+    continue Lua GUI/form parity, and complete the branding review.
