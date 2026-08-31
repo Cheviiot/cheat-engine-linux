@@ -277,6 +277,11 @@ mod ffi {
             collapsed: bool,
         ) -> AddressActionResult;
         fn load_table(self: Pin<&mut EngineFacade>, path: &str) -> TableActionResult;
+        fn load_protected_table(
+            self: Pin<&mut EngineFacade>,
+            path: &str,
+            password: &str,
+        ) -> TableActionResult;
         fn save_table(self: &EngineFacade, path: &str, json: bool) -> TableActionResult;
         fn table_scripts(self: &EngineFacade, start: u64, limit: u32) -> TableScriptPage;
         fn table_script_text(
@@ -1038,6 +1043,14 @@ impl Engine {
         table_action(self.inner.pin_mut().load_table(path))
     }
 
+    pub fn load_protected_table(
+        &mut self,
+        path: &str,
+        password: &str,
+    ) -> Result<TableAction, AddressError> {
+        table_action(self.inner.pin_mut().load_protected_table(path, password))
+    }
+
     pub fn save_table(&self, path: &str, json: bool) -> Result<TableAction, AddressError> {
         table_action(self.inner.save_table(path, json))
     }
@@ -1221,6 +1234,35 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         std::env::temp_dir().join(format!("ce-gtk-{}-{nonce}.{extension}", std::process::id()))
+    }
+
+    fn write_protected_table(path: &PathBuf, password: &str, json: &str) {
+        fn fnv1a(text: &str) -> u64 {
+            text.bytes().fold(1_469_598_103_934_665_603, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
+            })
+        }
+
+        fn xorshift64(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        let verifier = fnv1a(password);
+        let mut state = fnv1a(if password.is_empty() {
+            "cecore"
+        } else {
+            password
+        });
+        let encrypted = json
+            .bytes()
+            .map(|byte| byte ^ (xorshift64(&mut state) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mut payload = format!("CETRAINER1\n{verifier}\n").into_bytes();
+        payload.extend(encrypted);
+        std::fs::write(path, payload).expect("write protected table fixture");
     }
 
     fn wait_for_scan(engine: &Engine) -> ScanStatus {
@@ -1898,6 +1940,68 @@ mod tests {
         assert_eq!(first.rows[0].description, "Record 0");
         assert_eq!(second.rows[0].description, "Record 256");
         assert_eq!(third.rows[87].description, "Record 599");
+    }
+
+    #[test]
+    fn protected_tables_require_the_password_and_load_transactionally() {
+        let path = temporary_table_path("CETRAINER");
+        write_protected_table(
+            &path,
+            "correct horse",
+            r#"{
+  "game":"Protected fixture",
+  "version":"1",
+  "author":"test",
+  "comment":"",
+  "luaScript":"print('protected')",
+  "structures":[],
+  "disassemblerComments":[],
+  "entries":[{"id":77,"desc":"Secret Gold","addr":"0x1234","type":2,"value":"42"}]
+}"#,
+        );
+
+        let mut engine = Engine::new();
+        engine
+            .add_address(0x2222, ScanValueType::Int32, "Existing record", 0, false)
+            .expect("add existing record");
+        engine
+            .set_table_lua_trusted(true)
+            .expect("set existing trust state");
+
+        let password_required = engine
+            .load_table(path.to_str().expect("UTF-8 temp path"))
+            .expect_err("generic load must request a password");
+        assert_eq!(password_required.code, "protected_table");
+        assert!(engine.table_lua_trusted());
+        assert_eq!(
+            engine.visible_address_rows(0, 10, false).rows[0].description,
+            "Existing record"
+        );
+
+        let wrong_password = engine
+            .load_protected_table(path.to_str().expect("UTF-8 temp path"), "wrong")
+            .expect_err("wrong password must fail");
+        assert_eq!(wrong_password.code, "protected_table_decrypt_failed");
+        assert!(engine.table_lua_trusted());
+        assert_eq!(
+            engine.visible_address_rows(0, 10, false).rows[0].description,
+            "Existing record"
+        );
+
+        let loaded = engine
+            .load_protected_table(path.to_str().expect("UTF-8 temp path"), "correct horse")
+            .expect("correct password loads protected table");
+        assert_eq!(loaded.record_count, 1);
+        assert!(loaded.contains_scripts);
+        assert!(loaded.contains_lua);
+        assert!(!loaded.contains_auto_assembler);
+        assert!(!engine.table_lua_trusted());
+        let rows = engine.visible_address_rows(0, 10, false).rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 77);
+        assert_eq!(rows[0].description, "Secret Gold");
+
+        std::fs::remove_file(path).expect("remove protected table fixture");
     }
 
     #[test]

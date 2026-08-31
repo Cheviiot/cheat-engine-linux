@@ -80,6 +80,7 @@ public:
     AddressActionResult move_address(std::int32_t id, std::int32_t direction);
     AddressActionResult set_address_collapsed(std::int32_t id, bool collapsed);
     TableActionResult load_table(rust::Str path);
+    TableActionResult load_protected_table(rust::Str path, rust::Str password);
     TableActionResult save_table(rust::Str path, bool json) const;
     TableScriptPage table_scripts(std::uint64_t start,
                                   std::uint32_t limit) const;

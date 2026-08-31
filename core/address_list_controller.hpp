@@ -179,6 +179,11 @@ public:
     AddressOperationResult replaceRecords(std::vector<AddressRecordState> records,
                                           bool allowActiveScripts = false);
     TableOperationResult loadTable(const std::string& path);
+    /// Commit an already parsed cheat table into the live address list.  This
+    /// keeps protected-table decryption transactional: the facade can validate
+    /// the password and payload before it disables executable state belonging
+    /// to the currently loaded table.
+    TableOperationResult loadTableData(CheatTable table);
     TableOperationResult saveTable(const std::string& path, bool json) const;
     std::size_t scriptPayloadCount() const noexcept;
     std::vector<TableScriptSummary> scriptPayloads(std::size_t start,

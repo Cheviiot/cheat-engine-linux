@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -15,7 +16,7 @@ use crate::address_list_model::{
 };
 use crate::bridge::{
     AddressRecord, AttachError, Engine, FreezeMode, LuaExecution, Process, ProtectionMatch,
-    ScanComparison, ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
+    ScanComparison, ScanRequest, ScanValueType, Session, TableAction, TableScript, TableScriptKind,
 };
 use crate::process_dialog;
 use crate::scan_result_model::{
@@ -1653,30 +1654,9 @@ fn present_open_table_dialog(
                 .expect("engine remains present while opening a table")
                 .load_table(path_text);
             match result {
-                Ok(action) => {
-                    state.table_scripts_trusted.set(false);
-                    state.table_lua_trusted.set(false);
-                    state
-                        .table_contains_auto_assembler
-                        .set(action.contains_auto_assembler);
-                    state.table_contains_lua.set(action.contains_lua);
-                    update_script_trust_button(&state, &widgets);
-                    state.selected_address_ids.borrow_mut().clear();
-                    reload_address_list(&state, &widgets, state.attached.get());
-                    let script_notice = if action.contains_scripts {
-                        " Scripts were preserved but not executed."
-                    } else {
-                        ""
-                    };
-                    widgets.address_summary.set_label(&format!(
-                        "Opened {} record{}.{}",
-                        action.record_count,
-                        if action.record_count == 1 { "" } else { "s" },
-                        script_notice
-                    ));
-                    if action.contains_scripts {
-                        present_script_trust_dialog(&window, &state, &widgets, &action);
-                    }
+                Ok(action) => complete_table_load(&window, &state, &widgets, action),
+                Err(error) if error.code == "protected_table" => {
+                    present_protected_table_password_dialog(&window, &state, &widgets, path, false);
                 }
                 Err(error) => widgets.address_summary.set_label(&format!(
                     "Could not open the cheat table: {} ({})",
@@ -1685,6 +1665,123 @@ fn present_open_table_dialog(
             }
         }
     });
+}
+
+fn complete_table_load(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    action: TableAction,
+) {
+    state.table_scripts_trusted.set(false);
+    state.table_lua_trusted.set(false);
+    state
+        .table_contains_auto_assembler
+        .set(action.contains_auto_assembler);
+    state.table_contains_lua.set(action.contains_lua);
+    update_script_trust_button(state, widgets);
+    state.selected_address_ids.borrow_mut().clear();
+    reload_address_list(state, widgets, state.attached.get());
+    let script_notice = if action.contains_scripts {
+        " Scripts were preserved but not executed."
+    } else {
+        ""
+    };
+    widgets.address_summary.set_label(&format!(
+        "Opened {} record{}.{}",
+        action.record_count,
+        if action.record_count == 1 { "" } else { "s" },
+        script_notice
+    ));
+    if action.contains_scripts {
+        present_script_trust_dialog(window, state, widgets, &action);
+    }
+}
+
+fn present_protected_table_password_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    path: PathBuf,
+    retry: bool,
+) {
+    let password = gtk::PasswordEntry::builder()
+        .placeholder_text("Table password")
+        .show_peek_icon(true)
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let filename = path
+        .file_name()
+        .map_or_else(|| "this table".into(), |name| name.to_string_lossy());
+    let body = if retry {
+        format!(
+            "The password did not unlock {filename}. Try again, or cancel to keep the current table unchanged."
+        )
+    } else {
+        format!(
+            "{filename} is password-protected. Enter its password to decrypt and inspect it locally. Scripts remain blocked after loading."
+        )
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(if retry {
+            "Could not unlock the table"
+        } else {
+            "Protected cheat table"
+        })
+        .body(body)
+        .extra_child(&password)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("open", "Unlock");
+    dialog.set_default_response(Some("open"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+    dialog.connect_response(Some("open"), {
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let password = password.clone();
+        move |_, _| {
+            let Some(path_text) = path.to_str() else {
+                password.set_text("");
+                widgets
+                    .address_summary
+                    .set_label("This file path is not valid UTF-8 and cannot be opened yet.");
+                return;
+            };
+            let password_text = password.text();
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while opening a protected table")
+                .load_protected_table(path_text, password_text.as_str());
+            drop(password_text);
+            password.set_text("");
+            match result {
+                Ok(action) => complete_table_load(&window, &state, &widgets, action),
+                Err(error) if error.code == "protected_table_decrypt_failed" => {
+                    widgets.address_summary.set_label(
+                        "The protected table was not opened; the current table is unchanged.",
+                    );
+                    present_protected_table_password_dialog(
+                        &window,
+                        &state,
+                        &widgets,
+                        path.clone(),
+                        true,
+                    );
+                }
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not open the protected table: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+    dialog.present(Some(window));
+    password.grab_focus();
 }
 
 fn update_script_trust_button(state: &SessionState, widgets: &SessionWidgets) {

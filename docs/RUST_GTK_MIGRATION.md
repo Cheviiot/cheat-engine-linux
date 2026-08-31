@@ -98,12 +98,14 @@ Completed in the foundation and first vertical slices:
   losing the restoration state;
 - table-level and per-record Lua are visibly preserved and executable only by
   the reviewed, separately trusted, per-payload GTK workflow; password-protected
-  CETRAINER input still returns an explicit unsupported error;
+  CETRAINER input now opens through a masked GTK password prompt, decrypts and
+  parses before replacing the current table, and leaves the old session untouched
+  after cancellation, a wrong password, or a corrupt payload;
 - bridge tests that exercise real self-process writes, normal and directional
   freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
   codecs, plus group/subtree semantics, `.CT` hierarchy round trips, atomic
-  failure behavior, protected-table rejection, script non-execution before
-  trust, complete script enumeration/paging, hard payload limits with lossless
+  failure behavior, transactional protected-table password failure/success,
+  script non-execution before trust, complete script enumeration/paging, hard payload limits with lossless
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
@@ -128,8 +130,8 @@ Lua paths, an interactive bounded console, and toolkit-neutral periodic address/
 Lua timer scheduling. Imported Lua is intentionally per-payload rather than
 automatic, and VM instruction ceilings do not interrupt a blocking native
 binding. Broader Lua GUI/form parity remains advanced work. The GTK frontend
-does not yet open password-protected CETRAINER files or expose a loss report. No
-product identifier should be published before the branding decision.
+does not yet expose a table-format loss report. No product identifier should be
+published before the branding decision.
 
 ## Goal
 
@@ -464,5 +466,6 @@ recorded in a short decision note before public release.
 11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
     trust/review, trusted Auto Assembler activation/cleanup, and separately
     consented per-payload Lua execution with bounded input/VM/output, periodic
-    scheduling, and Lua console/timer parity.~~ Next continue Lua GUI/form parity,
-    add the GTK loss report/protected-table path, and complete branding review.
+    scheduling, Lua console/timer parity, and transactional protected-table
+    password loading.~~ Next continue Lua GUI/form parity, add the GTK loss
+    report, and complete branding review.

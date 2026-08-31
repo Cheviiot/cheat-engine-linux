@@ -871,7 +871,7 @@ TableOperationResult AddressListController::loadTable(const std::string& path) {
     const auto format = detectTableFormat(path);
     if (format == TableFormat::Protected)
         return {.success = false, .errorCode = "protected_table",
-                .errorMessage = "Password-protected CETRAINER files are not supported yet."};
+                .errorMessage = "This CETRAINER file requires its password."};
     std::ifstream input(path, std::ios::binary);
     if (!input)
         return {.success = false, .errorCode = "table_unreadable",
@@ -891,6 +891,10 @@ TableOperationResult AddressListController::loadTable(const std::string& path) {
                 .errorMessage = "The cheat table could not be parsed."};
     }
 
+    return loadTableData(std::move(parsed));
+}
+
+TableOperationResult AddressListController::loadTableData(CheatTable parsed) {
     std::unordered_map<int, int> indentByExternalId;
     std::unordered_set<int> runtimeIds;
     std::vector<Record> loaded;

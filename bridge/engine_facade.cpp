@@ -48,6 +48,7 @@ constexpr std::size_t kMaxAddressTextSize = 1u << 20;
 constexpr std::size_t kMaxAddressDescriptionSize = 1024;
 constexpr std::size_t kMaxAddressGroupSelection = 4096;
 constexpr std::size_t kMaxTablePathSize = 4096;
+constexpr std::size_t kMaxTablePasswordSize = 4096;
 constexpr std::uint32_t kMaxTableScriptPageSize = 256;
 constexpr std::uint32_t kMaxTableScriptTextSize = 64u << 10;
 constexpr std::size_t kMaxTableScriptDescriptionSize = 1024;
@@ -1775,6 +1776,17 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
             .error_message = "The cheat-table path is invalid or too long.",
         };
     }
+    if (ce::detectTableFormat(file) == ce::TableFormat::Protected) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
+            .error_code = "protected_table",
+            .error_message = "This CETRAINER file requires its password.",
+        };
+    }
     std::string scriptErrorCode;
     std::string scriptErrorMessage;
     if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
@@ -1789,6 +1801,103 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
         };
     }
     const auto result = address_list_->loadTable(file);
+    if (result.success) {
+        script_runtime_->autoAssemblerTrusted = false;
+        script_runtime_->luaTrusted = false;
+        script_runtime_->resetLua(process_.get(), address_list_.get());
+        script_runtime_->disableInfoById.clear();
+        script_runtime_->activationOrder.clear();
+    }
+    return TableActionResult{
+        .accepted = result.success,
+        .record_count = static_cast<std::uint64_t>(result.recordCount),
+        .contains_scripts = result.containsScripts,
+        .contains_auto_assembler = result.containsAutoAssembler,
+        .contains_lua = result.containsLua,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+TableActionResult EngineFacade::load_protected_table(rust::Str path,
+                                                       rust::Str requestedPassword) {
+    std::string file(path);
+    std::string password(requestedPassword);
+    if (file.size() > kMaxTablePathSize || file.find('\0') != std::string::npos) {
+        std::fill(password.begin(), password.end(), '\0');
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
+            .error_code = "invalid_path",
+            .error_message = "The cheat-table path is invalid or too long.",
+        };
+    }
+    if (password.size() > kMaxTablePasswordSize ||
+        password.find('\0') != std::string::npos) {
+        std::fill(password.begin(), password.end(), '\0');
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
+            .error_code = "invalid_password",
+            .error_message = "The table password is invalid or too long.",
+        };
+    }
+    if (ce::detectTableFormat(file) != ce::TableFormat::Protected) {
+        std::fill(password.begin(), password.end(), '\0');
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
+            .error_code = "protected_table_invalid",
+            .error_message = "The selected file is not a supported protected CETRAINER table.",
+        };
+    }
+
+    ce::CheatTable parsed;
+    bool decrypted = false;
+    try {
+        decrypted = parsed.loadProtected(file, password);
+    } catch (...) {
+        decrypted = false;
+    }
+    std::fill(password.begin(), password.end(), '\0');
+    if (!decrypted) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
+            .error_code = "protected_table_decrypt_failed",
+            .error_message = "The table could not be decrypted. Check the password or file integrity.",
+        };
+    }
+
+    // Decryption and parsing are complete before touching the old table.  A bad
+    // password therefore cannot disable its active Auto Assembler records.
+    std::string scriptErrorCode;
+    std::string scriptErrorMessage;
+    if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = true,
+            .contains_auto_assembler = true,
+            .contains_lua = false,
+            .error_code = scriptErrorCode,
+            .error_message = scriptErrorMessage,
+        };
+    }
+
+    const auto result = address_list_->loadTableData(std::move(parsed));
     if (result.success) {
         script_runtime_->autoAssemblerTrusted = false;
         script_runtime_->luaTrusted = false;
