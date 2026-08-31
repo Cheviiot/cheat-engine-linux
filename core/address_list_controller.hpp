@@ -147,6 +147,7 @@ public:
                     const std::string& description) override;
     int createGroup(const std::string& description) override;
     bool deleteById(int id) override;
+    bool disableWithoutExecute(int id) override;
     bool disableAllWithoutExecute() override;
     bool setDescription(int id, const std::string& description) override;
     bool setAddress(int id, uintptr_t address) override;

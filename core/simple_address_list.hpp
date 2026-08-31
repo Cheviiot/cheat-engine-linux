@@ -60,6 +60,9 @@ public:
         entries_.erase(entries_.begin() + i);
         return true;
     }
+    bool disableWithoutExecute(int id) override {
+        return set(id, [](auto& e){ e.active = false; });
+    }
     bool disableAllWithoutExecute() override {
         for (auto& e : entries_) e.active = false;
         return true;

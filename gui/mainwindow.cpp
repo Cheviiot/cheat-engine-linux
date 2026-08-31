@@ -1059,6 +1059,7 @@ bool MainWindow::runAddressListAdapterSmoke() {
     health["offsets"] = QJsonArray{QString("16"), QString("8")};
     health["type"] = "i32";
     health["value"] = "100";
+    health["active"] = true;
     health["dropdown"] = "100:Full;0:Empty";
     health["hotkeys"] = "Ctrl+H";
     health["lua"] = "return 7";
@@ -1086,6 +1087,26 @@ bool MainWindow::runAddressListAdapterSmoke() {
     fixture.append(score);
 
     addressListModel_->fromJson(fixture);
+    ce::IAddressList* adapter = addressListModel_;
+    int activationCallbacks = 0;
+    adapter->setActivationCallback(
+        [&activationCallbacks](int, bool) { ++activationCallbacks; });
+    const bool adapterReadOk = adapter->count() == 3 &&
+        adapter->findIdByDescription("Health") == 11 &&
+        adapter->ids() == std::vector<int>({11, 12, 13}) &&
+        adapter->byId(11).has_value() && adapter->byId(11)->active;
+    const bool adapterWriteOk = adapter->setDescription(11, "Player health") &&
+        adapter->setHexView(11, true) && adapter->setSigned(11, false) &&
+        adapter->setByteCount(11, 4) && adapter->setFreezeMode(11, 4) &&
+        adapter->setColor(11, "#12AB34") &&
+        adapter->disableWithoutExecute(11) &&
+        adapter->setAddressExpression(11, "[[game+20]+8]+10");
+    const auto adaptedHealth = adapter->byId(11);
+    const bool rawDisableOk = adaptedHealth && !adaptedHealth->active &&
+        adaptedHealth->description == "Player health" && adaptedHealth->showAsHex &&
+        activationCallbacks == 0;
+    if (!adapterReadOk || !adapterWriteOk || !rawDisableOk) return false;
+
     addressListModel_->groupSelectedRows({0, 1}, "Player");
     const auto grouped = addressListModel_->entries();
     const bool groupedOk = grouped.size() == 4 && grouped[0].isGroup &&
@@ -1117,8 +1138,17 @@ bool MainWindow::runAddressListAdapterSmoke() {
     if (!metadataOk) return false;
 
     addressListModel_->removeEntry(1);
-    return addressListModel_->entries().size() == 1 &&
-           addressListModel_->entries()[0].id == 13;
+    if (addressListModel_->entries().size() != 1 ||
+        addressListModel_->entries()[0].id != 13)
+        return false;
+
+    const int bonusId = adapter->createEntry(0x4000, ce::ValueType::Int32, "Bonus");
+    const bool createOk = bonusId > 0 && adapter->setDescription(bonusId, "Bonus score") &&
+        adapter->setColor(bonusId, "#ABCDEF") && adapter->setHexView(bonusId, true) &&
+        adapter->byId(bonusId).has_value() &&
+        adapter->byId(bonusId)->description == "Bonus score";
+    return createOk && adapter->deleteById(bonusId) && adapter->count() == 1 &&
+           adapter->at(0).has_value() && adapter->at(0)->id == 13;
 }
 
 // The monospace font from the Settings dialog (display/fontFamily + fontSize),
@@ -4578,11 +4608,27 @@ static AddressEntry fromSharedRecord(const ce::AddressRecordState& record) {
 
 AddressListModel::AddressListModel(QObject* parent) : QAbstractTableModel(parent) {}
 
-bool AddressListModel::syncSharedControllerFromEntries() {
+bool AddressListModel::syncSharedControllerFromEntries() const {
+    if (sharedControllerSynchronized_) return true;
     std::vector<ce::AddressRecordState> records;
     records.reserve(entries_.size());
     for (const auto& entry : entries_) records.push_back(toSharedRecord(entry));
-    return sharedController_.replaceRecords(std::move(records), true).success;
+    const bool success = sharedController_.replaceRecords(std::move(records), true).success;
+    if (success) sharedControllerSynchronized_ = true;
+    return success;
+}
+
+void AddressListModel::setProcess(ce::ProcessHandle* proc) {
+    const bool changed = proc_ != proc;
+    // Export before changing the borrowed handle. AddressListController never
+    // dereferences the previous handle here; it only raw-disables records, so a
+    // MainWindow reattach cannot freeze stale addresses in the new target.
+    const bool synced = syncSharedControllerFromEntries();
+    proc_ = proc;
+    sharedController_.setSymbolResolver(symbolResolver_);
+    sharedController_.setProcess(proc);
+    if (synced && changed) importEntriesFromSharedController();
+    refreshModuleCache();
 }
 
 void AddressListModel::importEntriesFromSharedController() {
@@ -4609,7 +4655,28 @@ void AddressListModel::importEntriesFromSharedController() {
     beginResetModel();
     entries_ = std::move(imported);
     nextId_ = nextId;
+    sharedControllerSynchronized_ = true;
     endResetModel();
+}
+
+bool AddressListModel::importEntryFromSharedController(int id, int firstColumn,
+                                                       int lastColumn) {
+    const int row = rowOfId(id);
+    if (row < 0) return false;
+    const auto records = sharedController_.exportRecords();
+    const auto found = std::find_if(records.begin(), records.end(),
+        [id](const ce::AddressRecordState& record) { return record.id == id; });
+    if (found == records.end()) return false;
+
+    auto disableInfo = std::move(entries_[static_cast<std::size_t>(row)].autoAsmDisableInfo);
+    auto imported = fromSharedRecord(*found);
+    imported.autoAsmDisableInfo = std::move(disableInfo);
+    entries_[static_cast<std::size_t>(row)] = std::move(imported);
+    sharedControllerSynchronized_ = true;
+    const int first = std::clamp(firstColumn, 0, columnCount() - 1);
+    const int last = std::clamp(lastColumn, first, columnCount() - 1);
+    emit dataChanged(index(row, first), index(row, last));
+    return true;
 }
 
 int AddressListModel::addEntry(uintptr_t addr, ValueType type, const QString& desc,
@@ -4625,6 +4692,7 @@ int AddressListModel::addEntry(uintptr_t addr, ValueType type, const QString& de
     entry.currentValue = "?";
     int id = entry.id;
     entries_.push_back(std::move(entry));
+    markSharedControllerDirty();
     endInsertRows();
     return id;
 }
@@ -4638,6 +4706,7 @@ void AddressListModel::addScriptEntry(const QString& desc, const QString& script
     entry.type = ValueType::Int32;
     entry.currentValue = "(Auto Assembler script)";
     entries_.push_back(std::move(entry));
+    markSharedControllerDirty();
     endInsertRows();
 }
 
@@ -4653,26 +4722,23 @@ void AddressListModel::updateScriptEntryById(int id, const QString& desc, const 
     if (!desc.isEmpty()) e.description = desc;
     // The script changed; if it is currently enabled its saved DisableInfo is
     // stale, so drop it (the user should re-toggle to re-apply the new script).
+    markSharedControllerDirty();
     emit dataChanged(index(row, 0), index(row, columnCount() - 1));
 }
 
 void AddressListModel::setEntryAddress(int row, uintptr_t addr, const QString& expr) {
     if (row < 0 || row >= (int)entries_.size()) return;
-    auto& e = entries_[row];
+    const auto& e = entries_[row];
     if (e.isGroup || !e.autoAsmScript.isEmpty()) return;  // not addressable
-    e.address = addr;
-    e.addressExpr = expr;      // pointer expression re-resolves each refresh
-    e.addressString.clear();
-    e.offsets.clear();
-    e.currentValue.clear();    // force a re-read at the new address
-    emit dataChanged(index(row, 2), index(row, columnCount() - 1),
-                     {Qt::DisplayRole, Qt::EditRole});
+    const int id = e.id;
+    if (!syncSharedControllerFromEntries() || !sharedController_.setAddress(id, addr)) return;
+    if (!expr.isEmpty()) sharedController_.setAddressExpression(id, expr.toStdString());
+    importEntryFromSharedController(id, 0, columnCount() - 1);
 }
 
 void AddressListModel::setEntryDescription(int row, const QString& desc) {
     if (row < 0 || row >= (int)entries_.size()) return;
-    entries_[row].description = desc;
-    emit dataChanged(index(row, 1), index(row, 1), {Qt::DisplayRole, Qt::EditRole});
+    setDescription(entries_[row].id, desc.toStdString());
 }
 
 void AddressListModel::addGroup(const QString& desc) {
@@ -4947,6 +5013,7 @@ void AddressListModel::reresolveAddress(AddressEntry& e) {
 }
 
 void AddressListModel::freezeWrite(ProcessHandle* proc) {
+    bool addressChanged = false;
     for (auto& e : entries_) {
         if (e.isGroup) continue;
         if (!e.active || e.frozenValue.isEmpty()) continue;
@@ -4954,7 +5021,9 @@ void AddressListModel::freezeWrite(ProcessHandle* proc) {
         // Re-resolve pointer records so the freeze writes to the current target, not the
         // up-to-500ms-stale cached address (the value refresh runs slower than this 100ms
         // freeze); a moved pointer would otherwise clobber unrelated memory.
+        const auto previousAddress = e.address;
         reresolveAddress(e);
+        addressChanged = addressChanged || e.address != previousAddress;
 
         if (e.freezeMode == FreezeMode::Normal) {
             writeValueToProcess(proc, e.address, e.type, e.frozenValue, e.codec, e.bigEndian, e.showAsHex);
@@ -4973,6 +5042,7 @@ void AddressListModel::freezeWrite(ProcessHandle* proc) {
         if (ce::freezeShouldWrite(e.freezeMode, current, frozen))
             writeValueToProcess(proc, e.address, e.type, e.frozenValue, e.codec, e.bigEndian, e.showAsHex);
     }
+    if (addressChanged) markSharedControllerDirty();
 }
 
 QJsonArray AddressListModel::toJson() const {
@@ -5118,19 +5188,20 @@ void AddressListModel::fromJson(const QJsonArray& arr) {
         parentIndentById.push_back(e.indent);
         entries_.push_back(e);
     }
+    markSharedControllerDirty();
     endResetModel();
 }
 
 void AddressListModel::setFreezeMode(int row, FreezeMode mode) {
     if (row < 0 || row >= (int)entries_.size()) return;
-    entries_[row].freezeMode = mode;
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    setFreezeMode(entries_[row].id, static_cast<int>(mode));
 }
 
 void AddressListModel::setEntryCodec(int row, ce::ValueCodec codec) {
     if (row < 0 || row >= (int)entries_.size()) return;
     entries_[row].codec = codec;
     entries_[row].currentValue.clear();   // force a re-read/reformat through the codec
+    markSharedControllerDirty();
     emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
 }
 
@@ -5143,6 +5214,7 @@ void AddressListModel::setEntryBigEndian(int row, bool bigEndian) {
     if (row < 0 || row >= (int)entries_.size()) return;
     entries_[row].bigEndian = bigEndian;
     entries_[row].currentValue.clear();   // re-read/reformat in the new byte order
+    markSharedControllerDirty();
     emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
 }
 
@@ -5152,20 +5224,19 @@ bool AddressListModel::entryBigEndian(int row) const {
 
 void AddressListModel::setShowAsHex(int row, bool hex) {
     if (row < 0 || row >= (int)entries_.size()) return;
-    entries_[row].showAsHex = hex;
-    emit dataChanged(index(row, 4), index(row, 4));
+    setHexView(entries_[row].id, hex);
 }
 
 void AddressListModel::setEntryType(int row, ValueType t) {
     if (row < 0 || row >= (int)entries_.size()) return;
     if (entries_[row].isGroup) return;
-    entries_[row].type = t;
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    setType(entries_[row].id, t);
 }
 
 void AddressListModel::setHotkeyKeys(int row, const QString& keys) {
     if (row < 0 || row >= (int)entries_.size()) return;
     entries_[row].hotkeyKeys = keys;
+    markSharedControllerDirty();
     emit dataChanged(index(row, 0), index(row, columnCount() - 1));
 }
 
@@ -5177,6 +5248,7 @@ void AddressListModel::setValueHotkeys(int row, const QString& increaseKeys, con
     entries_[row].hotkeyStep = step.isEmpty() ? "1" : step;
     entries_[row].setValueHotkeyKeys = setKeys;
     entries_[row].setValueHotkeyValue = setValue;
+    markSharedControllerDirty();
     emit dataChanged(index(row, 0), index(row, columnCount() - 1));
 }
 
@@ -5227,6 +5299,7 @@ bool AddressListModel::adjustEntryValue(int row, double delta) {
     writeValueToProcess(proc_, e.address, e.type, nextText, e.codec, e.bigEndian, e.showAsHex);
     e.currentValue = nextText;
     if (e.active) e.frozenValue = nextText;
+    markSharedControllerDirty();
     emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
     return true;
 }
@@ -5266,15 +5339,17 @@ void AddressListModel::reportActivationError(const QString& title, const QString
 }
 
 void AddressListModel::setAllActive(bool active) {
-    for (int i = 0; i < (int)entries_.size(); ++i)
-        if (!entries_[i].isGroup) setEntryActive(i, active);
+    std::vector<int> ids;
+    for (const auto& entry : entries_)
+        if (!entry.isGroup) ids.push_back(entry.id);
+    for (const int id : ids) setActive(id, active);
     if (!entries_.empty())
         emit dataChanged(index(0, 0), index((int)entries_.size() - 1, columnCount() - 1));
 }
 
 void AddressListModel::toggleActive(int row) {
     if (row < 0 || row >= (int)entries_.size() || entries_[row].isGroup) return;
-    setEntryActive(row, !entries_[row].active);
+    setActive(entries_[row].id, !entries_[row].active);
 }
 
 bool AddressListModel::toggleGroupCollapse(int row) {
@@ -5288,14 +5363,8 @@ bool AddressListModel::toggleGroupCollapse(int row) {
 }
 
 void AddressListModel::setEntryValueTo(int row, const QString& value) {
-    if (row < 0 || row >= (int)entries_.size() || !proc_) return;
-    auto& e = entries_[row];
-    if (e.isGroup || value.isEmpty()) return;
-    reresolveAddress(e);   // write to the current pointer target
-    writeValueToProcess(proc_, e.address, e.type, value, e.codec, e.bigEndian, e.showAsHex);
-    e.currentValue = value;
-    if (e.active) e.frozenValue = value;
-    emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
+    if (row < 0 || row >= (int)entries_.size() || value.isEmpty()) return;
+    setValue(entries_[row].id, value.toStdString());
 }
 
 bool AddressListModel::setEntryActive(int row, bool active) {
@@ -5340,6 +5409,7 @@ bool AddressListModel::setEntryActive(int row, bool active) {
         e.frozenValue = e.currentValue;
     else
         e.frozenValue.clear();
+    markSharedControllerDirty();
     if (activationCb_)
         activationCb_(e.id, active);
     return true;
@@ -5412,10 +5482,13 @@ static std::optional<QString> formatVariableLengthValue(ProcessHandle* proc, uin
 }
 
 void AddressListModel::updateValues(ProcessHandle* proc) {
+    bool stateChanged = false;
     for (size_t i = 0; i < entries_.size(); ++i) {
         auto& e = entries_[i];
         if (e.isGroup) continue;
         if (e.active) continue; // Don't overwrite display for frozen entries
+        const auto previousAddress = e.address;
+        const auto previousValue = e.currentValue;
 
         // Pointer records: re-evaluate the address expression so a moving pointer
         // chain is followed live (CE re-resolves every refresh).
@@ -5424,6 +5497,8 @@ void AddressListModel::updateValues(ProcessHandle* proc) {
         // Variable-length types: read the element (exact length if known) and format.
         if (auto fv = formatVariableLengthValue(proc, e.address, e.type, e.byteCount)) {
             e.currentValue = *fv;
+            stateChanged = stateChanged || e.address != previousAddress ||
+                           e.currentValue != previousValue;
             continue;
         }
 
@@ -5436,28 +5511,19 @@ void AddressListModel::updateValues(ProcessHandle* proc) {
         } else {
             e.currentValue = "??";
         }
+        stateChanged = stateChanged || e.address != previousAddress ||
+                       e.currentValue != previousValue;
     }
+    if (stateChanged) markSharedControllerDirty();
     if (!entries_.empty())
         emit dataChanged(index(0, 4), index(entries_.size() - 1, 4));
 }
 
 std::string AddressListModel::liveValue(int id) {
-    int row = rowOfId(id);
-    if (row < 0 || !proc_) return {};
-    auto& e = entries_[row];
-    if (e.isGroup) return {};
-    // Re-resolve pointer expressions and read the process now (CE's mr.Value does a
-    // live read on access, not a cached refresh value).
-    reresolveAddress(e);
-    if (auto fv = formatVariableLengthValue(proc_, e.address, e.type, e.byteCount))
-        return fv->toStdString();
-
-    uint8_t buf[8] = {};
-    size_t vs = vtSize(e.type);
-    auto r = proc_->read(e.address, buf, vs);
-    if (!r || *r < vs) return "??";
-    QString out = formatScalarValue(e.type, buf, e.showAsHex, e.codec, e.bigEndian, e.showAsSigned);
-    return out.isEmpty() ? std::string("?") : out.toStdString();
+    if (rowOfId(id) < 0 || !syncSharedControllerFromEntries()) return {};
+    const auto value = sharedController_.liveValue(id);
+    importEntryFromSharedController(id, 2, 4);
+    return value;
 }
 
 int AddressListModel::rowCount(const QModelIndex&) const { return entries_.size(); }
@@ -5651,21 +5717,22 @@ static ValueType valueTypeFromDisplayName(const QString& s) {
 
 bool AddressListModel::setData(const QModelIndex& index, const QVariant& value, int role) {
     if (role == Qt::CheckStateRole && index.column() == 0) {
-        auto& e = entries_[index.row()];
-        bool requestedActive = (value.toInt() == Qt::Checked);
-        if (!setEntryActive(index.row(), requestedActive))
+        const int id = entries_[index.row()].id;
+        const bool requestedActive = (value.toInt() == Qt::Checked);
+        if (!setActive(id, requestedActive))
             return false;
         emit dataChanged(index, index);
 
         // Cascade to children if this is a group and CE's matching option is set:
         // moActivateChildrenAsWell for turning on, moDeactivateChildrenAsWell for off.
+        const auto& e = entries_[index.row()];
         bool cascade = requestedActive ? e.activateChildren : e.deactivateChildren;
         if (e.isGroup && cascade) {
             int parentIndent = e.indent;
             int lastChangedRow = index.row();
             for (int i = index.row() + 1; i < (int)entries_.size(); ++i) {
                 if (entries_[i].indent <= parentIndent) break;
-                setEntryActive(i, requestedActive);
+                setActive(entries_[i].id, requestedActive);
                 lastChangedRow = i;
             }
             // Repaint exactly the rows that were cascaded (the old fixed +50
@@ -5678,9 +5745,8 @@ bool AddressListModel::setData(const QModelIndex& index, const QVariant& value, 
     }
     if (role == Qt::EditRole) {
         if (index.column() == 1) {
-            entries_[index.row()].description = value.toString();
-            emit dataChanged(index, index, {Qt::DisplayRole, Qt::EditRole});
-            return true;
+            return setDescription(entries_[index.row()].id,
+                                  value.toString().toStdString());
         }
         if (index.column() == 2) {   // Address
             auto& e = entries_[index.row()];
@@ -5703,13 +5769,9 @@ bool AddressListModel::setData(const QModelIndex& index, const QVariant& value, 
             return true;
         }
         if (index.column() == 3) {   // Type
-            auto& e = entries_[index.row()];
+            const auto& e = entries_[index.row()];
             if (e.isGroup) return false;
-            e.type = valueTypeFromDisplayName(value.toString());
-            e.currentValue.clear();  // force a re-read/reformat with the new type
-            emit dataChanged(this->index(index.row(), 3), this->index(index.row(), 4),
-                             {Qt::DisplayRole, Qt::EditRole});
-            return true;
+            return setType(e.id, valueTypeFromDisplayName(value.toString()));
         }
         if (index.column() == 4) {
             auto& e = entries_[index.row()];
@@ -5742,6 +5804,7 @@ bool AddressListModel::setData(const QModelIndex& index, const QVariant& value, 
                 // the freeze timer, not this, owns its persistence.
                 if (!e.active) scheduleEditVerify(e.address, e.type, writeStr, e.codec, e.bigEndian, e.showAsSigned);
             }
+            markSharedControllerDirty();
             emit dataChanged(index, index);
             return true;
         }
@@ -5777,192 +5840,166 @@ int AddressListModel::rowOfId(int id) const {
     return -1;
 }
 
-int AddressListModel::count() const { return (int)entries_.size(); }
-
-static AddressEntrySnapshot snapshotOf(const AddressEntry& e) {
-    AddressEntrySnapshot s;
-    s.id = e.id;
-    s.description = e.description.toStdString();
-    s.address = e.address;
-    s.type = e.type;
-    s.value = e.currentValue.toStdString();
-    s.color = e.color.toStdString();
-    s.script = e.autoAsmScript.toStdString();
-    s.hotkeyKeys = e.hotkeyKeys.toStdString();
-    s.active = e.active;
-    s.isGroup = e.isGroup;
-    s.showAsHex = e.showAsHex;
-    s.indent = e.indent;
-    return s;
+int AddressListModel::count() const {
+    return syncSharedControllerFromEntries() ? sharedController_.count()
+                                             : static_cast<int>(entries_.size());
 }
 
 bool AddressListModel::setHexView(int id, bool hex) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    setShowAsHex(row, hex);   // existing row-based method: updates + emits dataChanged
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setHexView(id, hex) &&
+           importEntryFromSharedController(id, 4, 4);
 }
 
 bool AddressListModel::setByteCount(int id, std::size_t count) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].byteCount = count;   // element length for String / Array of byte
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setByteCount(id, count) &&
+           importEntryFromSharedController(id);
 }
 
 bool AddressListModel::setSigned(int id, bool isSigned) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].showAsSigned = isSigned;   // CE ShowAsSigned: re-render the value column
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setSigned(id, isSigned) &&
+           importEntryFromSharedController(id, 4, 4);
 }
 
 bool AddressListModel::setIndent(int id, int indent) {
-    int row = rowOfId(id);
-    if (row < 0 || row >= (int)entries_.size()) return false;
-    entries_[row].indent = indent < 0 ? 0 : indent;
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setIndent(id, indent) &&
+           importEntryFromSharedController(id);
 }
 
 std::optional<AddressEntrySnapshot> AddressListModel::at(int index) const {
-    if (index < 0 || index >= (int)entries_.size()) return std::nullopt;
-    return snapshotOf(entries_[index]);
+    if (!syncSharedControllerFromEntries()) return std::nullopt;
+    return sharedController_.at(index);
 }
 
 std::optional<AddressEntrySnapshot> AddressListModel::byId(int id) const {
-    int row = rowOfId(id);
-    if (row < 0) return std::nullopt;
-    return snapshotOf(entries_[row]);
+    if (!syncSharedControllerFromEntries()) return std::nullopt;
+    return sharedController_.byId(id);
 }
 
 int AddressListModel::findIdByDescription(const std::string& desc) const {
-    QString q = QString::fromStdString(desc);
-    for (const auto& e : entries_)
-        if (e.description == q) return e.id;
-    return -1;
+    return syncSharedControllerFromEntries()
+        ? sharedController_.findIdByDescription(desc) : -1;
 }
 
 std::vector<int> AddressListModel::ids() const {
-    std::vector<int> out;
-    out.reserve(entries_.size());
-    for (const auto& e : entries_) out.push_back(e.id);
-    return out;
+    return syncSharedControllerFromEntries() ? sharedController_.ids()
+                                             : std::vector<int>{};
 }
 
 int AddressListModel::createEntry(uintptr_t addr, ValueType type, const std::string& description) {
-    addEntry(addr, type, QString::fromStdString(description));
-    return entries_.empty() ? -1 : entries_.back().id;
+    if (!syncSharedControllerFromEntries()) return -1;
+    const auto result = sharedController_.addRecord(addr, type, description);
+    if (!result.success) return -1;
+    importEntriesFromSharedController();
+    return result.id;
 }
 
 int AddressListModel::createGroup(const std::string& description) {
-    addGroup(QString::fromStdString(description));
-    return entries_.empty() ? -1 : entries_.back().id;
+    if (!syncSharedControllerFromEntries()) return -1;
+    const int id = sharedController_.createGroup(description);
+    if (id < 0) return -1;
+    importEntriesFromSharedController();
+    return id;
 }
 
 bool AddressListModel::deleteById(int id) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    removeEntry(row);
+    if (!syncSharedControllerFromEntries() || !sharedController_.deleteById(id)) return false;
+    importEntriesFromSharedController();
     return true;
+}
+
+bool AddressListModel::disableWithoutExecute(int id) {
+    if (!syncSharedControllerFromEntries() ||
+        !sharedController_.disableWithoutExecute(id))
+        return false;
+    return importEntryFromSharedController(id);
 }
 
 bool AddressListModel::disableAllWithoutExecute() {
-    bool any = false;
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        if (entries_[i].active && !entries_[i].isGroup) {
-            entries_[i].active = false;
-            entries_[i].frozenValue.clear();
-            any = true;
-        }
-    }
-    if (any)
-        emit dataChanged(index(0, 0), index((int)entries_.size() - 1, columnCount() - 1));
-    return any;
+    if (!syncSharedControllerFromEntries() ||
+        !sharedController_.disableAllWithoutExecute())
+        return false;
+    importEntriesFromSharedController();
+    return true;
 }
 
 bool AddressListModel::setDescription(int id, const std::string& desc) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].description = QString::fromStdString(desc);
-    emit dataChanged(index(row, 1), index(row, 1));
-    return true;
+    return syncSharedControllerFromEntries() &&
+           sharedController_.setDescription(id, desc) &&
+           importEntryFromSharedController(id, 1, 1);
 }
 
 bool AddressListModel::setAddress(int id, uintptr_t addr) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].address = addr;
-    entries_[row].addressExpr.clear();   // a plain address clears any pointer expr
-    entries_[row].addressString.clear();
-    entries_[row].offsets.clear();
-    emit dataChanged(index(row, 2), index(row, 2));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setAddress(id, addr) &&
+           importEntryFromSharedController(id, 0, 4);
 }
 
 bool AddressListModel::setAddressExpression(int id, const std::string& expr) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].addressExpr = QString::fromStdString(expr);
-    if (const auto pointer = ce::parsePointerExpression(expr)) {
-        entries_[row].addressString = QString::fromStdString(pointer->base);
-        entries_[row].offsets = pointer->offsets;
-    } else {
-        entries_[row].addressString = QString::fromStdString(expr);
-        entries_[row].offsets.clear();
-    }
-    // Resolve once now so the address column is populated immediately.
-    ExpressionParser parser(proc_, nullptr);
-    if (auto v = parser.parse(expr)) entries_[row].address = *v;
-    emit dataChanged(index(row, 2), index(row, 2));
-    return true;
+    if (!syncSharedControllerFromEntries()) return false;
+    const bool resolved = sharedController_.setAddressExpression(id, expr);
+    const bool imported = importEntryFromSharedController(id, 0, 4);
+    return resolved && imported;
 }
 
 bool AddressListModel::setType(int id, ValueType t) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].type = t;
-    emit dataChanged(index(row, 3), index(row, 4));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setType(id, t) &&
+           importEntryFromSharedController(id, 0, 4);
 }
 
 bool AddressListModel::setValue(int id, const std::string& valStr) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    auto& e = entries_[row];
-    if (e.isGroup) return false;
-    e.currentValue = QString::fromStdString(valStr);
-    if (e.active) e.frozenValue = e.currentValue;
-    if (proc_) {
-        reresolveAddress(e);   // write to the current pointer target, not a stale address
-        writeValueToProcess(proc_, e.address, e.type, e.currentValue, e.codec, e.bigEndian, e.showAsHex);
+    const int row = rowOfId(id);
+    if (row < 0 || !syncSharedControllerFromEntries()) return false;
+    const bool wasActive = entries_[static_cast<std::size_t>(row)].active;
+    if (!sharedController_.setValue(id, valStr) ||
+        !importEntryFromSharedController(id, 2, 4))
+        return false;
+    const int updatedRow = rowOfId(id);
+    if (!wasActive && proc_ && updatedRow >= 0) {
+        const auto& entry = entries_[static_cast<std::size_t>(updatedRow)];
+        scheduleEditVerify(entry.address, entry.type, QString::fromStdString(valStr),
+                           entry.codec, entry.bigEndian, entry.showAsSigned);
     }
-    emit dataChanged(index(row, 4), index(row, 4));
     return true;
 }
 
 bool AddressListModel::setActive(int id, bool active) {
-    int row = rowOfId(id);
+    const int row = rowOfId(id);
     if (row < 0) return false;
-    bool ok = setEntryActive(row, active);
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
-    return ok;
+    const auto& entry = entries_[static_cast<std::size_t>(row)];
+    const bool wasActive = entry.active;
+    // AA remains a Qt-owned execution adapter until the explicit table trust
+    // policy lands. Groups keep their legacy metadata-only toggle behavior.
+    if (!entry.autoAsmScript.isEmpty() || entry.isGroup) {
+        const bool changed = setEntryActive(row, active);
+        if (changed) emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+        return changed;
+    }
+    if (!entry.luaScript.isEmpty() && active) {
+        reportActivationError("Lua record blocked",
+            "This table record contains Lua. Review and trust the table before executing it.");
+        return false;
+    }
+    if (!syncSharedControllerFromEntries()) return false;
+    const auto result = sharedController_.activateRecord(id, active);
+    if (!result.success) {
+        reportActivationError("Could not change record state",
+                              QString::fromStdString(result.errorMessage));
+        return false;
+    }
+    if (!importEntryFromSharedController(id)) return false;
+    if (activationCb_ && wasActive != active) activationCb_(id, active);
+    return true;
 }
 
 bool AddressListModel::setColor(int id, const std::string& color) {
-    int row = rowOfId(id);
-    if (row < 0) return false;
-    entries_[row].color = QString::fromStdString(color);
-    emit dataChanged(index(row, 1), index(row, columnCount() - 1));
-    return true;
+    return syncSharedControllerFromEntries() && sharedController_.setColor(id, color) &&
+           importEntryFromSharedController(id, 1, 4);
 }
 
 bool AddressListModel::setDropdownList(int id, const QString& list) {
     int row = rowOfId(id);
     if (row < 0) return false;
     entries_[row].dropdownList = list;
+    markSharedControllerDirty();
     emit dataChanged(index(row, 1), index(row, columnCount() - 1));
     return true;
 }
@@ -5975,14 +6012,16 @@ bool AddressListModel::setScript(int id, const std::string& script) {
     int row = rowOfId(id);
     if (row < 0) return false;
     entries_[row].autoAsmScript = QString::fromStdString(script);
+    markSharedControllerDirty();
+    syncSharedControllerFromEntries();
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
     return true;
 }
 
 bool AddressListModel::setFreezeMode(int id, int mode) {
-    int row = rowOfId(id);
-    if (row < 0 || mode < 0 || mode > 4) return false;
-    entries_[row].freezeMode = static_cast<ce::FreezeMode>(mode);
-    return true;
+    return syncSharedControllerFromEntries() &&
+           sharedController_.setFreezeMode(id, mode) &&
+           importEntryFromSharedController(id);
 }
 
 } // namespace ce::gui

@@ -50,6 +50,13 @@ Completed in the foundation and first vertical slices:
   grouping, subtree deletion, sibling/block moves, collapse, indent/outdent,
   and drag/drop all import complete record state, apply the shared operation,
   and restore Qt-only Auto Assembler disable state by stable ID;
+- the Qt `IAddressList` adapter now also delegates bounded snapshots, stable-ID
+  lookup, record/group creation and deletion, safe metadata edits, address/type
+  changes, live reads, numeric writes, and numeric activation to the shared
+  controller; changing the attached target raw-disables stale active state;
+- `disableWithoutExecute()` is now a real per-record core operation: both it and
+  the all-record variant clear active/frozen state without invoking activation
+  callbacks or accidentally executing an imported disable script;
 - transactional `.CT`/native-JSON load and save through the existing
   `CheatTable` parser, preserving pointer expressions, table metadata,
   structures, disassembler comments, hotkeys, dropdowns, entry Lua, Auto
@@ -73,14 +80,15 @@ The current pager deliberately keeps only one bounded page in GTK.  A later
 performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
 contract.  The address-list controller is now the GTK source of truth and the
-Qt model delegates all hierarchy mutations through a lossless adapter.  Qt still
-owns its live reads/writes, freeze timer, and existing Auto Assembler execution;
-moving those `IAddressList` operations is the remaining Phase 2 extraction and
-must preserve Qt's current behavior.  The following slice adds an explicit GTK
-trust prompt and a separately reviewed Lua/Auto Assembler activation path.  The
-GTK frontend does not yet open password-protected CETRAINER files, expose a loss
-report, or virtualize address rows beyond its bounded first page.  No product
-identifier should be published before the branding decision.
+Qt model delegates hierarchy plus the safe `IAddressList` surface through a
+lossless adapter.  Qt still owns its periodic refresh and freeze timers, inline
+value-editor verification, and existing Auto Assembler execution.  Completing
+that timer/execution extraction is the remaining Phase 2 work and must preserve
+Qt's current behavior.  The following slice adds an explicit GTK trust prompt
+and a separately reviewed Lua/Auto Assembler activation path.  The GTK frontend
+does not yet open password-protected CETRAINER files, expose a loss report, or
+virtualize address rows beyond its bounded first page.  No product identifier
+should be published before the branding decision.
 
 ## Goal
 

@@ -174,6 +174,9 @@ public:
     virtual int createEntry(uintptr_t addr, ValueType type, const std::string& description) = 0;
     virtual int createGroup(const std::string& description) = 0;
     virtual bool deleteById(int id) = 0;
+    /// Clear one record's active/frozen state without running its script or an
+    /// activation callback. Used for untrusted-table teardown and target changes.
+    virtual bool disableWithoutExecute(int /*id*/) { return false; }
     virtual bool disableAllWithoutExecute() = 0;
 
     virtual bool setDescription(int id, const std::string& desc) = 0;

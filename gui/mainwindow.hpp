@@ -397,11 +397,14 @@ public:
     void toggleActive(int row);   // flip active state (hotkey target)
     bool toggleGroupCollapse(int row);  // flip a group header's collapsed flag; true if it was a group
     void setEntryValueTo(int row, const QString& value);  // set-value hotkey target
-    void setProcess(ce::ProcessHandle* proc) { proc_ = proc; refreshModuleCache(); }
+    void setProcess(ce::ProcessHandle* proc);
     /// Shared symbol resolver used to resolve record address expressions, so a
     /// user-defined label set in the Memory Viewer works as a record address too
     /// (CE's userdefined symbols are global). Null keeps the previous behaviour.
-    void setSymbolResolver(ce::SymbolResolver* r) { symbolResolver_ = r; }
+    void setSymbolResolver(ce::SymbolResolver* r) {
+        symbolResolver_ = r;
+        sharedController_.setSymbolResolver(r);
+    }
     /// Refresh the cached module list used to display addresses as module+offset.
     /// Cheap enough to call from the periodic value refresh so it tracks modules
     /// that load after attach.
@@ -455,6 +458,7 @@ public:
     int createEntry(uintptr_t addr, ce::ValueType type, const std::string& description) override;
     int createGroup(const std::string& description) override;
     bool deleteById(int id) override;
+    bool disableWithoutExecute(int id) override;
     bool disableAllWithoutExecute() override;
     bool setDescription(int id, const std::string& desc) override;
     bool setAddress(int id, uintptr_t addr) override;
@@ -483,8 +487,10 @@ signals:
     void valueReverted(uintptr_t addr, const QString& wrote, const QString& now);
 
 private:
-    bool syncSharedControllerFromEntries();
+    bool syncSharedControllerFromEntries() const;
+    void markSharedControllerDirty() noexcept { sharedControllerSynchronized_ = false; }
     void importEntriesFromSharedController();
+    bool importEntryFromSharedController(int id, int firstColumn = 0, int lastColumn = 4);
     bool setEntryActive(int row, bool active);
     void reportActivationError(const QString& title, const QString& message);
     // After a manual (non-frozen) value edit, re-read shortly after and emit
@@ -498,7 +504,8 @@ private:
     int allocId() { return nextId_++; }
 
     std::vector<AddressEntry> entries_;
-    ce::AddressListController sharedController_;
+    mutable ce::AddressListController sharedController_;
+    mutable bool sharedControllerSynchronized_ = false;
     std::vector<ce::ModuleInfo> moduleCache_;   // for module+offset address display
     ce::ProcessHandle* proc_ = nullptr;
     ce::SymbolResolver* symbolResolver_ = nullptr;   // shared user/module symbols (may be null)

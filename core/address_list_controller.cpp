@@ -1141,6 +1141,17 @@ int AddressListController::createGroup(const std::string& description) {
 
 bool AddressListController::deleteById(int id) { return removeRecord(id).success; }
 
+bool AddressListController::disableWithoutExecute(int id) {
+    const int index = indexOf(id);
+    if (index < 0) return false;
+    auto& record = records_[static_cast<std::size_t>(index)];
+    if (!record.active) return true;
+    record.active = false;
+    record.frozenValue.clear();
+    ++generation_;
+    return true;
+}
+
 bool AddressListController::disableAllWithoutExecute() {
     bool changed = false;
     for (auto& record : records_) {
@@ -1148,8 +1159,8 @@ bool AddressListController::disableAllWithoutExecute() {
         record.active = false;
         record.frozenValue.clear();
         changed = true;
-        if (activationCallback_) activationCallback_(record.id, false);
     }
+    if (changed) ++generation_;
     return changed;
 }
 

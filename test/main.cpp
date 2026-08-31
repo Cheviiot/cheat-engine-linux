@@ -6818,6 +6818,11 @@ public:
             if (it->id == id) { entries_.erase(it); return true; }
         return false;
     }
+    bool disableWithoutExecute(int id) override {
+        auto* e = find(id); if (!e) return false;
+        e->active = false;
+        return true;
+    }
     bool disableAllWithoutExecute() override {
         for (auto& e : entries_) e.active = false;
         return true;
@@ -6908,6 +6913,17 @@ static void test_lua_memrec() {
         mr.Active = true
         getAddressList():disableAllWithoutExecute()
         assert(mr.Active == false)
+    )");
+
+    run("disableWithoutExecute skips OnActivate", R"(
+        _G._mr_raw_disable_hits = 0
+        local mr = getAddressList():getMemoryRecord(0)
+        mr.OnActivate = function(_) _G._mr_raw_disable_hits = _G._mr_raw_disable_hits + 1 end
+        mr.Active = true
+        assert(_G._mr_raw_disable_hits == 1)
+        mr:disableWithoutExecute()
+        assert(mr.Active == false)
+        assert(_G._mr_raw_disable_hits == 1, "raw disable executed callback")
     )");
 
     run("delete removes from list", R"(
@@ -10482,6 +10498,16 @@ static void test_address_list_controller_adapter_state() {
         roundTrip[1].codec.describe() == "xor:0x55" &&
         roundTrip[2].script == script.script && roundTrip[2].luaScript == script.luaScript;
 
+    int rawDisableCallbacks = 0;
+    controller.setActivationCallback(
+        [&rawDisableCallbacks](int, bool) { ++rawDisableCallbacks; });
+    const bool rawOne = controller.disableWithoutExecute(12);
+    const bool rawAll = controller.disableAllWithoutExecute();
+    const auto rawDisabled = controller.exportRecords();
+    bool rawDisableOk = rawOne && rawAll && rawDisableCallbacks == 0 &&
+        !rawDisabled[1].active && !rawDisabled[2].active;
+    controller.replaceRecords(roundTrip, true);
+
     auto duplicate = roundTrip;
     duplicate[3].id = duplicate[2].id;
     auto duplicateResult = controller.replaceRecords(std::move(duplicate), true);
@@ -10494,10 +10520,11 @@ static void test_address_list_controller_adapter_state() {
     auto removed = controller.removeRecord(10);
     bool deleteOk = removed.success && controller.ids() == std::vector<int>({13});
 
-    printf("  lossless state + trust gate + atomic import + subtree move/delete "
-           "(%d%d%d%d%d): %s\n",
-           trustGateOk, stateOk, atomicOk, moveOk, deleteOk,
-           trustGateOk && stateOk && atomicOk && moveOk && deleteOk ? "OK" : "FAILED");
+    printf("  lossless state + trust gate + raw disable + atomic import + subtree "
+           "move/delete (%d%d%d%d%d%d): %s\n",
+           trustGateOk, stateOk, rawDisableOk, atomicOk, moveOk, deleteOk,
+           trustGateOk && stateOk && rawDisableOk && atomicOk && moveOk && deleteOk
+               ? "OK" : "FAILED");
 }
 
 static void test_expression_parser() {

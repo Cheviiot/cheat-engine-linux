@@ -254,12 +254,7 @@ int l_mr_disableWithoutExecute(lua_State* L) {
     auto* ref = checkMemRec(L, 1);
     auto* list = currentList(L);
     if (!list) return 0;
-    // Bypass setActive so no enable/disable script runs — call setValue("") would be wrong;
-    // best we can do without a dedicated API is set active false through the model. Real CE
-    // skips the [DISABLE] script, but our model only fires the script on toggle paths through
-    // setEntryActive. For now this is equivalent to setActive(false); upgrade later when we
-    // expose a "raw" deactivation hook.
-    list->setActive(ref->id, false);
+    list->disableWithoutExecute(ref->id);
     return 0;
 }
 
