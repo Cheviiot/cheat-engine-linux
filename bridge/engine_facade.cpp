@@ -1,6 +1,7 @@
 #include "bridge/engine_facade.hpp"
 
 #include "ce-gtk/src/bridge.rs.h"
+#include "core/address_list_controller.hpp"
 #include "core/target_profile.hpp"
 #include "core/value_transform.hpp"
 #include "core/version.hpp"
@@ -35,8 +36,11 @@ constexpr std::size_t kMaxProcessQuerySize = 256;
 constexpr std::size_t kMaxDisplayNameSize = 256;
 constexpr std::size_t kMemoryProbeLimit = 8;
 constexpr std::uint32_t kMaxScanPageSize = 256;
+constexpr std::uint32_t kMaxAddressPageSize = 256;
 constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
+constexpr std::size_t kMaxAddressTextSize = 1u << 20;
+constexpr std::size_t kMaxAddressDescriptionSize = 1024;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -173,6 +177,26 @@ std::optional<ce::ScanCompare> scan_comparison(std::uint8_t value) {
         ce::ScanCompare::SameAsFirst,
     };
     return comparisons[value];
+}
+
+std::uint8_t bridge_value_type(ce::ValueType type) {
+    switch (type) {
+        case ce::ValueType::Byte: return 0;
+        case ce::ValueType::Int16: return 1;
+        case ce::ValueType::Int32: return 2;
+        case ce::ValueType::Int64: return 3;
+        case ce::ValueType::Float: return 4;
+        case ce::ValueType::Double: return 5;
+        case ce::ValueType::String: return 6;
+        case ce::ValueType::UnicodeString: return 7;
+        case ce::ValueType::ByteArray: return 8;
+        case ce::ValueType::Binary: return 9;
+        case ce::ValueType::All: return 10;
+        case ce::ValueType::Pointer: return 11;
+        case ce::ValueType::Grouped: return 12;
+        case ce::ValueType::Custom: return 13;
+    }
+    return 2;
 }
 
 std::optional<ce::ProtMatch> protection_match(std::uint8_t value) {
@@ -697,9 +721,13 @@ std::string format_scan_value(const ce::ScanConfig& config, bool display_hex,
 
 } // namespace
 
+EngineFacade::EngineFacade()
+    : address_list_(std::make_unique<ce::AddressListController>()) {}
+
 EngineFacade::~EngineFacade() {
     cancel_scan();
     join_scan_worker();
+    address_list_->setProcess(nullptr);
 }
 
 rust::Vec<ProcessRow> EngineFacade::list_processes(rust::Str query,
@@ -770,6 +798,7 @@ AttachResult EngineFacade::attach(std::int32_t pid, rust::Str display_name) {
         if (read && *read == sizeof byte) {
             clear_scan_state();
             process_ = std::move(candidate);
+            address_list_->setProcess(process_.get());
             result.success = true;
             return result;
         }
@@ -793,6 +822,7 @@ void EngineFacade::detach() noexcept {
     cancel_scan();
     join_scan_worker();
     clear_scan_state();
+    address_list_->setProcess(nullptr);
     process_.reset();
 }
 
@@ -1072,6 +1102,187 @@ void EngineFacade::cancel_scan() noexcept {
     if (!scan_running_.load(std::memory_order_acquire) || !scanner_) return;
     scan_cancel_requested_.store(true, std::memory_order_release);
     scanner_->cancel();
+}
+
+AddressPage EngineFacade::address_rows(std::uint64_t start, std::uint32_t limit,
+                                       bool refresh_values) {
+    AddressPage page;
+    page.generation = address_list_->generation();
+    page.start = start;
+    page.total_count = static_cast<std::uint64_t>(address_list_->count());
+    page.error_message = "";
+    page.start = std::min(page.start, page.total_count);
+    const auto bounded_start = static_cast<std::size_t>(std::min<std::uint64_t>(
+        page.start, std::numeric_limits<std::size_t>::max()));
+    const auto bounded_limit = static_cast<std::size_t>(
+        std::min(limit, kMaxAddressPageSize));
+    for (const auto& record :
+         address_list_->records(bounded_start, bounded_limit, refresh_values)) {
+        page.rows.push_back(AddressRow{
+            .id = record.id,
+            .description = sanitize_utf8(record.description),
+            .address = static_cast<std::uint64_t>(record.address),
+            .address_expression = sanitize_utf8(record.addressExpression),
+            .value_type = bridge_value_type(record.type),
+            .type_name = ce::valueTypeName(record.type),
+            .value = sanitize_utf8(record.value),
+            .error_message = sanitize_utf8(record.error),
+            .readable = record.readable,
+            .active = record.active,
+            .freeze_mode = static_cast<std::uint8_t>(record.freezeMode),
+            .show_as_hex = record.showAsHex,
+            .byte_count = static_cast<std::uint32_t>(std::min<std::size_t>(
+                record.byteCount, std::numeric_limits<std::uint32_t>::max())),
+            .is_group = record.isGroup,
+            .indent = record.indent,
+        });
+    }
+    return page;
+}
+
+AddressActionResult EngineFacade::add_scan_result(std::uint64_t generation,
+                                                   std::uint64_t scan_index,
+                                                   rust::Str description) {
+    AddressActionResult response;
+    response.accepted = false;
+    response.id = 0;
+    response.error_code = "";
+    response.error_message = "";
+    std::string label(description);
+    if (label.size() > kMaxAddressDescriptionSize) label.resize(kMaxAddressDescriptionSize);
+
+    std::lock_guard lock(scan_mutex_);
+    const auto current_generation = scan_generation_.load(std::memory_order_acquire);
+    if (generation != current_generation) {
+        response.error_code = "stale_scan_result";
+        response.error_message = "The scan result changed before it could be added.";
+        return response;
+    }
+    if (scan_running_.load(std::memory_order_acquire)) {
+        response.error_code = "scan_in_progress";
+        response.error_message = "Wait for the current scan to finish before adding a result.";
+        return response;
+    }
+    if (!scan_result_ || !scan_config_) {
+        response.error_code = "no_scan_result";
+        response.error_message = "No completed scan result is available.";
+        return response;
+    }
+    if (scan_index >= static_cast<std::uint64_t>(scan_result_->count()) ||
+        scan_index > std::numeric_limits<std::size_t>::max()) {
+        response.error_code = "scan_result_not_found";
+        response.error_message = "The selected scan result no longer exists.";
+        return response;
+    }
+
+    try {
+        const auto address = scan_result_->address(static_cast<std::size_t>(scan_index));
+        const auto result = address_list_->addRecord(
+            address, scan_config_->valueType, label, scan_value_size(*scan_config_),
+            scan_display_hex_);
+        response.accepted = result.success;
+        response.id = result.id;
+        response.error_code = result.errorCode;
+        response.error_message = result.errorMessage;
+    } catch (const std::exception& error) {
+        response.error_code = "scan_result_unavailable";
+        response.error_message = error.what();
+    }
+    return response;
+}
+
+AddressActionResult EngineFacade::add_address(std::uint64_t address,
+                                              std::uint8_t value_type,
+                                              rust::Str description,
+                                              std::uint32_t byte_count,
+                                              bool show_as_hex) {
+    AddressActionResult response;
+    response.accepted = false;
+    response.id = 0;
+    response.error_code = "";
+    response.error_message = "";
+    const auto type = scan_value_type(value_type);
+    if (!type) {
+        response.error_code = "invalid_value_type";
+        response.error_message = "The address-list value type is not supported.";
+        return response;
+    }
+    if (address > std::numeric_limits<std::uintptr_t>::max()) {
+        response.error_code = "invalid_address";
+        response.error_message = "The address does not fit this platform.";
+        return response;
+    }
+    std::string label(description);
+    if (label.size() > kMaxAddressDescriptionSize) label.resize(kMaxAddressDescriptionSize);
+    const auto result = address_list_->addRecord(
+        static_cast<std::uintptr_t>(address), *type, label, byte_count, show_as_hex);
+    response.accepted = result.success;
+    response.id = result.id;
+    response.error_code = result.errorCode;
+    response.error_message = result.errorMessage;
+    return response;
+}
+
+AddressActionResult EngineFacade::set_address_value(std::int32_t id, rust::Str value) {
+    AddressActionResult response;
+    std::string text(value);
+    if (text.size() > kMaxAddressTextSize) {
+        response.accepted = false;
+        response.id = id;
+        response.error_code = "value_too_large";
+        response.error_message = "The address-list value is too large.";
+        return response;
+    }
+    const auto result = address_list_->writeRecordValue(id, text);
+    response.accepted = result.success;
+    response.id = result.id;
+    response.error_code = result.errorCode;
+    response.error_message = result.errorMessage;
+    return response;
+}
+
+AddressActionResult EngineFacade::set_address_active(std::int32_t id, bool active) {
+    const auto result = address_list_->activateRecord(id, active);
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+AddressActionResult EngineFacade::set_address_freeze_mode(std::int32_t id,
+                                                          std::uint8_t mode) {
+    if (mode > static_cast<std::uint8_t>(ce::FreezeMode::NeverDecrease)) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "invalid_freeze_mode",
+            .error_message = "The freeze mode is not supported.",
+        };
+    }
+    const auto result = address_list_->changeFreezeMode(
+        id, static_cast<ce::FreezeMode>(mode));
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+AddressActionResult EngineFacade::delete_address(std::int32_t id) {
+    const auto result = address_list_->removeRecord(id);
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+void EngineFacade::freeze_addresses() noexcept {
+    address_list_->freezeTick();
 }
 
 void EngineFacade::join_scan_worker() noexcept {

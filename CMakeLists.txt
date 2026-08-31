@@ -177,6 +177,7 @@ endif()
 
 # ── libcecore C++ library ──
 add_library(cecore SHARED
+    core/address_list_controller.cpp
     core/types.cpp
     core/version.cpp
     core/autoasm.cpp

@@ -31,15 +31,27 @@ Completed in the foundation and first vertical slices:
   reattach state preservation, bounded Int32 paging, float ranges,
   case-insensitive text plus Next Scan, AOB wildcards, variable-width
   Unknown/Changed scans, and All-type ranges/snapshots;
+- a toolkit-neutral `AddressListController` in `libcecore` with stable record
+  IDs, bounded snapshots, live scalar/text/AOB reads and writes, pointer-address
+  expression resolution, safe session changes, five freeze modes, and group-aware
+  deletion;
+- bounded address-list endpoints in the CXX facade plus a GTK address list that
+  accepts scan results and manual addresses, refreshes live values, edits on
+  Enter, freezes at 100 ms, selects directional freeze policy, and removes
+  records;
+- bridge tests that exercise real self-process writes, normal and directional
+  freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
+  codecs;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The current pager deliberately keeps only one bounded page in GTK.  A later
 performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
-contract.  The next functional slice extracts the toolkit-neutral address-list
-controller and then connects scan results to editable/freezeable records.  No
-product identifier should be published before the branding decision.
+contract.  The address-list controller is now the GTK source of truth; the next
+slice moves the legacy Qt model onto that controller and adds grouping,
+reordering, and `.CT` persistence before script activation.  No product
+identifier should be published before the branding decision.
 
 ## Goal
 
@@ -355,6 +367,10 @@ recorded in a short decision note before public release.
 4. ~~Asynchronous Int32 first-scan spike with progress and cancellation.~~
 5. ~~Replace the preview with generation-aware, bounded result paging.~~
 6. ~~Add exact Int32 next scan and one-level undo.~~
-7. Add the complete scan request/value-type/comparison surface.
+7. ~~Add the complete scan request/value-type/comparison surface.~~
 8. Replace the explicit pager with a virtualized bounded-cache GTK model.
-9. Extract the toolkit-neutral address-list controller and adapt Qt to it.
+9. Extract the toolkit-neutral address-list controller and adapt Qt to it
+   (controller and GTK adapter complete; Qt adapter remains).
+10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
+11. Add grouping/reordering and lossless `.CT` load/save through the shared
+    controller, then gate script activation behind an explicit trust prompt.

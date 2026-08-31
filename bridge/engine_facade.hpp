@@ -10,6 +10,7 @@
 #include <thread>
 
 namespace ce {
+class AddressListController;
 class MemoryScanner;
 class ProcessHandle;
 class ScanResult;
@@ -25,6 +26,9 @@ struct ScanActionResult;
 struct ScanRequest;
 struct ScanStatus;
 struct ScanPage;
+struct AddressRow;
+struct AddressPage;
+struct AddressActionResult;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -32,7 +36,7 @@ struct ScanPage;
 /// the C++ side.  Only explicitly reviewed bridge-safe values belong here.
 class EngineFacade {
 public:
-    EngineFacade() noexcept = default;
+    EngineFacade();
     ~EngineFacade();
 
     rust::String version() const;
@@ -48,6 +52,19 @@ public:
     ScanPage scan_rows(std::uint64_t generation, std::uint64_t start,
                        std::uint32_t limit) const;
     void cancel_scan() noexcept;
+    AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
+                             bool refresh_values);
+    AddressActionResult add_scan_result(std::uint64_t scan_generation,
+                                        std::uint64_t scan_index,
+                                        rust::Str description);
+    AddressActionResult add_address(std::uint64_t address, std::uint8_t value_type,
+                                    rust::Str description, std::uint32_t byte_count,
+                                    bool show_as_hex);
+    AddressActionResult set_address_value(std::int32_t id, rust::Str value);
+    AddressActionResult set_address_active(std::int32_t id, bool active);
+    AddressActionResult set_address_freeze_mode(std::int32_t id, std::uint8_t mode);
+    AddressActionResult delete_address(std::int32_t id);
+    void freeze_addresses() noexcept;
 
 private:
     void join_scan_worker() noexcept;
@@ -59,6 +76,7 @@ private:
     std::unique_ptr<ce::ScanResult> undo_scan_result_;
     std::unique_ptr<ce::ScanConfig> scan_config_;
     std::unique_ptr<ce::ScanConfig> undo_scan_config_;
+    std::unique_ptr<ce::AddressListController> address_list_;
     bool scan_display_hex_ = false;
     bool undo_scan_display_hex_ = false;
     std::thread scan_worker_;

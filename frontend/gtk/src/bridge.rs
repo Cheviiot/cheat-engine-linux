@@ -93,6 +93,39 @@ mod ffi {
         rows: Vec<ScanHit>,
     }
 
+    struct AddressRow {
+        id: i32,
+        description: String,
+        address: u64,
+        address_expression: String,
+        value_type: u8,
+        type_name: String,
+        value: String,
+        error_message: String,
+        readable: bool,
+        active: bool,
+        freeze_mode: u8,
+        show_as_hex: bool,
+        byte_count: u32,
+        is_group: bool,
+        indent: i32,
+    }
+
+    struct AddressPage {
+        generation: u64,
+        start: u64,
+        total_count: u64,
+        error_message: String,
+        rows: Vec<AddressRow>,
+    }
+
+    struct AddressActionResult {
+        accepted: bool,
+        id: i32,
+        error_code: String,
+        error_message: String,
+    }
+
     unsafe extern "C++" {
         include!("bridge/engine_facade.hpp");
 
@@ -112,6 +145,43 @@ mod ffi {
         fn scan_status(self: &EngineFacade) -> ScanStatus;
         fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
+        fn address_rows(
+            self: Pin<&mut EngineFacade>,
+            start: u64,
+            limit: u32,
+            refresh_values: bool,
+        ) -> AddressPage;
+        fn add_scan_result(
+            self: Pin<&mut EngineFacade>,
+            scan_generation: u64,
+            scan_index: u64,
+            description: &str,
+        ) -> AddressActionResult;
+        fn add_address(
+            self: Pin<&mut EngineFacade>,
+            address: u64,
+            value_type: u8,
+            description: &str,
+            byte_count: u32,
+            show_as_hex: bool,
+        ) -> AddressActionResult;
+        fn set_address_value(
+            self: Pin<&mut EngineFacade>,
+            id: i32,
+            value: &str,
+        ) -> AddressActionResult;
+        fn set_address_active(
+            self: Pin<&mut EngineFacade>,
+            id: i32,
+            active: bool,
+        ) -> AddressActionResult;
+        fn set_address_freeze_mode(
+            self: Pin<&mut EngineFacade>,
+            id: i32,
+            mode: u8,
+        ) -> AddressActionResult;
+        fn delete_address(self: Pin<&mut EngineFacade>, id: i32) -> AddressActionResult;
+        fn freeze_addresses(self: Pin<&mut EngineFacade>);
     }
 }
 
@@ -410,6 +480,71 @@ pub struct ScanPage {
     pub rows: Vec<ScanHit>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FreezeMode {
+    Normal = 0,
+    IncreaseOnly = 1,
+    DecreaseOnly = 2,
+    NeverIncrease = 3,
+    NeverDecrease = 4,
+}
+
+impl FreezeMode {
+    pub const LABELS: [&'static str; 5] = [
+        "Locked",
+        "Allow increase",
+        "Allow decrease",
+        "Never increase",
+        "Never decrease",
+    ];
+
+    pub fn from_index(index: u32) -> Option<Self> {
+        Some(match index {
+            0 => Self::Normal,
+            1 => Self::IncreaseOnly,
+            2 => Self::DecreaseOnly,
+            3 => Self::NeverIncrease,
+            4 => Self::NeverDecrease,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressRecord {
+    pub id: i32,
+    pub description: String,
+    pub address: u64,
+    pub address_expression: String,
+    pub value_type: ScanValueType,
+    pub type_name: String,
+    pub value: String,
+    pub error_message: String,
+    pub readable: bool,
+    pub active: bool,
+    pub freeze_mode: FreezeMode,
+    pub show_as_hex: bool,
+    pub byte_count: u32,
+    pub is_group: bool,
+    pub indent: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressPage {
+    pub generation: u64,
+    pub start: u64,
+    pub total_count: u64,
+    pub error_message: String,
+    pub rows: Vec<AddressRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressError {
+    pub code: String,
+    pub message: String,
+}
+
 pub struct Engine {
     inner: cxx::UniquePtr<ffi::EngineFacade>,
 }
@@ -561,6 +696,107 @@ impl Engine {
     pub fn cancel_scan(&mut self) {
         self.inner.pin_mut().cancel_scan();
     }
+
+    pub fn address_rows(&mut self, start: u64, limit: u32, refresh_values: bool) -> AddressPage {
+        let page = self
+            .inner
+            .pin_mut()
+            .address_rows(start, limit, refresh_values);
+        AddressPage {
+            generation: page.generation,
+            start: page.start,
+            total_count: page.total_count,
+            error_message: page.error_message,
+            rows: page
+                .rows
+                .into_iter()
+                .filter_map(|row| {
+                    Some(AddressRecord {
+                        id: row.id,
+                        description: row.description,
+                        address: row.address,
+                        address_expression: row.address_expression,
+                        value_type: ScanValueType::from_index(u32::from(row.value_type))?,
+                        type_name: row.type_name,
+                        value: row.value,
+                        error_message: row.error_message,
+                        readable: row.readable,
+                        active: row.active,
+                        freeze_mode: FreezeMode::from_index(u32::from(row.freeze_mode))?,
+                        show_as_hex: row.show_as_hex,
+                        byte_count: row.byte_count,
+                        is_group: row.is_group,
+                        indent: row.indent,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    pub fn add_scan_result(
+        &mut self,
+        scan_generation: u64,
+        scan_index: u64,
+        description: &str,
+    ) -> Result<i32, AddressError> {
+        address_action(self.inner.pin_mut().add_scan_result(
+            scan_generation,
+            scan_index,
+            description,
+        ))
+    }
+
+    pub fn add_address(
+        &mut self,
+        address: u64,
+        value_type: ScanValueType,
+        description: &str,
+        byte_count: u32,
+        show_as_hex: bool,
+    ) -> Result<i32, AddressError> {
+        address_action(self.inner.pin_mut().add_address(
+            address,
+            value_type as u8,
+            description,
+            byte_count,
+            show_as_hex,
+        ))
+    }
+
+    pub fn set_address_value(&mut self, id: i32, value: &str) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_address_value(id, value)).map(|_| ())
+    }
+
+    pub fn set_address_active(&mut self, id: i32, active: bool) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_address_active(id, active)).map(|_| ())
+    }
+
+    pub fn set_address_freeze_mode(
+        &mut self,
+        id: i32,
+        mode: FreezeMode,
+    ) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_address_freeze_mode(id, mode as u8)).map(|_| ())
+    }
+
+    pub fn delete_address(&mut self, id: i32) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().delete_address(id)).map(|_| ())
+    }
+
+    pub fn freeze_addresses(&mut self) {
+        self.inner.pin_mut().freeze_addresses();
+    }
+}
+
+fn address_action(result: ffi::AddressActionResult) -> Result<i32, AddressError> {
+    if result.accepted {
+        Ok(result.id)
+    } else {
+        Err(AddressError {
+            code: result.error_code,
+            message: result.error_message,
+        })
+    }
 }
 
 impl Default for Engine {
@@ -571,10 +807,11 @@ impl Default for Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::UnsafeCell;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::{Engine, ScanComparison, ScanRequest, ScanStatus, ScanValueType};
+    use super::{Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType};
 
     fn wait_for_scan(engine: &Engine) -> ScanStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -925,6 +1162,181 @@ mod tests {
             "\u{fffd}\u{fffd}"
         );
         std::hint::black_box(&bytes);
+    }
+
+    #[test]
+    fn address_records_read_write_freeze_and_survive_detach_safely() {
+        let value = Box::new(UnsafeCell::new(41_i32));
+        let address = value.get() as u64;
+        let mut engine = attached_engine();
+        let id = engine
+            .add_address(address, ScanValueType::Int32, "Score", 0, false)
+            .expect("add a manual address");
+
+        let page = engine.address_rows(0, 10_000, true);
+        assert_eq!(page.total_count, 1);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].id, id);
+        assert_eq!(page.rows[0].description, "Score");
+        assert_eq!(page.rows[0].value, "41");
+        assert!(page.rows[0].readable);
+
+        engine
+            .set_address_value(id, "77")
+            .expect("write the address-list value");
+        // SAFETY: UnsafeCell is the synchronization boundary for the external
+        // process-memory write performed by the engine in this single thread.
+        assert_eq!(unsafe { *value.get() }, 77);
+
+        engine
+            .set_address_active(id, true)
+            .expect("freeze the address-list value");
+        unsafe { *value.get() = 5 };
+        engine.freeze_addresses();
+        assert_eq!(unsafe { *value.get() }, 77);
+
+        engine
+            .set_address_freeze_mode(id, FreezeMode::IncreaseOnly)
+            .expect("change the freeze mode");
+        unsafe { *value.get() = 100 };
+        engine.freeze_addresses();
+        assert_eq!(unsafe { *value.get() }, 100, "allowed increase must remain");
+        unsafe { *value.get() = 1 };
+        engine.freeze_addresses();
+        assert_eq!(
+            unsafe { *value.get() },
+            77,
+            "decrease below the floor is restored"
+        );
+
+        engine.detach();
+        let detached = engine.address_rows(0, 10, false);
+        assert_eq!(detached.total_count, 1);
+        assert!(!detached.rows[0].active);
+        assert!(!detached.rows[0].readable);
+        assert_eq!(detached.rows[0].value, "??");
+
+        engine.delete_address(id).expect("remove the record");
+        assert_eq!(engine.address_rows(0, 10, false).total_count, 0);
+        std::hint::black_box(value);
+    }
+
+    #[test]
+    fn scan_results_add_by_generation_and_reject_stale_rows() {
+        let values = [111_i32, 222_i32];
+        let address = values.as_ptr() as u64;
+        let mut engine = attached_engine();
+        let first_request = ScanRequest {
+            value: "222".to_owned(),
+            start_address: address,
+            stop_address: address + std::mem::size_of_val(&values) as u64,
+            alignment: 4,
+            ..ScanRequest::default()
+        };
+        engine
+            .start_first_scan(&first_request)
+            .expect("start the source scan");
+        let first = wait_for_scan(&engine);
+        assert!(first.completed, "scan failed: {}", first.error_message);
+        assert_eq!(first.result_count, 1);
+
+        let id = engine
+            .add_scan_result(first.generation, 0, "Scanned value")
+            .expect("add the scan result");
+        let records = engine.address_rows(0, 10, true);
+        assert_eq!(records.rows[0].id, id);
+        assert_eq!(records.rows[0].address, address + 4);
+        assert_eq!(records.rows[0].value, "222");
+        assert_eq!(records.rows[0].value_type, ScanValueType::Int32);
+
+        let second_request = ScanRequest {
+            value: "111".to_owned(),
+            ..first_request
+        };
+        engine
+            .start_first_scan(&second_request)
+            .expect("replace the result set");
+        let second = wait_for_scan(&engine);
+        assert!(second.completed);
+        let error = engine
+            .add_scan_result(first.generation, 0, "Stale")
+            .expect_err("stale result generation must be rejected");
+        assert_eq!(error.code, "stale_scan_result");
+        std::hint::black_box(values);
+    }
+
+    #[test]
+    fn address_records_encode_float_text_unicode_and_bytes() {
+        let float_value = Box::new(UnsafeCell::new(1.5_f32));
+        let text_value = Box::new(UnsafeCell::new(*b"abcdefgh"));
+        let unicode_value = Box::new(UnsafeCell::new([0_u8; 8]));
+        let bytes_value = Box::new(UnsafeCell::new([0_u8; 4]));
+        let mut engine = attached_engine();
+
+        let float_id = engine
+            .add_address(
+                float_value.get() as u64,
+                ScanValueType::Float,
+                "Float",
+                0,
+                false,
+            )
+            .expect("add float");
+        let text_id = engine
+            .add_address(
+                text_value.get() as u64,
+                ScanValueType::String,
+                "Text",
+                8,
+                false,
+            )
+            .expect("add text");
+        let unicode_id = engine
+            .add_address(
+                unicode_value.get() as u64,
+                ScanValueType::UnicodeString,
+                "Unicode",
+                8,
+                false,
+            )
+            .expect("add unicode");
+        let bytes_id = engine
+            .add_address(
+                bytes_value.get() as u64,
+                ScanValueType::ByteArray,
+                "Bytes",
+                4,
+                false,
+            )
+            .expect("add bytes");
+
+        engine
+            .set_address_value(float_id, "2,5")
+            .expect("write comma-decimal float");
+        engine
+            .set_address_value(text_id, "Rust")
+            .expect("write padded UTF-8 text");
+        engine
+            .set_address_value(unicode_id, "Ж")
+            .expect("write padded UTF-16 text");
+        engine
+            .set_address_value(bytes_id, "90 90 48 8B")
+            .expect("write byte array");
+
+        assert_eq!(unsafe { *float_value.get() }, 2.5);
+        assert_eq!(unsafe { *text_value.get() }, *b"Rust\0\0\0\0");
+        assert_eq!(
+            unsafe { *unicode_value.get() },
+            [0x16, 0x04, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(unsafe { *bytes_value.get() }, [0x90, 0x90, 0x48, 0x8b]);
+
+        let page = engine.address_rows(0, 10, true);
+        assert_eq!(page.rows[0].value, "2.5");
+        assert_eq!(page.rows[1].value, "Rust");
+        assert_eq!(page.rows[2].value, "Ж");
+        assert_eq!(page.rows[3].value, "90 90 48 8B");
+        std::hint::black_box((float_value, text_value, unicode_value, bytes_value));
     }
 
     #[test]

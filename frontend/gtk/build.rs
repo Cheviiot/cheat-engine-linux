@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/bridge.rs");
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.hpp");
     println!("cargo:rerun-if-changed=../../core/value_transform.hpp");
+    println!("cargo:rerun-if-changed=../../core/address_list_controller.hpp");
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.cpp");
     println!("cargo:rerun-if-changed=../../core/version.hpp");
     println!("cargo:rerun-if-changed=../../core/target_profile.hpp");

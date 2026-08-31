@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -7,14 +8,17 @@ use adw::prelude::*;
 use gtk::{Align, Orientation};
 
 use crate::bridge::{
-    AttachError, Engine, Process, ProtectionMatch, ScanComparison, ScanRequest, ScanValueType,
-    Session,
+    AddressRecord, AttachError, Engine, FreezeMode, Process, ProtectionMatch, ScanComparison,
+    ScanRequest, ScanValueType, Session,
 };
 use crate::process_dialog;
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SCAN_PAGE_SIZE: u32 = 128;
+const ADDRESS_PAGE_SIZE: u32 = 256;
+const FREEZE_INTERVAL: Duration = Duration::from_millis(100);
+const ADDRESS_REFRESH_TICKS: u8 = 5;
 
 #[derive(Clone)]
 struct SessionState {
@@ -24,6 +28,7 @@ struct SessionState {
     scanning: Rc<Cell<bool>>,
     scan_generation: Rc<Cell<u64>>,
     scan_page_start: Rc<Cell<u64>>,
+    address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
 }
 
 #[derive(Clone)]
@@ -63,6 +68,8 @@ struct SessionWidgets {
     previous_page_button: gtk::Button,
     next_page_button: gtk::Button,
     page_label: gtk::Label,
+    address_list: gtk::ListBox,
+    address_summary: gtk::Label,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +97,7 @@ fn build_window(application: &adw::Application) {
         scanning: Rc::new(Cell::new(false)),
         scan_generation: Rc::new(Cell::new(0)),
         scan_page_start: Rc::new(Cell::new(0)),
+        address_value_entries: Rc::new(RefCell::new(HashMap::new())),
     };
 
     let header = adw::HeaderBar::builder().show_title(false).build();
@@ -339,6 +347,39 @@ fn build_window(application: &adw::Application) {
     page_actions.append(&page_label);
     page_actions.append(&next_page_button);
 
+    let address_title = gtk::Label::builder()
+        .label("Address list")
+        .css_classes(["title-3"])
+        .halign(Align::Start)
+        .hexpand(true)
+        .build();
+    let add_address_button = gtk::Button::builder()
+        .label("Add manually")
+        .icon_name("list-add-symbolic")
+        .css_classes(["flat"])
+        .build();
+    let address_header = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    address_header.append(&address_title);
+    address_header.append(&add_address_button);
+    let address_summary = gtk::Label::builder()
+        .label("Add scan results here to edit or freeze their live values.")
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    let address_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let address_list_scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(180)
+        .child(&address_list)
+        .build();
+
     let content = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(18)
@@ -363,6 +404,10 @@ fn build_window(application: &adw::Application) {
     content.append(&scan_summary);
     content.append(&scan_results_scrolled);
     content.append(&page_actions);
+    content.append(&gtk::Separator::new(Orientation::Horizontal));
+    content.append(&address_header);
+    content.append(&address_summary);
+    content.append(&address_list_scrolled);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(720)
@@ -372,7 +417,11 @@ fn build_window(application: &adw::Application) {
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&clamp));
+    let content_scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .build();
+    toolbar_view.set_content(Some(&content_scrolled));
 
     let window = adw::ApplicationWindow::builder()
         .application(application)
@@ -418,6 +467,8 @@ fn build_window(application: &adw::Application) {
         previous_page_button,
         next_page_button,
         page_label,
+        address_list,
+        address_summary,
     };
 
     update_scan_option_visibility(&widgets);
@@ -532,6 +583,15 @@ fn build_window(application: &adw::Application) {
             load_scan_page(&state, &widgets, start);
         }
     });
+
+    add_address_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| present_add_address_dialog(&window, &state, &widgets)
+    });
+
+    install_address_refresh_timer(&state, &widgets);
 
     window.present();
 }
@@ -733,6 +793,7 @@ fn show_attached(state: &SessionState, widgets: &SessionWidgets, session: &Sessi
     widgets
         .scan_summary
         .set_label("Choose a value type, comparison, and scan value.");
+    reload_address_list(state, widgets, true);
 }
 
 fn show_attach_error(
@@ -775,6 +836,7 @@ fn detach(state: &SessionState, widgets: &SessionWidgets) {
         .session_button
         .set_sensitive(state.selected.borrow().is_some());
     reset_scan_ui(state, widgets);
+    reload_address_list(state, widgets, false);
 }
 
 fn session_description(session: &Session) -> String {
@@ -1029,14 +1091,55 @@ fn build_scan_request(widgets: &SessionWidgets) -> Result<ScanRequest, String> {
     })
 }
 
-fn render_scan_results(list: &gtk::ListBox, hits: &[crate::bridge::ScanHit]) {
-    clear_scan_results(list);
-    for hit in hits {
+fn render_scan_results(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    hits: &[crate::bridge::ScanHit],
+    page_start: u64,
+) {
+    clear_scan_results(&widgets.scan_results);
+    for (offset, hit) in hits.iter().enumerate() {
         let row = adw::ActionRow::builder()
             .title(format!("0x{:016X}", hit.address))
             .subtitle(format!("Value: {}", hit.value))
             .build();
-        list.append(&row);
+        let add_button = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Add to the address list")
+            .valign(Align::Center)
+            .css_classes(["flat"])
+            .build();
+        add_button.connect_clicked({
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let scan_index = page_start.saturating_add(offset as u64);
+            move |button| {
+                button.set_sensitive(false);
+                let result = state
+                    .engine
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("engine remains present while adding a scan result")
+                    .add_scan_result(state.scan_generation.get(), scan_index, "No description");
+                match result {
+                    Ok(_) => {
+                        widgets
+                            .address_summary
+                            .set_label("The scan result was added to the address list.");
+                        reload_address_list(&state, &widgets, true);
+                    }
+                    Err(error) => {
+                        widgets.address_summary.set_label(&format!(
+                            "Could not add the result: {} ({})",
+                            error.message, error.code
+                        ));
+                        button.set_sensitive(true);
+                    }
+                }
+            }
+        });
+        row.add_suffix(&add_button);
+        widgets.scan_results.append(&row);
     }
 }
 
@@ -1066,7 +1169,7 @@ fn load_scan_page(state: &SessionState, widgets: &SessionWidgets, start: u64) {
     }
 
     state.scan_page_start.set(page.start);
-    render_scan_results(&widgets.scan_results, &page.rows);
+    render_scan_results(state, widgets, &page.rows, page.start);
 
     let shown_end = page.start.saturating_add(page.rows.len() as u64);
     if page.total_count == 0 {
@@ -1090,6 +1193,363 @@ fn load_scan_page(state: &SessionState, widgets: &SessionWidgets, start: u64) {
 fn clear_scan_results(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
+    }
+}
+
+fn present_add_address_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+) {
+    let address = gtk::Entry::builder()
+        .placeholder_text("0x7FFF…")
+        .hexpand(true)
+        .build();
+    let description = gtk::Entry::builder()
+        .text("Manual entry")
+        .hexpand(true)
+        .build();
+    let value_type = gtk::DropDown::from_strings(&ScanValueType::LABELS);
+    value_type.set_selected(ScanValueType::Int32 as u32);
+    value_type.set_hexpand(true);
+    let byte_count = gtk::Entry::builder()
+        .placeholder_text("Automatic")
+        .hexpand(true)
+        .build();
+    let hexadecimal = gtk::CheckButton::builder()
+        .label("Show integer as hexadecimal")
+        .build();
+    let fields = gtk::Grid::builder()
+        .column_spacing(12)
+        .row_spacing(9)
+        .margin_top(12)
+        .build();
+    attach_advanced_row(&fields, 0, "Address", &address);
+    attach_advanced_row(&fields, 1, "Description", &description);
+    attach_advanced_row(&fields, 2, "Value type", &value_type);
+    attach_advanced_row(&fields, 3, "Value size (bytes)", &byte_count);
+    fields.attach(&hexadecimal, 1, 4, 1, 1);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Add an address")
+        .body("Create a live record from a raw target address.")
+        .extra_child(&fields)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("add", "Add");
+    dialog.set_default_response(Some("add"));
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.connect_response(Some("add"), {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, _| {
+            let parsed_address = match parse_u64(&address.text(), "Address") {
+                Ok(address) => address,
+                Err(message) => {
+                    widgets.address_summary.set_label(&message);
+                    return;
+                }
+            };
+            let parsed_byte_count = match parse_u32_or_zero(&byte_count.text(), "Value size") {
+                Ok(count) => count,
+                Err(message) => {
+                    widgets.address_summary.set_label(&message);
+                    return;
+                }
+            };
+            let Some(selected_type) = ScanValueType::from_index(value_type.selected()) else {
+                widgets
+                    .address_summary
+                    .set_label("Select a supported address-list value type.");
+                return;
+            };
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while adding an address")
+                .add_address(
+                    parsed_address,
+                    selected_type,
+                    description.text().trim(),
+                    parsed_byte_count,
+                    hexadecimal.is_active(),
+                );
+            match result {
+                Ok(_) => reload_address_list(&state, &widgets, state.attached.get()),
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not add the address: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+    dialog.present(Some(window));
+}
+
+fn install_address_refresh_timer(state: &SessionState, widgets: &SessionWidgets) {
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let ticks = Rc::new(Cell::new(0_u8));
+    adw::glib::timeout_add_local(FREEZE_INTERVAL, move || {
+        if !state.attached.get() {
+            return adw::glib::ControlFlow::Continue;
+        }
+
+        let next_tick = ticks.get().wrapping_add(1);
+        ticks.set(next_tick);
+        let page = {
+            let mut engine_slot = state.engine.borrow_mut();
+            let Some(engine) = engine_slot.as_mut() else {
+                return adw::glib::ControlFlow::Continue;
+            };
+            engine.freeze_addresses();
+            next_tick
+                .is_multiple_of(ADDRESS_REFRESH_TICKS)
+                .then(|| engine.address_rows(0, ADDRESS_PAGE_SIZE, true))
+        };
+        if let Some(page) = page {
+            update_address_values(&state, &widgets, page);
+        }
+        adw::glib::ControlFlow::Continue
+    });
+}
+
+fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_values: bool) {
+    let page = {
+        let mut engine_slot = state.engine.borrow_mut();
+        let Some(engine) = engine_slot.as_mut() else {
+            return;
+        };
+        engine.address_rows(0, ADDRESS_PAGE_SIZE, refresh_values)
+    };
+    render_address_records(state, widgets, page);
+}
+
+fn render_address_records(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    page: crate::bridge::AddressPage,
+) {
+    while let Some(child) = widgets.address_list.first_child() {
+        widgets.address_list.remove(&child);
+    }
+    state.address_value_entries.borrow_mut().clear();
+
+    if !page.error_message.is_empty() {
+        widgets.address_summary.set_label(&page.error_message);
+        return;
+    }
+    if page.total_count == 0 {
+        widgets
+            .address_summary
+            .set_label("Add a scan result to edit or freeze its live value.");
+        return;
+    }
+
+    for record in &page.rows {
+        append_address_record(state, widgets, record);
+    }
+    let truncated = (page.rows.len() as u64) < page.total_count;
+    widgets.address_summary.set_label(&format!(
+        "{} record{}{}",
+        page.total_count,
+        if page.total_count == 1 { "" } else { "s" },
+        if truncated {
+            " · showing the first 256"
+        } else if state.attached.get() {
+            " · live values refresh automatically"
+        } else {
+            " · attach to refresh values"
+        }
+    ));
+}
+
+fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record: &AddressRecord) {
+    let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
+    let address = if record.address_expression.is_empty() {
+        format!("0x{:016X}", record.address)
+    } else {
+        format!("{} → 0x{:016X}", record.address_expression, record.address)
+    };
+    let subtitle = if record.error_message.is_empty() {
+        format!("{address} · {}", record.type_name)
+    } else {
+        format!(
+            "{address} · {} · {}",
+            record.type_name, record.error_message
+        )
+    };
+    let row = adw::ActionRow::builder()
+        .title(format!("{indent}{}", record.description))
+        .subtitle(subtitle)
+        .build();
+
+    let value_entry = gtk::Entry::builder()
+        .text(&record.value)
+        .placeholder_text("Value")
+        .width_chars(12)
+        .max_width_chars(22)
+        .valign(Align::Center)
+        .sensitive(state.attached.get() && !record.is_group)
+        .css_classes(["monospace"])
+        .build();
+    if !record.readable {
+        value_entry.add_css_class("error");
+    }
+    if !record.error_message.is_empty() {
+        value_entry.set_tooltip_text(Some(&record.error_message));
+    }
+    value_entry.connect_activate({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |entry| {
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while editing an address")
+                .set_address_value(id, &entry.text());
+            match result {
+                Ok(()) => reload_address_list(&state, &widgets, true),
+                Err(error) => {
+                    widgets.address_summary.set_label(&format!(
+                        "Could not write the value: {} ({})",
+                        error.message, error.code
+                    ));
+                    entry.add_css_class("error");
+                    entry.set_tooltip_text(Some(&error.message));
+                }
+            }
+        }
+    });
+
+    let freeze_mode = gtk::DropDown::from_strings(&FreezeMode::LABELS);
+    freeze_mode.set_selected(record.freeze_mode as u32);
+    freeze_mode.set_tooltip_text(Some("Freeze mode"));
+    freeze_mode.set_valign(Align::Center);
+    freeze_mode.set_sensitive(state.attached.get() && !record.is_group);
+    freeze_mode.connect_selected_notify({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |dropdown| {
+            let Some(mode) = FreezeMode::from_index(dropdown.selected()) else {
+                return;
+            };
+            if let Err(error) = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while changing a freeze mode")
+                .set_address_freeze_mode(id, mode)
+            {
+                widgets.address_summary.set_label(&format!(
+                    "Could not change the freeze mode: {} ({})",
+                    error.message, error.code
+                ));
+            }
+        }
+    });
+
+    let freeze = gtk::CheckButton::builder()
+        .active(record.active)
+        .tooltip_text("Freeze this value")
+        .valign(Align::Center)
+        .sensitive(state.attached.get() && !record.is_group)
+        .build();
+    freeze.connect_toggled({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |button| {
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while freezing an address")
+                .set_address_active(id, button.is_active());
+            if let Err(error) = result {
+                widgets.address_summary.set_label(&format!(
+                    "Could not freeze the value: {} ({})",
+                    error.message, error.code
+                ));
+                reload_address_list(&state, &widgets, true);
+            }
+        }
+    });
+
+    let delete = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Remove from the address list")
+        .valign(Align::Center)
+        .css_classes(["flat"])
+        .build();
+    delete.connect_clicked({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |_| {
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while deleting an address")
+                .delete_address(id);
+            match result {
+                Ok(()) => reload_address_list(&state, &widgets, true),
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not remove the record: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+
+    if !record.is_group {
+        row.add_suffix(&value_entry);
+        row.add_suffix(&freeze_mode);
+        row.add_suffix(&freeze);
+        state
+            .address_value_entries
+            .borrow_mut()
+            .insert(record.id, value_entry);
+    }
+    row.add_suffix(&delete);
+    widgets.address_list.append(&row);
+}
+
+fn update_address_values(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    page: crate::bridge::AddressPage,
+) {
+    let entries = state.address_value_entries.borrow();
+    if entries.len() != page.rows.iter().filter(|row| !row.is_group).count() {
+        drop(entries);
+        render_address_records(state, widgets, page);
+        return;
+    }
+    for record in &page.rows {
+        if record.is_group {
+            continue;
+        }
+        let Some(entry) = entries.get(&record.id) else {
+            drop(entries);
+            render_address_records(state, widgets, page);
+            return;
+        };
+        if !entry.has_focus() {
+            entry.set_text(&record.value);
+        }
+        if record.readable {
+            entry.remove_css_class("error");
+            entry.set_tooltip_text(None);
+        } else {
+            entry.add_css_class("error");
+            entry.set_tooltip_text(Some(&record.error_message));
+        }
     }
 }
 
