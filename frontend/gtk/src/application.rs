@@ -27,6 +27,7 @@ use crate::scan_result_model::{
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
 static ADDRESS_LIST_SMOKE_OK: AtomicBool = AtomicBool::new(false);
+static MAIN_LAYOUT_SMOKE_OK: AtomicBool = AtomicBool::new(false);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SCRIPT_REVIEW_PAGE_SIZE: u32 = 64;
 const SCRIPT_TEXT_PAGE_SIZE: u32 = 64 << 10;
@@ -119,6 +120,10 @@ pub fn address_list_smoke_ok() -> bool {
     ADDRESS_LIST_SMOKE_OK.load(Ordering::SeqCst)
 }
 
+pub fn main_layout_smoke_ok() -> bool {
+    MAIN_LAYOUT_SMOKE_OK.load(Ordering::SeqCst)
+}
+
 fn build_window(application: &adw::Application) {
     let mut engine = Engine::new();
     let address_list_smoke = std::env::var_os("CE_GTK_ADDRESS_LIST_SMOKE").is_some();
@@ -159,7 +164,12 @@ fn build_window(application: &adw::Application) {
         lua_console_history: Rc::new(RefCell::new(Vec::new())),
     };
 
-    let header = adw::HeaderBar::builder().show_title(false).build();
+    let header = adw::HeaderBar::new();
+    let window_title = adw::WindowTitle::builder()
+        .title("Engine UI")
+        .subtitle(format!("libcecore {core_version} · GTK development build"))
+        .build();
+    header.set_title_widget(Some(&window_title));
     let lua_console_button = gtk::Button::builder()
         .label("Lua Console")
         .icon_name("utilities-terminal-symbolic")
@@ -167,29 +177,11 @@ fn build_window(application: &adw::Application) {
         .build();
     header.pack_end(&lua_console_button);
 
-    let title = gtk::Label::builder()
-        .label("Rust/GTK frontend foundation")
-        .css_classes(["title-1"])
-        .halign(Align::Start)
-        .build();
-
-    let description = gtk::Label::builder()
-        .label("The first migration slice is connected to the existing C++ engine.")
-        .wrap(true)
-        .xalign(0.0)
-        .css_classes(["dim-label"])
-        .build();
-
-    let version = gtk::Label::builder()
-        .label(format!("libcecore {core_version}"))
-        .selectable(true)
-        .xalign(0.0)
-        .build();
-
     let selected_process = gtk::Label::builder()
         .label("No process selected")
         .xalign(0.0)
-        .css_classes(["dim-label"])
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .css_classes(["heading"])
         .build();
 
     let session_details = gtk::Label::builder()
@@ -201,7 +193,9 @@ fn build_window(application: &adw::Application) {
         .build();
 
     let process_button = gtk::Button::builder()
-        .label("Choose process")
+        .label("Open process")
+        .icon_name("system-search-symbolic")
+        .tooltip_text("Choose a running process")
         .css_classes(["pill"])
         .halign(Align::Start)
         .build();
@@ -213,18 +207,26 @@ fn build_window(application: &adw::Application) {
         .halign(Align::Start)
         .build();
 
+    let process_identity = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .valign(Align::Center)
+        .build();
+    process_identity.append(&selected_process);
+    process_identity.append(&session_details);
+
     let session_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(12)
+        .margin_top(10)
+        .margin_bottom(10)
+        .margin_start(12)
+        .margin_end(12)
         .build();
     session_actions.append(&process_button);
+    session_actions.append(&process_identity);
     session_actions.append(&session_button);
-
-    let scan_title = gtk::Label::builder()
-        .label("Memory scan")
-        .css_classes(["title-3"])
-        .halign(Align::Start)
-        .build();
 
     let value_type = gtk::DropDown::from_strings(&ScanValueType::LABELS);
     value_type.set_selected(ScanValueType::Int32 as u32);
@@ -232,12 +234,6 @@ fn build_window(application: &adw::Application) {
     let comparison = gtk::DropDown::from_strings(&ScanComparison::LABELS);
     comparison.set_selected(ScanComparison::Exact as u32);
     comparison.set_hexpand(true);
-    let scan_mode_row = gtk::Box::builder()
-        .orientation(Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    scan_mode_row.append(&value_type);
-    scan_mode_row.append(&comparison);
 
     let scan_value = gtk::Entry::builder()
         .placeholder_text("Value")
@@ -432,7 +428,6 @@ fn build_window(application: &adw::Application) {
     address_header.append(&address_title);
     address_header.append(&open_table_button);
     address_header.append(&save_table_button);
-    address_header.append(&add_address_button);
     let add_group_button = gtk::Button::builder()
         .label("New group")
         .icon_name("folder-new-symbolic")
@@ -480,54 +475,173 @@ fn build_window(application: &adw::Application) {
         .child(&address_list)
         .build();
 
+    // Keep Cheat Engine's proven information architecture while using native
+    // GTK/libadwaita widgets: process across the top, found addresses beside a
+    // fixed-width scan panel, and the cheat table across the full lower pane.
+    let process_frame = gtk::Frame::builder().child(&session_actions).build();
+
+    let result_columns = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["dim-label"])
+        .build();
+    let result_address_column = compact_column_header("Address", 24, true);
+    let result_value_column = compact_column_header("Value", 10, false);
+    result_value_column.set_hexpand(true);
+    result_columns.append(&result_address_column);
+    result_columns.append(&result_value_column);
+    result_columns.append(&compact_column_header("", 4, false));
+
+    let results_footer = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(6)
+        .build();
+    results_footer.append(&page_label);
+    results_footer.append(&add_address_button);
+
+    let results_panel = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    results_panel.append(&result_columns);
+    results_panel.append(&gtk::Separator::new(Orientation::Horizontal));
+    results_panel.append(&scan_results_scrolled);
+    results_panel.append(&results_footer);
+    let results_frame = gtk::Frame::builder()
+        .label("Found addresses")
+        .child(&results_panel)
+        .build();
+
+    let scan_form = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    attach_scan_control_row(&scan_form, 0, "Scan value", &scan_values_row);
+    attach_scan_control_row(&scan_form, 1, "Scan type", &comparison);
+    attach_scan_control_row(&scan_form, 2, "Value type", &value_type);
+
+    let scan_controls = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    scan_controls.append(&scan_actions);
+    scan_controls.append(&scan_form);
+    scan_controls.append(&advanced_options);
+    scan_controls.append(&scan_progress);
+    scan_controls.append(&scan_summary);
+    let scan_controls_scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_width(330)
+        .child(&scan_controls)
+        .build();
+    let scan_controls_frame = gtk::Frame::builder()
+        .label("Scan controls")
+        .child(&scan_controls_scrolled)
+        .build();
+
+    let top_paned = gtk::Paned::new(Orientation::Horizontal);
+    top_paned.set_wide_handle(true);
+    top_paned.set_start_child(Some(&results_frame));
+    top_paned.set_end_child(Some(&scan_controls_frame));
+    top_paned.set_resize_start_child(true);
+    top_paned.set_shrink_start_child(false);
+    top_paned.set_resize_end_child(false);
+    top_paned.set_shrink_end_child(false);
+    top_paned.set_position(690);
+
+    let address_columns = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["dim-label"])
+        .build();
+    address_columns.append(&compact_column_header("Sel", 4, false));
+    address_columns.append(&compact_column_header("Active", 5, false));
+    let description_column = compact_column_header("Description", 18, false);
+    description_column.set_hexpand(true);
+    address_columns.append(&description_column);
+    address_columns.append(&compact_column_header("Address / Type", 28, true));
+    address_columns.append(&compact_column_header("Value", 12, true));
+    address_columns.append(&compact_column_header("Actions", 12, false));
+
+    let address_toolbar = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(6)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    address_toolbar.append(&address_header);
+    address_toolbar.append(&address_structure_actions);
+    address_toolbar.append(&address_summary);
+
+    let address_panel = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .build();
+    address_panel.append(&address_toolbar);
+    address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
+    address_panel.append(&address_columns);
+    address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
+    address_panel.append(&address_list_scrolled);
+    let address_frame = gtk::Frame::builder().child(&address_panel).build();
+
+    let workspace_paned = gtk::Paned::new(Orientation::Vertical);
+    workspace_paned.set_wide_handle(true);
+    workspace_paned.set_start_child(Some(&top_paned));
+    workspace_paned.set_end_child(Some(&address_frame));
+    workspace_paned.set_resize_start_child(false);
+    workspace_paned.set_shrink_start_child(false);
+    workspace_paned.set_resize_end_child(true);
+    workspace_paned.set_shrink_end_child(false);
+    workspace_paned.set_position(390);
+
     let content = gtk::Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(18)
-        .margin_top(36)
-        .margin_bottom(36)
-        .margin_start(36)
-        .margin_end(36)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
         .build();
-    content.append(&title);
-    content.append(&description);
-    content.append(&version);
-    content.append(&selected_process);
-    content.append(&session_details);
-    content.append(&session_actions);
-    content.append(&gtk::Separator::new(Orientation::Horizontal));
-    content.append(&scan_title);
-    content.append(&scan_mode_row);
-    content.append(&scan_values_row);
-    content.append(&scan_actions);
-    content.append(&advanced_options);
-    content.append(&scan_progress);
-    content.append(&scan_summary);
-    content.append(&scan_results_scrolled);
-    content.append(&page_label);
-    content.append(&gtk::Separator::new(Orientation::Horizontal));
-    content.append(&address_header);
-    content.append(&address_structure_actions);
-    content.append(&address_summary);
-    content.append(&address_list_scrolled);
+    content.append(&process_frame);
+    content.append(&workspace_paned);
 
-    let clamp = adw::Clamp::builder()
-        .maximum_size(720)
-        .tightening_threshold(520)
-        .child(&content)
-        .build();
+    MAIN_LAYOUT_SMOKE_OK.store(
+        top_paned.orientation() == Orientation::Horizontal
+            && top_paned.start_child().is_some()
+            && top_paned.end_child().is_some()
+            && workspace_paned.orientation() == Orientation::Vertical
+            && workspace_paned.start_child().is_some()
+            && workspace_paned.end_child().is_some(),
+        Ordering::SeqCst,
+    );
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    let content_scrolled = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&clamp)
-        .build();
-    toolbar_view.set_content(Some(&content_scrolled));
+    toolbar_view.set_content(Some(&content));
 
     let window = adw::ApplicationWindow::builder()
         .application(application)
         .title("Engine UI — development preview")
-        .default_width(900)
+        .default_width(1100)
         .default_height(760)
         .content(&toolbar_view)
         .build();
@@ -756,6 +870,35 @@ fn attach_advanced_row<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, title: &
         .build();
     grid.attach(&label, 0, row, 1, 1);
     grid.attach(child, 1, row, 1, 1);
+}
+
+fn attach_scan_control_row<W: IsA<gtk::Widget>>(
+    grid: &gtk::Grid,
+    row: i32,
+    title: &str,
+    child: &W,
+) {
+    let label = gtk::Label::builder()
+        .label(title)
+        .halign(Align::End)
+        .xalign(1.0)
+        .build();
+    grid.attach(&label, 0, row, 1, 1);
+    grid.attach(child, 1, row, 1, 1);
+}
+
+fn compact_column_header(title: &str, width_chars: i32, monospace: bool) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .width_chars(width_chars)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["caption", "heading"])
+        .build();
+    if monospace {
+        label.add_css_class("monospace");
+    }
+    label
 }
 
 fn update_scan_option_visibility(widgets: &SessionWidgets) {
@@ -1265,22 +1408,18 @@ fn configure_scan_result_factory(
             let list_item = object
                 .downcast_ref::<gtk::ListItem>()
                 .expect("scan result factory receives list items");
-            let title = gtk::Label::builder()
+            let address = gtk::Label::builder()
                 .xalign(0.0)
+                .width_chars(24)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["monospace"])
                 .build();
-            let subtitle = gtk::Label::builder()
+            let value = gtk::Label::builder()
                 .xalign(0.0)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["dim-label"])
-                .build();
-            let labels = gtk::Box::builder()
-                .orientation(Orientation::Vertical)
-                .spacing(3)
                 .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["monospace"])
                 .build();
-            labels.append(&title);
-            labels.append(&subtitle);
             let add_button = gtk::Button::builder()
                 .icon_name("list-add-symbolic")
                 .tooltip_text("Add to the address list")
@@ -1310,12 +1449,13 @@ fn configure_scan_result_factory(
             let row = gtk::Box::builder()
                 .orientation(Orientation::Horizontal)
                 .spacing(12)
-                .margin_top(9)
-                .margin_bottom(9)
+                .margin_top(5)
+                .margin_bottom(5)
                 .margin_start(12)
                 .margin_end(12)
                 .build();
-            row.append(&labels);
+            row.append(&address);
+            row.append(&value);
             row.append(&add_button);
             list_item.set_child(Some(&row));
         }
@@ -1329,19 +1469,15 @@ fn configure_scan_result_factory(
             .child()
             .and_downcast::<gtk::Box>()
             .expect("scan result row");
-        let labels = row
-            .first_child()
-            .and_downcast::<gtk::Box>()
-            .expect("scan result labels");
-        let title = labels
+        let address = row
             .first_child()
             .and_downcast::<gtk::Label>()
-            .expect("scan result title");
-        let subtitle = title
+            .expect("scan result address");
+        let value = address
             .next_sibling()
             .and_downcast::<gtk::Label>()
-            .expect("scan result subtitle");
-        let add_button = labels
+            .expect("scan result value");
+        let add_button = value
             .next_sibling()
             .and_downcast::<gtk::Button>()
             .expect("scan result add button");
@@ -1349,20 +1485,28 @@ fn configure_scan_result_factory(
             .item()
             .and_downcast::<adw::glib::BoxedAnyObject>()
             .expect("virtual scan result item");
+        value.remove_css_class("dim-label");
+        value.remove_css_class("error");
         match &*item.borrow::<VirtualScanRow>() {
             VirtualScanRow::Loading { index } => {
-                title.set_label(&format!("Loading result #{}…", index + 1));
-                subtitle.set_label("Fetching this page from the scan result store");
+                address.set_label(&format!("Result #{}", index + 1));
+                value.set_label("Loading…");
+                value.add_css_class("dim-label");
                 add_button.set_sensitive(false);
             }
-            VirtualScanRow::Loaded { address, value, .. } => {
-                title.set_label(&format!("0x{address:016X}"));
-                subtitle.set_label(&format!("Value: {value}"));
+            VirtualScanRow::Loaded {
+                address: hit_address,
+                value: hit_value,
+                ..
+            } => {
+                address.set_label(&format!("0x{hit_address:016X}"));
+                value.set_label(hit_value);
                 add_button.set_sensitive(true);
             }
             VirtualScanRow::Error { index, message } => {
-                title.set_label(&format!("Result #{} is unavailable", index + 1));
-                subtitle.set_label(message);
+                address.set_label(&format!("Result #{}", index + 1));
+                value.set_label(message);
+                value.add_css_class("error");
                 add_button.set_sensitive(false);
             }
         }
@@ -3168,18 +3312,20 @@ fn configure_address_list_factory(
                 .and_downcast::<adw::glib::BoxedAnyObject>()
                 .expect("virtual address item");
             let virtual_row = item.borrow::<VirtualAddressRow>().clone();
-            let row = match virtual_row {
-                VirtualAddressRow::Loading { index } => adw::ActionRow::builder()
-                    .title(format!("Loading address record #{}…", index + 1))
-                    .subtitle("Fetching this visible hierarchy page")
-                    .build(),
+            let row: gtk::Widget = match virtual_row {
+                VirtualAddressRow::Loading { index } => build_address_status_row(
+                    &format!("Loading address record #{}…", index + 1),
+                    "Fetching this visible hierarchy page",
+                )
+                .upcast(),
                 VirtualAddressRow::Loaded { record, .. } => {
-                    build_address_record_row(&state, &widgets, &record)
+                    build_address_record_row(&state, &widgets, &record).upcast()
                 }
-                VirtualAddressRow::Error { index, message } => adw::ActionRow::builder()
-                    .title(format!("Address record #{} is unavailable", index + 1))
-                    .subtitle(message)
-                    .build(),
+                VirtualAddressRow::Error { index, message } => build_address_status_row(
+                    &format!("Address record #{} is unavailable", index + 1),
+                    &message,
+                )
+                .upcast(),
             };
             slot.append(&row);
 
@@ -3330,11 +3476,38 @@ fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_v
     ));
 }
 
+fn build_address_status_row(title: &str, detail: &str) -> gtk::Box {
+    let title = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    let detail = gtk::Label::builder()
+        .label(detail)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["dim-label"])
+        .build();
+    let row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    row.append(&title);
+    row.append(&detail);
+    row
+}
+
 fn build_address_record_row(
     state: &SessionState,
     widgets: &SessionWidgets,
     record: &AddressRecord,
-) -> adw::ActionRow {
+) -> gtk::Box {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
     let scripts_trusted = state.table_scripts_trusted.get();
     let lua_trusted = state.table_lua_trusted.get();
@@ -3372,9 +3545,21 @@ fn build_address_record_row(
             record.type_name, record.error_message
         )
     };
-    let row = adw::ActionRow::builder()
-        .title(format!("{indent}{}", record.description))
-        .subtitle(subtitle)
+    let description = gtk::Label::builder()
+        .label(format!("{indent}{}", record.description))
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .tooltip_text(&record.description)
+        .build();
+    let address_details = gtk::Label::builder()
+        .label(&subtitle)
+        .xalign(0.0)
+        .width_chars(28)
+        .max_width_chars(36)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .tooltip_text(&subtitle)
+        .css_classes(["monospace", "caption"])
         .build();
 
     let selected = gtk::CheckButton::builder()
@@ -3397,9 +3582,7 @@ fn build_address_record_row(
                 .set_sensitive(!state.selected_address_ids.borrow().is_empty());
         }
     });
-    row.add_prefix(&selected);
-
-    if record.is_group {
+    let collapse = if record.is_group {
         let collapse = gtk::Button::builder()
             .icon_name(if record.collapsed {
                 "pan-end-symbolic"
@@ -3435,8 +3618,10 @@ fn build_address_record_row(
                 }
             }
         });
-        row.add_prefix(&collapse);
-    }
+        Some(collapse)
+    } else {
+        None
+    };
 
     let value_entry = gtk::Entry::builder()
         .text(&record.value)
@@ -3618,24 +3803,70 @@ fn build_address_record_row(
         move |_| move_address_record(&state, &widgets, id, 1)
     });
     let move_actions = gtk::Box::builder()
-        .orientation(Orientation::Vertical)
+        .orientation(Orientation::Horizontal)
         .spacing(0)
         .valign(Align::Center)
         .build();
     move_actions.append(&move_up);
     move_actions.append(&move_down);
 
+    selected.set_size_request(38, -1);
+    freeze.set_size_request(44, -1);
+    if record.is_group {
+        freeze.set_opacity(0.0);
+        freeze.set_can_target(false);
+    }
+
+    let description_cell = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(2)
+        .hexpand(true)
+        .build();
+    if let Some(collapse) = collapse {
+        description_cell.append(&collapse);
+    } else {
+        let indent_spacer = gtk::Box::new(Orientation::Horizontal, 0);
+        indent_spacer.set_size_request(34, -1);
+        description_cell.append(&indent_spacer);
+    }
+    description_cell.append(&description);
+
+    let value_cell: gtk::Widget = if record.is_group {
+        let empty_value = gtk::Label::builder().label("").width_chars(12).build();
+        empty_value.upcast()
+    } else {
+        value_entry.clone().upcast()
+    };
+
+    let action_cell = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(2)
+        .valign(Align::Center)
+        .build();
     if !record.is_group {
-        row.add_suffix(&value_entry);
-        row.add_suffix(&freeze_mode);
-        row.add_suffix(&freeze);
+        action_cell.append(&freeze_mode);
         state
             .address_value_entries
             .borrow_mut()
-            .insert(record.id, value_entry);
+            .insert(record.id, value_entry.clone());
     }
-    row.add_suffix(&move_actions);
-    row.add_suffix(&delete);
+    action_cell.append(&move_actions);
+    action_cell.append(&delete);
+
+    let row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    row.append(&selected);
+    row.append(&freeze);
+    row.append(&description_cell);
+    row.append(&address_details);
+    row.append(&value_cell);
+    row.append(&action_cell);
     row
 }
 

@@ -595,6 +595,13 @@ if(CECORE_BUILD_GTK_GUI)
                         "$<TARGET_FILE:ce-gtk>" --smoke-test)
                 set_tests_properties(gtk_startup_smoke PROPERTIES TIMEOUT 15)
 
+                add_test(NAME gtk_main_layout_smoke
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                        "${XVFB_RUN_EXECUTABLE}" -a
+                        "$<TARGET_FILE:ce-gtk>" --main-layout-smoke)
+                set_tests_properties(gtk_main_layout_smoke PROPERTIES TIMEOUT 15)
+
                 add_test(NAME gtk_lua_console_smoke
                     COMMAND ${CMAKE_COMMAND} -E env
                         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"

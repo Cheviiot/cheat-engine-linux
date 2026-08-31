@@ -23,6 +23,11 @@ Completed in the foundation and first vertical slices:
   encoding/case mode, and explicit variable-width snapshots;
 - GTK scan controls for that request, including a compact default workflow and
   a collapsed advanced-options panel;
+- a Cheat-Engine-faithful main-window geometry rebuilt with native GTK4/
+  libadwaita widgets: the process bar spans the top, virtual scan results stay
+  on the left, scan controls stay on the right, and the address table occupies
+  the full lower pane; horizontal and vertical splitters remain user-resizable,
+  while compact column rows replace the earlier single-column prototype;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -116,8 +121,8 @@ Completed in the foundation and first vertical slices:
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
-- CXX contract, Rust unit, GTK/Xvfb startup, Lua-console, and 600-record virtual
-  address-list smokes, Qt smoke, and core regression tests.
+- CXX contract, Rust unit, GTK/Xvfb startup, main-layout, Lua-console, and
+  600-record virtual address-list smokes, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The scan-result view now uses a custom virtual `gio::ListModel`: GTK sees the

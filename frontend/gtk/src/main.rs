@@ -26,7 +26,10 @@ fn main() -> adw::glib::ExitCode {
     let address_list_smoke = arguments
         .iter()
         .any(|argument| argument == "--address-list-smoke");
-    if startup_smoke || lua_console_smoke || address_list_smoke {
+    let main_layout_smoke = arguments
+        .iter()
+        .any(|argument| argument == "--main-layout-smoke");
+    if startup_smoke || lua_console_smoke || address_list_smoke || main_layout_smoke {
         application.connect_activate(move |application| {
             if startup_smoke && let Some(window) = application.active_window() {
                 process_dialog::present(&window, |_| {});
@@ -44,6 +47,9 @@ fn main() -> adw::glib::ExitCode {
     let exit_code = application.run_with_args(&["ce-gtk"]);
     if address_list_smoke && !application::address_list_smoke_ok() {
         eprintln!("virtual address-list smoke did not load the second page");
+        adw::glib::ExitCode::FAILURE
+    } else if main_layout_smoke && !application::main_layout_smoke_ok() {
+        eprintln!("main window does not preserve the process/results/controls/address-list layout");
         adw::glib::ExitCode::FAILURE
     } else {
         exit_code
