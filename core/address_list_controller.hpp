@@ -107,6 +107,29 @@ struct TableOperationResult {
     std::string errorMessage;
 };
 
+enum class TableScriptKind : std::uint8_t {
+    TableLua = 0,
+    AutoAssembler = 1,
+    RecordLua = 2,
+};
+
+struct TableScriptSummary {
+    int recordId = 0;
+    TableScriptKind kind = TableScriptKind::TableLua;
+    std::string description;
+    std::size_t byteCount = 0;
+};
+
+struct TableScriptTextPage {
+    int recordId = 0;
+    TableScriptKind kind = TableScriptKind::TableLua;
+    std::size_t offset = 0;
+    std::size_t nextOffset = 0;
+    std::size_t totalBytes = 0;
+    bool truncated = false;
+    std::string text;
+};
+
 class AddressListController final : public IAddressList {
 public:
     AddressListController() = default;
@@ -145,6 +168,12 @@ public:
                                           bool allowActiveScripts = false);
     TableOperationResult loadTable(const std::string& path);
     TableOperationResult saveTable(const std::string& path, bool json) const;
+    std::size_t scriptPayloadCount() const noexcept;
+    std::vector<TableScriptSummary> scriptPayloads(std::size_t start,
+                                                   std::size_t limit) const;
+    std::optional<TableScriptTextPage> scriptPayloadText(
+        int recordId, TableScriptKind kind, std::size_t offset,
+        std::size_t limit) const;
     void freezeTick() noexcept;
 
     // IAddressList

@@ -10462,7 +10462,8 @@ static void test_address_list_controller_adapter_state() {
     ce::AddressRecordState script;
     script.id = 12;
     script.description = "Injection";
-    script.script = "[ENABLE]\nnop\n[DISABLE]\nnop";
+    script.script = "[ENABLE]\n" + std::string((64u << 10) + 2048, 'A') +
+                    "\n[DISABLE]\nnop";
     script.luaScript = "return 'entry lua'";
     script.currentValue = "(Auto Assembler script)";
     script.active = true;
@@ -10484,6 +10485,33 @@ static void test_address_list_controller_adapter_state() {
                   directScriptActivation.errorCode == "script_not_executable";
     auto roundTrip = controller.exportRecords();
     const auto snapshots = controller.records(0, 10, false);
+    const auto scriptPageOne = controller.scriptPayloads(0, 2);
+    const auto scriptPageTwo = controller.scriptPayloads(2, 2);
+    const auto cappedScript = controller.scriptPayloadText(
+        12, ce::TableScriptKind::AutoAssembler, 0,
+        std::numeric_limits<std::size_t>::max());
+    std::string pagedScript;
+    std::size_t scriptOffset = 0;
+    while (scriptOffset < script.script.size()) {
+        const auto page = controller.scriptPayloadText(
+            12, ce::TableScriptKind::AutoAssembler, scriptOffset, 4096);
+        if (!page || page->nextOffset <= scriptOffset) break;
+        pagedScript += page->text;
+        scriptOffset = page->nextOffset;
+    }
+    const bool scriptReviewOk = controller.scriptPayloadCount() == 3 &&
+        scriptPageOne.size() == 2 && scriptPageTwo.size() == 1 &&
+        scriptPageOne[0].recordId == 11 &&
+        scriptPageOne[0].kind == ce::TableScriptKind::RecordLua &&
+        scriptPageOne[1].recordId == 12 &&
+        scriptPageOne[1].kind == ce::TableScriptKind::AutoAssembler &&
+        scriptPageOne[1].byteCount == script.script.size() &&
+        scriptPageTwo[0].recordId == 12 &&
+        scriptPageTwo[0].kind == ce::TableScriptKind::RecordLua &&
+        cappedScript && cappedScript->text.size() == (64u << 10) &&
+        cappedScript->truncated && pagedScript == script.script &&
+        !controller.scriptPayloadText(999, ce::TableScriptKind::AutoAssembler,
+                                      0, 4096);
     bool stateOk = imported.success && roundTrip.size() == 4 &&
         snapshots.size() == 4 && !snapshots[0].hasScript &&
         snapshots[1].hasScript && !snapshots[1].hasAutoAssembler && snapshots[1].hasLua &&
@@ -10527,10 +10555,12 @@ static void test_address_list_controller_adapter_state() {
     auto removed = controller.removeRecord(10);
     bool deleteOk = removed.success && controller.ids() == std::vector<int>({13});
 
-    printf("  lossless state + trust gate + raw disable + atomic import + subtree "
-           "move/delete (%d%d%d%d%d%d): %s\n",
-           trustGateOk, stateOk, rawDisableOk, atomicOk, moveOk, deleteOk,
-           trustGateOk && stateOk && rawDisableOk && atomicOk && moveOk && deleteOk
+    printf("  lossless state + trust gate + bounded script review + raw disable + "
+           "atomic import + subtree move/delete (%d%d%d%d%d%d%d): %s\n",
+           trustGateOk, stateOk, scriptReviewOk, rawDisableOk, atomicOk, moveOk,
+           deleteOk,
+           trustGateOk && stateOk && scriptReviewOk && rawDisableOk && atomicOk &&
+                   moveOk && deleteOk
                ? "OK" : "FAILED");
 }
 

@@ -46,6 +46,9 @@ constexpr std::size_t kMaxAddressTextSize = 1u << 20;
 constexpr std::size_t kMaxAddressDescriptionSize = 1024;
 constexpr std::size_t kMaxAddressGroupSelection = 4096;
 constexpr std::size_t kMaxTablePathSize = 4096;
+constexpr std::uint32_t kMaxTableScriptPageSize = 256;
+constexpr std::uint32_t kMaxTableScriptTextSize = 64u << 10;
+constexpr std::size_t kMaxTableScriptDescriptionSize = 1024;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -1690,6 +1693,92 @@ TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
         .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
+    };
+}
+
+TableScriptPage EngineFacade::table_scripts(std::uint64_t start,
+                                             std::uint32_t limit) const {
+    const auto total = static_cast<std::uint64_t>(address_list_->scriptPayloadCount());
+    start = std::min(start, total);
+    const auto boundedStart = static_cast<std::size_t>(std::min<std::uint64_t>(
+        start, std::numeric_limits<std::size_t>::max()));
+    const auto boundedLimit = static_cast<std::size_t>(
+        std::min(limit, kMaxTableScriptPageSize));
+
+    TableScriptPage page{
+        .start = start,
+        .next_start = start,
+        .total_count = total,
+        .truncated = start < total,
+        .rows = {},
+    };
+    for (const auto& script :
+         address_list_->scriptPayloads(boundedStart, boundedLimit)) {
+        const auto descriptionBytes = std::min(
+            script.description.size(), kMaxTableScriptDescriptionSize);
+        page.rows.push_back(TableScriptRow{
+            .record_id = script.recordId,
+            .kind = static_cast<std::uint8_t>(script.kind),
+            .description = sanitize_utf8(
+                script.description.substr(0, descriptionBytes)),
+            .byte_count = static_cast<std::uint64_t>(script.byteCount),
+        });
+    }
+    page.next_start = std::min(
+        total, start + static_cast<std::uint64_t>(page.rows.size()));
+    page.truncated = page.next_start < total;
+    return page;
+}
+
+TableScriptTextPage EngineFacade::table_script_text(
+    std::int32_t record_id, std::uint8_t kind, std::uint64_t offset,
+    std::uint32_t limit) const {
+    if (kind > static_cast<std::uint8_t>(ce::TableScriptKind::RecordLua)) {
+        return TableScriptTextPage{
+            .accepted = false,
+            .record_id = record_id,
+            .kind = kind,
+            .offset = offset,
+            .next_offset = offset,
+            .total_bytes = 0,
+            .truncated = false,
+            .text = {},
+            .error_code = "invalid_script_kind",
+            .error_message = "The requested table script kind is invalid.",
+        };
+    }
+    const auto boundedOffset = static_cast<std::size_t>(std::min<std::uint64_t>(
+        offset, std::numeric_limits<std::size_t>::max()));
+    const auto boundedLimit = static_cast<std::size_t>(
+        std::min(limit, kMaxTableScriptTextSize));
+    const auto page = address_list_->scriptPayloadText(
+        record_id, static_cast<ce::TableScriptKind>(kind), boundedOffset,
+        boundedLimit);
+    if (!page) {
+        return TableScriptTextPage{
+            .accepted = false,
+            .record_id = record_id,
+            .kind = kind,
+            .offset = offset,
+            .next_offset = offset,
+            .total_bytes = 0,
+            .truncated = false,
+            .text = {},
+            .error_code = "script_not_found",
+            .error_message = "The requested table script no longer exists.",
+        };
+    }
+    return TableScriptTextPage{
+        .accepted = true,
+        .record_id = page->recordId,
+        .kind = static_cast<std::uint8_t>(page->kind),
+        .offset = static_cast<std::uint64_t>(page->offset),
+        .next_offset = static_cast<std::uint64_t>(page->nextOffset),
+        .total_bytes = static_cast<std::uint64_t>(page->totalBytes),
+        .truncated = page->truncated,
+        .text = sanitize_utf8(page->text),
+        .error_code = {},
+        .error_message = {},
     };
 }
 

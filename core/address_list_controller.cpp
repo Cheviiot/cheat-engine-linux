@@ -23,6 +23,8 @@ namespace {
 constexpr std::size_t kDefaultTextReadSize = 64;
 constexpr std::size_t kDefaultByteArrayReadSize = 16;
 constexpr std::size_t kMaxRecordValueSize = 1u << 20;
+constexpr std::size_t kMaxScriptSummaryPage = 256;
+constexpr std::size_t kMaxScriptTextPage = 64u << 10;
 
 std::string trim(std::string value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -1065,6 +1067,82 @@ TableOperationResult AddressListController::saveTable(const std::string& path,
             .containsAutoAssembler = tableContainsAutoAssembler(table),
             .containsLua = tableContainsLua(table),
             .errorCode = {}, .errorMessage = {}};
+}
+
+std::size_t AddressListController::scriptPayloadCount() const noexcept {
+    std::size_t count = tableMetadata_.luaScript.empty() ? 0 : 1;
+    for (const auto& record : records_) {
+        if (!record.script.empty() && count != std::numeric_limits<std::size_t>::max())
+            ++count;
+        if (!record.luaScript.empty() && count != std::numeric_limits<std::size_t>::max())
+            ++count;
+    }
+    return count;
+}
+
+std::vector<TableScriptSummary> AddressListController::scriptPayloads(
+    std::size_t start, std::size_t limit) const {
+    std::vector<TableScriptSummary> result;
+    limit = std::min(limit, kMaxScriptSummaryPage);
+    result.reserve(limit);
+    std::size_t index = 0;
+    const auto append = [&](int recordId, TableScriptKind kind,
+                            const std::string& description,
+                            const std::string& payload) {
+        if (payload.empty()) return;
+        if (index >= start && result.size() < limit)
+            result.push_back({recordId, kind, description, payload.size()});
+        if (index != std::numeric_limits<std::size_t>::max()) ++index;
+    };
+
+    append(0, TableScriptKind::TableLua, "Table-level Lua script",
+           tableMetadata_.luaScript);
+    for (const auto& record : records_) {
+        append(record.id, TableScriptKind::AutoAssembler, record.description,
+               record.script);
+        append(record.id, TableScriptKind::RecordLua, record.description,
+               record.luaScript);
+        if (result.size() >= limit) break;
+    }
+    return result;
+}
+
+std::optional<TableScriptTextPage> AddressListController::scriptPayloadText(
+    int recordId, TableScriptKind kind, std::size_t offset,
+    std::size_t limit) const {
+    const std::string* payload = nullptr;
+    switch (kind) {
+    case TableScriptKind::TableLua:
+        if (recordId == 0) payload = &tableMetadata_.luaScript;
+        break;
+    case TableScriptKind::AutoAssembler:
+    case TableScriptKind::RecordLua:
+        if (recordId > 0) {
+            const auto record = std::find_if(records_.begin(), records_.end(),
+                                             [recordId](const Record& candidate) {
+                                                 return candidate.id == recordId;
+                                             });
+            if (record != records_.end())
+                payload = kind == TableScriptKind::AutoAssembler
+                              ? &record->script
+                              : &record->luaScript;
+        }
+        break;
+    }
+    if (payload == nullptr || payload->empty()) return std::nullopt;
+
+    const auto total = payload->size();
+    offset = std::min(offset, total);
+    limit = std::min(limit, kMaxScriptTextPage);
+    const auto length = std::min(limit, total - offset);
+    const auto nextOffset = offset + length;
+    return TableScriptTextPage{.recordId = recordId,
+                               .kind = kind,
+                               .offset = offset,
+                               .nextOffset = nextOffset,
+                               .totalBytes = total,
+                               .truncated = nextOffset < total,
+                               .text = payload->substr(offset, length)};
 }
 
 void AddressListController::freezeTick() noexcept {

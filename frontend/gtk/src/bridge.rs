@@ -140,6 +140,34 @@ mod ffi {
         error_message: String,
     }
 
+    struct TableScriptRow {
+        record_id: i32,
+        kind: u8,
+        description: String,
+        byte_count: u64,
+    }
+
+    struct TableScriptPage {
+        start: u64,
+        next_start: u64,
+        total_count: u64,
+        truncated: bool,
+        rows: Vec<TableScriptRow>,
+    }
+
+    struct TableScriptTextPage {
+        accepted: bool,
+        record_id: i32,
+        kind: u8,
+        offset: u64,
+        next_offset: u64,
+        total_bytes: u64,
+        truncated: bool,
+        text: String,
+        error_code: String,
+        error_message: String,
+    }
+
     unsafe extern "C++" {
         include!("bridge/engine_facade.hpp");
 
@@ -216,6 +244,14 @@ mod ffi {
         ) -> AddressActionResult;
         fn load_table(self: Pin<&mut EngineFacade>, path: &str) -> TableActionResult;
         fn save_table(self: &EngineFacade, path: &str, json: bool) -> TableActionResult;
+        fn table_scripts(self: &EngineFacade, start: u64, limit: u32) -> TableScriptPage;
+        fn table_script_text(
+            self: &EngineFacade,
+            record_id: i32,
+            kind: u8,
+            offset: u64,
+            limit: u32,
+        ) -> TableScriptTextPage;
         fn set_table_scripts_trusted(
             self: Pin<&mut EngineFacade>,
             trusted: bool,
@@ -597,6 +633,62 @@ pub struct TableAction {
     pub contains_lua: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableScriptKind {
+    TableLua,
+    AutoAssembler,
+    RecordLua,
+    Unknown(u8),
+}
+
+impl TableScriptKind {
+    fn from_bridge(value: u8) -> Self {
+        match value {
+            0 => Self::TableLua,
+            1 => Self::AutoAssembler,
+            2 => Self::RecordLua,
+            value => Self::Unknown(value),
+        }
+    }
+
+    fn bridge_value(self) -> u8 {
+        match self {
+            Self::TableLua => 0,
+            Self::AutoAssembler => 1,
+            Self::RecordLua => 2,
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableScript {
+    pub record_id: i32,
+    pub kind: TableScriptKind,
+    pub description: String,
+    pub byte_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableScriptPage {
+    pub start: u64,
+    pub next_start: u64,
+    pub total_count: u64,
+    pub truncated: bool,
+    pub rows: Vec<TableScript>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableScriptTextPage {
+    pub record_id: i32,
+    pub kind: TableScriptKind,
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_bytes: u64,
+    pub truncated: bool,
+    pub text: String,
+}
+
 pub struct Engine {
     inner: cxx::UniquePtr<ffi::EngineFacade>,
 }
@@ -863,6 +955,54 @@ impl Engine {
         table_action(self.inner.save_table(path, json))
     }
 
+    pub fn table_scripts(&self, start: u64, limit: u32) -> TableScriptPage {
+        let page = self.inner.table_scripts(start, limit);
+        TableScriptPage {
+            start: page.start,
+            next_start: page.next_start,
+            total_count: page.total_count,
+            truncated: page.truncated,
+            rows: page
+                .rows
+                .into_iter()
+                .map(|row| TableScript {
+                    record_id: row.record_id,
+                    kind: TableScriptKind::from_bridge(row.kind),
+                    description: row.description,
+                    byte_count: row.byte_count,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn table_script_text(
+        &self,
+        record_id: i32,
+        kind: TableScriptKind,
+        offset: u64,
+        limit: u32,
+    ) -> Result<TableScriptTextPage, AddressError> {
+        let page = self
+            .inner
+            .table_script_text(record_id, kind.bridge_value(), offset, limit);
+        if page.accepted {
+            Ok(TableScriptTextPage {
+                record_id: page.record_id,
+                kind: TableScriptKind::from_bridge(page.kind),
+                offset: page.offset,
+                next_offset: page.next_offset,
+                total_bytes: page.total_bytes,
+                truncated: page.truncated,
+                text: page.text,
+            })
+        } else {
+            Err(AddressError {
+                code: page.error_code,
+                message: page.error_message,
+            })
+        }
+    }
+
     pub fn set_table_scripts_trusted(&mut self, trusted: bool) -> Result<(), AddressError> {
         address_action(self.inner.pin_mut().set_table_scripts_trusted(trusted)).map(|_| ())
     }
@@ -916,7 +1056,9 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use super::{Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType};
+    use super::{
+        Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType, TableScriptKind,
+    };
 
     fn temporary_table_path(extension: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1597,6 +1739,69 @@ dealloc(newmem)</AssemblerScript>
         assert!(action.contains_auto_assembler);
         assert!(action.contains_lua);
         assert!(!engine.table_scripts_trusted());
+        let first_scripts = engine.table_scripts(0, 2);
+        assert_eq!(first_scripts.start, 0);
+        assert_eq!(first_scripts.next_start, 2);
+        assert_eq!(first_scripts.total_count, 3);
+        assert!(first_scripts.truncated);
+        assert_eq!(first_scripts.rows[0].record_id, 0);
+        assert_eq!(first_scripts.rows[0].kind, TableScriptKind::TableLua);
+        assert_eq!(first_scripts.rows[1].record_id, 7);
+        assert_eq!(first_scripts.rows[1].kind, TableScriptKind::AutoAssembler);
+        let last_scripts = engine.table_scripts(first_scripts.next_start, 2);
+        assert_eq!(last_scripts.start, 2);
+        assert_eq!(last_scripts.next_start, 3);
+        assert!(!last_scripts.truncated);
+        assert_eq!(last_scripts.rows.len(), 1);
+        assert_eq!(last_scripts.rows[0].record_id, 8);
+        assert_eq!(last_scripts.rows[0].kind, TableScriptKind::RecordLua);
+        assert_eq!(
+            engine
+                .table_script_text(0, TableScriptKind::TableLua, 0, 1024)
+                .expect("read table Lua review")
+                .text,
+            "error('must not execute')"
+        );
+        assert_eq!(
+            engine
+                .table_script_text(8, TableScriptKind::RecordLua, 0, 1024)
+                .expect("read record Lua review")
+                .text,
+            "error('record lua must remain blocked')"
+        );
+
+        let mut reviewed_aa = String::new();
+        let mut review_offset = 0;
+        loop {
+            let page = engine
+                .table_script_text(7, TableScriptKind::AutoAssembler, review_offset, 7)
+                .expect("read bounded AA review page");
+            assert_eq!(page.record_id, 7);
+            assert_eq!(page.kind, TableScriptKind::AutoAssembler);
+            assert_eq!(page.offset, review_offset);
+            reviewed_aa.push_str(&page.text);
+            if !page.truncated {
+                assert_eq!(page.next_offset, page.total_bytes);
+                break;
+            }
+            assert!(page.next_offset > review_offset);
+            review_offset = page.next_offset;
+        }
+        assert_eq!(
+            reviewed_aa,
+            "[ENABLE]\nalloc(newmem,64)\n[DISABLE]\ndealloc(newmem)"
+        );
+        assert!(
+            !engine.table_scripts_trusted(),
+            "review must never grant trust"
+        );
+        assert_eq!(
+            engine
+                .table_script_text(7, TableScriptKind::Unknown(255), 0, 16)
+                .expect_err("unknown script kind must be rejected")
+                .code,
+            "invalid_script_kind"
+        );
         let rows = engine.address_rows(0, 10, false).rows;
         let row = rows.iter().find(|row| row.id == 7).expect("AA row");
         let lua_row = rows.iter().find(|row| row.id == 8).expect("Lua row");
@@ -1642,6 +1847,42 @@ dealloc(newmem)</AssemblerScript>
 
         std::fs::remove_file(source).expect("remove script table fixture");
         std::fs::remove_file(saved).expect("remove script table round trip");
+    }
+
+    #[test]
+    fn table_script_review_enforces_bridge_text_limit() {
+        let source = temporary_table_path("large-script.CT");
+        let payload = "A".repeat((64 << 10) + 4096);
+        std::fs::write(
+            &source,
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable><CheatEntries><CheatEntry>
+<ID>41</ID><Description>Large review</Description>
+<VariableType>Auto Assembler Script</VariableType>
+<AssemblerScript>{payload}</AssemblerScript>
+</CheatEntry></CheatEntries></CheatTable>"#
+            ),
+        )
+        .expect("write large script table fixture");
+
+        let mut engine = Engine::new();
+        engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("load large script table");
+        let scripts = engine.table_scripts(0, u32::MAX);
+        assert_eq!(scripts.total_count, 1);
+        assert_eq!(scripts.rows[0].byte_count, payload.len() as u64);
+        let page = engine
+            .table_script_text(41, TableScriptKind::AutoAssembler, 0, u32::MAX)
+            .expect("review capped payload page");
+        assert_eq!(page.text.len(), 64 << 10);
+        assert_eq!(page.next_offset, (64 << 10) as u64);
+        assert_eq!(page.total_bytes, payload.len() as u64);
+        assert!(page.truncated);
+        assert!(!engine.table_scripts_trusted());
+
+        std::fs::remove_file(source).expect("remove large script table fixture");
     }
 
     #[test]

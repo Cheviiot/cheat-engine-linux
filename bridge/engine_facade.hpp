@@ -31,6 +31,9 @@ struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
 struct TableActionResult;
+struct TableScriptRow;
+struct TableScriptPage;
+struct TableScriptTextPage;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -73,6 +76,12 @@ public:
     AddressActionResult set_address_collapsed(std::int32_t id, bool collapsed);
     TableActionResult load_table(rust::Str path);
     TableActionResult save_table(rust::Str path, bool json) const;
+    TableScriptPage table_scripts(std::uint64_t start,
+                                  std::uint32_t limit) const;
+    TableScriptTextPage table_script_text(std::int32_t record_id,
+                                          std::uint8_t kind,
+                                          std::uint64_t offset,
+                                          std::uint32_t limit) const;
     AddressActionResult set_table_scripts_trusted(bool trusted);
     bool table_scripts_trusted() const noexcept;
     void freeze_addresses() noexcept;

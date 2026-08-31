@@ -9,7 +9,7 @@ use gtk::{Align, Orientation};
 
 use crate::bridge::{
     AddressRecord, AttachError, Engine, FreezeMode, Process, ProtectionMatch, ScanComparison,
-    ScanRequest, ScanValueType, Session,
+    ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
 };
 use crate::process_dialog;
 
@@ -17,6 +17,8 @@ pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SCAN_PAGE_SIZE: u32 = 128;
 const ADDRESS_PAGE_SIZE: u32 = 256;
+const SCRIPT_REVIEW_PAGE_SIZE: u32 = 64;
+const SCRIPT_TEXT_PAGE_SIZE: u32 = 64 << 10;
 const FREEZE_INTERVAL: Duration = Duration::from_millis(100);
 const ADDRESS_REFRESH_TICKS: u8 = 5;
 
@@ -672,28 +674,7 @@ fn build_window(application: &adw::Application) {
         let widgets = widgets.clone();
         move |_| {
             if state.table_scripts_trusted.get() {
-                let result = state
-                    .engine
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("engine remains present while revoking table trust")
-                    .set_table_scripts_trusted(false);
-                match result {
-                    Ok(()) => {
-                        state.table_scripts_trusted.set(false);
-                        reload_address_list(&state, &widgets, false);
-                        widgets.address_summary.set_label(
-                            "Script trust was revoked and active Auto Assembler records were disabled.",
-                        );
-                    }
-                    Err(error) => {
-                        reload_address_list(&state, &widgets, false);
-                        widgets.address_summary.set_label(&format!(
-                            "Could not revoke script trust safely: {} ({})",
-                            error.message, error.code
-                        ));
-                    }
-                }
+                change_table_script_trust(&state, &widgets, false);
             } else {
                 let action = crate::bridge::TableAction {
                     record_count: 0,
@@ -1580,6 +1561,439 @@ fn update_script_trust_button(state: &SessionState, widgets: &SessionWidgets) {
     }
 }
 
+fn change_table_script_trust(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    trusted: bool,
+) -> bool {
+    let result = state
+        .engine
+        .borrow_mut()
+        .as_mut()
+        .expect("engine remains present while changing table trust")
+        .set_table_scripts_trusted(trusted);
+    match result {
+        Ok(()) => {
+            state.table_scripts_trusted.set(trusted);
+            reload_address_list(state, widgets, state.attached.get());
+            widgets.address_summary.set_label(if trusted {
+                if state.table_contains_lua.get() {
+                    "Auto Assembler is trusted for this loaded table; Lua remains blocked."
+                } else {
+                    "Auto Assembler is trusted for this loaded table and runs only when enabled."
+                }
+            } else {
+                "Script trust was revoked and active Auto Assembler records were disabled."
+            });
+            true
+        }
+        Err(error) => {
+            reload_address_list(state, widgets, false);
+            widgets.address_summary.set_label(&format!(
+                "Could not {} script trust safely: {} ({})",
+                if trusted { "grant" } else { "revoke" },
+                error.message,
+                error.code
+            ));
+            false
+        }
+    }
+}
+
+fn table_script_kind_label(kind: TableScriptKind) -> &'static str {
+    match kind {
+        TableScriptKind::TableLua => "Table Lua",
+        TableScriptKind::AutoAssembler => "Auto Assembler",
+        TableScriptKind::RecordLua => "Record Lua",
+        TableScriptKind::Unknown(_) => "Unknown script",
+    }
+}
+
+fn present_script_review_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+) {
+    let header = adw::HeaderBar::new();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+
+    let explanation = gtk::Label::builder()
+        .label(
+            "Reviewing is read-only: it never executes a payload or grants trust. Lua remains blocked in this build.",
+        )
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    let previous = gtk::Button::builder()
+        .label("Previous")
+        .sensitive(false)
+        .build();
+    let page_label = gtk::Label::builder()
+        .label("Loading scripts…")
+        .hexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let next = gtk::Button::builder()
+        .label("Next")
+        .sensitive(false)
+        .build();
+    let navigation = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    navigation.append(&previous);
+    navigation.append(&page_label);
+    navigation.append(&next);
+
+    let content = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(&explanation);
+    content.append(&scrolled);
+    content.append(&navigation);
+
+    if state.table_contains_auto_assembler.get() && !state.table_scripts_trusted.get() {
+        let trust_button = gtk::Button::builder()
+            .label("Trust Auto Assembler after review")
+            .halign(Align::End)
+            .css_classes(["destructive-action"])
+            .build();
+        trust_button.connect_clicked({
+            let state = state.clone();
+            let widgets = widgets.clone();
+            move |button| {
+                if change_table_script_trust(&state, &widgets, true) {
+                    button.set_label("Auto Assembler trusted");
+                    button.set_sensitive(false);
+                }
+            }
+        });
+        content.append(&trust_button);
+    }
+
+    toolbar.set_content(Some(&content));
+    let dialog = adw::Dialog::builder()
+        .title("Review table scripts")
+        .content_width(760)
+        .content_height(600)
+        .child(&toolbar)
+        .build();
+    let page_start = Rc::new(Cell::new(0_u64));
+    previous.connect_clicked({
+        let dialog = dialog.clone();
+        let state = state.clone();
+        let list = list.clone();
+        let page_label = page_label.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let page_start = page_start.clone();
+        move |_| {
+            let start = page_start
+                .get()
+                .saturating_sub(u64::from(SCRIPT_REVIEW_PAGE_SIZE));
+            load_script_review_page(
+                &dialog,
+                &state,
+                &list,
+                &page_label,
+                &previous,
+                &next,
+                &page_start,
+                start,
+            );
+        }
+    });
+    next.connect_clicked({
+        let dialog = dialog.clone();
+        let state = state.clone();
+        let list = list.clone();
+        let page_label = page_label.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let page_start = page_start.clone();
+        move |_| {
+            let start = page_start
+                .get()
+                .saturating_add(u64::from(SCRIPT_REVIEW_PAGE_SIZE));
+            load_script_review_page(
+                &dialog,
+                &state,
+                &list,
+                &page_label,
+                &previous,
+                &next,
+                &page_start,
+                start,
+            );
+        }
+    });
+    load_script_review_page(
+        &dialog,
+        state,
+        &list,
+        &page_label,
+        &previous,
+        &next,
+        &page_start,
+        0,
+    );
+    dialog.present(Some(window));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_script_review_page(
+    dialog: &adw::Dialog,
+    state: &SessionState,
+    list: &gtk::ListBox,
+    page_label: &gtk::Label,
+    previous: &gtk::Button,
+    next: &gtk::Button,
+    page_start: &Cell<u64>,
+    start: u64,
+) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let page = state
+        .engine
+        .borrow()
+        .as_ref()
+        .expect("engine remains present while reviewing table scripts")
+        .table_scripts(start, SCRIPT_REVIEW_PAGE_SIZE);
+    page_start.set(page.start);
+    previous.set_sensitive(page.start > 0);
+    next.set_sensitive(page.truncated);
+    if page.total_count == 0 {
+        page_label.set_label("No preserved scripts");
+        return;
+    }
+    page_label.set_label(&format!(
+        "{}–{} of {}",
+        page.start + 1,
+        page.next_start,
+        page.total_count
+    ));
+    for script in page.rows {
+        let record = if script.record_id == 0 {
+            "Table-level".to_owned()
+        } else {
+            format!("Record #{}", script.record_id)
+        };
+        let row = adw::ActionRow::builder()
+            .title(&script.description)
+            .subtitle(format!(
+                "{record} · {} · {} bytes",
+                table_script_kind_label(script.kind),
+                script.byte_count
+            ))
+            .build();
+        let view = gtk::Button::builder()
+            .label("View")
+            .valign(Align::Center)
+            .build();
+        view.connect_clicked({
+            let dialog = dialog.clone();
+            let state = state.clone();
+            move |_| present_script_payload_dialog(&dialog, &state, &script)
+        });
+        row.add_suffix(&view);
+        row.set_activatable_widget(Some(&view));
+        list.append(&row);
+    }
+}
+
+fn present_script_payload_dialog(parent: &adw::Dialog, state: &SessionState, script: &TableScript) {
+    let header = adw::HeaderBar::new();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    let notice = gtk::Label::builder()
+        .label("Read-only payload. Viewing it does not execute it or change table trust.")
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    let text = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .child(&text)
+        .build();
+    let previous = gtk::Button::builder()
+        .label("Previous")
+        .sensitive(false)
+        .build();
+    let page_label = gtk::Label::builder()
+        .label("Loading payload…")
+        .hexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let next = gtk::Button::builder()
+        .label("Next")
+        .sensitive(false)
+        .build();
+    let navigation = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    navigation.append(&previous);
+    navigation.append(&page_label);
+    navigation.append(&next);
+    let content = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(&notice);
+    content.append(&scrolled);
+    content.append(&navigation);
+    toolbar.set_content(Some(&content));
+    let dialog = adw::Dialog::builder()
+        .title(format!(
+            "{} — {}",
+            table_script_kind_label(script.kind),
+            script.description
+        ))
+        .content_width(820)
+        .content_height(640)
+        .child(&toolbar)
+        .build();
+    let current_offset = Rc::new(Cell::new(0_u64));
+    let next_offset = Rc::new(Cell::new(0_u64));
+    previous.connect_clicked({
+        let state = state.clone();
+        let script = script.clone();
+        let text = text.clone();
+        let page_label = page_label.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let current_offset = current_offset.clone();
+        let next_offset = next_offset.clone();
+        move |_| {
+            let offset = current_offset
+                .get()
+                .saturating_sub(u64::from(SCRIPT_TEXT_PAGE_SIZE));
+            load_script_payload_page(
+                &state,
+                &script,
+                &text,
+                &page_label,
+                &previous,
+                &next,
+                &current_offset,
+                &next_offset,
+                offset,
+            );
+        }
+    });
+    next.connect_clicked({
+        let state = state.clone();
+        let script = script.clone();
+        let text = text.clone();
+        let page_label = page_label.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let current_offset = current_offset.clone();
+        let next_offset = next_offset.clone();
+        move |_| {
+            load_script_payload_page(
+                &state,
+                &script,
+                &text,
+                &page_label,
+                &previous,
+                &next,
+                &current_offset,
+                &next_offset,
+                next_offset.get(),
+            );
+        }
+    });
+    load_script_payload_page(
+        state,
+        script,
+        &text,
+        &page_label,
+        &previous,
+        &next,
+        &current_offset,
+        &next_offset,
+        0,
+    );
+    dialog.present(Some(parent));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_script_payload_page(
+    state: &SessionState,
+    script: &TableScript,
+    text: &gtk::TextView,
+    page_label: &gtk::Label,
+    previous: &gtk::Button,
+    next: &gtk::Button,
+    current_offset: &Cell<u64>,
+    next_offset: &Cell<u64>,
+    offset: u64,
+) {
+    let result = state
+        .engine
+        .borrow()
+        .as_ref()
+        .expect("engine remains present while reading a table script")
+        .table_script_text(script.record_id, script.kind, offset, SCRIPT_TEXT_PAGE_SIZE);
+    match result {
+        Ok(page) => {
+            current_offset.set(page.offset);
+            next_offset.set(page.next_offset);
+            previous.set_sensitive(page.offset > 0);
+            next.set_sensitive(page.truncated);
+            text.buffer().set_text(&page.text);
+            page_label.set_label(&format!(
+                "Bytes {}–{} of {}",
+                page.offset.saturating_add(1),
+                page.next_offset,
+                page.total_bytes
+            ));
+        }
+        Err(error) => {
+            previous.set_sensitive(false);
+            next.set_sensitive(false);
+            text.buffer().set_text("");
+            page_label.set_label(&format!(
+                "Could not read this payload: {} ({})",
+                error.message, error.code
+            ));
+        }
+    }
+}
+
 fn present_script_trust_dialog(
     window: &adw::ApplicationWindow,
     state: &SessionState,
@@ -1609,37 +2023,23 @@ fn present_script_trust_dialog(
         ))
         .build();
     dialog.add_response("blocked", "Keep blocked");
+    dialog.add_response("review", "Review scripts");
     dialog.set_default_response(Some("blocked"));
     dialog.set_close_response("blocked");
+    dialog.connect_response(Some("review"), {
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, _| present_script_review_dialog(&window, &state, &widgets)
+    });
     if action.contains_auto_assembler {
-        let contains_lua = action.contains_lua;
         dialog.add_response("trust", "Trust Auto Assembler");
         dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
         dialog.connect_response(Some("trust"), {
             let state = state.clone();
             let widgets = widgets.clone();
             move |_, _| {
-                let result = state
-                    .engine
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("engine remains present while changing table trust")
-                    .set_table_scripts_trusted(true);
-                match result {
-                    Ok(()) => {
-                        state.table_scripts_trusted.set(true);
-                        reload_address_list(&state, &widgets, state.attached.get());
-                        widgets.address_summary.set_label(if contains_lua {
-                            "Auto Assembler is trusted for this loaded table; record Lua remains blocked."
-                        } else {
-                            "Auto Assembler is trusted for this loaded table and runs only when enabled."
-                        });
-                    }
-                    Err(error) => widgets.address_summary.set_label(&format!(
-                        "Could not change table trust: {} ({})",
-                        error.message, error.code
-                    )),
-                }
+                change_table_script_trust(&state, &widgets, true);
             }
         });
     }
