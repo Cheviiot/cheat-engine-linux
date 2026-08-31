@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,10 @@ constexpr std::size_t kMaxTableScriptDescriptionSize = 1024;
 constexpr std::size_t kMaxLuaScriptSize = 1u << 20;
 constexpr std::size_t kMaxLuaOutputSize = 64u << 10;
 constexpr int kLuaInstructionLimit = 2'000'000;
+constexpr int kLuaTimerInstructionLimit = 200'000;
+constexpr std::size_t kMaxLuaTimerCallbacksPerTick = 32;
+constexpr double kAddressFreezeIntervalMs = 100.0;
+constexpr double kAddressRefreshIntervalMs = 500.0;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -749,19 +754,71 @@ std::string format_scan_value(const ce::ScanConfig& config, bool display_hex,
 } // namespace
 
 struct EngineFacade::ScriptRuntime {
+    struct OutputBuffer {
+        std::string text;
+        bool truncated = false;
+
+        void append(const std::string& line) {
+            if (truncated) return;
+            std::string safe = sanitize_utf8(line);
+            if (!text.empty()) safe.insert(safe.begin(), '\n');
+            const auto available = kMaxLuaOutputSize - text.size();
+            if (safe.size() <= available) {
+                text += safe;
+                return;
+            }
+            text += bounded_utf8(std::move(safe), available);
+            truncated = true;
+        }
+    };
+
     ce::AutoAssembler assembler;
     std::unordered_map<int, ce::DisableInfo> disableInfoById;
     std::vector<int> activationOrder;
     std::unique_ptr<ce::LuaEngine> lua;
+    OutputBuffer* activeOutput = nullptr;
+    OutputBuffer pendingOutput;
+    std::uint64_t luaGeneration = 0;
+    double lastFreezeMs = 0;
+    double lastRefreshMs = 0;
     bool autoAssemblerTrusted = false;
     bool luaTrusted = false;
 
+    void appendLuaOutput(const std::string& line) {
+        (activeOutput ? *activeOutput : pendingOutput).append(line);
+    }
+
+    OutputBuffer takePendingOutput() {
+        OutputBuffer output = std::move(pendingOutput);
+        pendingOutput = {};
+        return output;
+    }
+
     void resetLua(ce::ProcessHandle* process,
                   ce::AddressListController* addressList) {
-        lua.reset();
-        lua = std::make_unique<ce::LuaEngine>();
-        lua->setProcess(process);
-        lua->setAddressList(addressList);
+        activeOutput = nullptr;
+        auto replacement = std::make_unique<ce::LuaEngine>();
+        replacement->setProcess(process);
+        replacement->setOutputCallback([this](const std::string& line) {
+            appendLuaOutput(line);
+        });
+
+        // AddressListController stores one borrowed activation dispatcher. Detach
+        // the previous owner before installing the replacement, but restore it if
+        // the new callback allocation fails so a reset never leaves a null runtime.
+        auto previous = std::move(lua);
+        if (previous) previous->setAddressList(nullptr);
+        try {
+            replacement->setAddressList(addressList);
+        } catch (...) {
+            replacement->setAddressList(nullptr);
+            lua = std::move(previous);
+            if (lua) lua->setAddressList(addressList);
+            throw;
+        }
+        lua = std::move(replacement);
+        pendingOutput = {};
+        ++luaGeneration;
     }
 };
 
@@ -1926,32 +1983,18 @@ LuaExecutionResult EngineFacade::execute_table_lua(std::int32_t record_id,
         return failure("lua_script_invalid_utf8",
                        "Lua payloads must be valid UTF-8 before they can be reviewed and run.");
 
-    std::string output;
-    bool outputTruncated = false;
-    const auto appendOutput = [&output, &outputTruncated](const std::string& line) {
-        if (outputTruncated) return;
-        std::string safe = sanitize_utf8(line);
-        if (!output.empty()) safe.insert(safe.begin(), '\n');
-        const auto available = kMaxLuaOutputSize - output.size();
-        if (safe.size() <= available) {
-            output += safe;
-            return;
-        }
-        output += bounded_utf8(std::move(safe), available);
-        outputTruncated = true;
-    };
-
+    ScriptRuntime::OutputBuffer output;
     std::string runtimeError;
     try {
-        script_runtime_->lua->setOutputCallback(appendOutput);
+        script_runtime_->activeOutput = &output;
         runtimeError = script_runtime_->lua->executeBounded(
             source, kLuaInstructionLimit);
-        script_runtime_->lua->setOutputCallback({});
+        script_runtime_->activeOutput = nullptr;
     } catch (const std::exception& error) {
-        script_runtime_->lua->setOutputCallback({});
+        script_runtime_->activeOutput = nullptr;
         return failure("lua_execution_failed", error.what());
     } catch (...) {
-        script_runtime_->lua->setOutputCallback({});
+        script_runtime_->activeOutput = nullptr;
         return failure("lua_execution_failed",
                        "The Lua runtime raised an unknown native error.");
     }
@@ -1960,8 +2003,8 @@ LuaExecutionResult EngineFacade::execute_table_lua(std::int32_t record_id,
         .accepted = true,
         .record_id = record_id,
         .kind = kind,
-        .output = std::move(output),
-        .output_truncated = outputTruncated,
+        .output = std::move(output.text),
+        .output_truncated = output.truncated,
         .runtime_error = bounded_utf8(sanitize_utf8(runtimeError),
                                       kMaxLuaOutputSize),
         .error_code = {},
@@ -1969,8 +2012,113 @@ LuaExecutionResult EngineFacade::execute_table_lua(std::int32_t record_id,
     };
 }
 
-void EngineFacade::freeze_addresses() noexcept {
-    address_list_->freezeTick();
+LuaConsoleResult EngineFacade::execute_lua_console(rust::Str requestedSource) {
+    const auto failure = [this](std::string code, std::string message) {
+        return LuaConsoleResult{
+            .accepted = false,
+            .runtime_generation = script_runtime_->luaGeneration,
+            .output = {},
+            .output_truncated = false,
+            .runtime_error = {},
+            .error_code = std::move(code),
+            .error_message = bounded_utf8(sanitize_utf8(message),
+                                          kMaxLuaOutputSize),
+        };
+    };
+
+    std::string source(requestedSource);
+    if (source.size() > kMaxLuaScriptSize) {
+        return failure("lua_console_source_too_large",
+                       "Lua console input larger than 1 MiB is not executed.");
+    }
+    if (source.find('\0') != std::string::npos) {
+        return failure("lua_console_source_contains_nul",
+                       "Lua console input containing NUL bytes is not executed.");
+    }
+    if (sanitize_utf8(source) != source) {
+        return failure("lua_console_source_invalid_utf8",
+                       "Lua console input must be valid UTF-8.");
+    }
+
+    ScriptRuntime::OutputBuffer output;
+    std::string runtimeError;
+    try {
+        script_runtime_->activeOutput = &output;
+        runtimeError = script_runtime_->lua->executeBounded(
+            source, kLuaInstructionLimit);
+        script_runtime_->activeOutput = nullptr;
+    } catch (const std::exception& error) {
+        script_runtime_->activeOutput = nullptr;
+        return failure("lua_console_execution_failed", error.what());
+    } catch (...) {
+        script_runtime_->activeOutput = nullptr;
+        return failure("lua_console_execution_failed",
+                       "The Lua runtime raised an unknown native error.");
+    }
+
+    return LuaConsoleResult{
+        .accepted = true,
+        .runtime_generation = script_runtime_->luaGeneration,
+        .output = std::move(output.text),
+        .output_truncated = output.truncated,
+        .runtime_error = bounded_utf8(sanitize_utf8(runtimeError),
+                                      kMaxLuaOutputSize),
+        .error_code = {},
+        .error_message = {},
+    };
+}
+
+std::uint64_t EngineFacade::lua_runtime_generation() const noexcept {
+    return script_runtime_->luaGeneration;
+}
+
+RuntimeTickResult EngineFacade::periodic_tick() {
+    using namespace std::chrono;
+    const double now = duration<double, std::milli>(
+        steady_clock::now().time_since_epoch()).count();
+
+    if (script_runtime_->lastFreezeMs == 0 ||
+        now - script_runtime_->lastFreezeMs >= kAddressFreezeIntervalMs) {
+        address_list_->freezeTick();
+        script_runtime_->lastFreezeMs = now;
+    }
+
+    bool refreshDue = false;
+    if (script_runtime_->lastRefreshMs == 0) {
+        script_runtime_->lastRefreshMs = now;
+    } else if (now - script_runtime_->lastRefreshMs >= kAddressRefreshIntervalMs) {
+        script_runtime_->lastRefreshMs = now;
+        refreshDue = true;
+    }
+
+    ce::LuaEngine::TimerPumpResult timerResult;
+    try {
+        timerResult = script_runtime_->lua->pumpTimersBounded(
+            kLuaTimerInstructionLimit, kMaxLuaTimerCallbacksPerTick);
+    } catch (const std::exception& error) {
+        script_runtime_->appendLuaOutput(
+            std::string("Lua timer pump error: ") + error.what());
+        timerResult.callbacksFailed = 1;
+    } catch (...) {
+        script_runtime_->appendLuaOutput(
+            "Lua timer pump error: unknown native failure");
+        timerResult.callbacksFailed = 1;
+    }
+    auto output = script_runtime_->takePendingOutput();
+    const auto toU32 = [](std::size_t value) {
+        return static_cast<std::uint32_t>(std::min<std::size_t>(
+            value, std::numeric_limits<std::uint32_t>::max()));
+    };
+    return RuntimeTickResult{
+        .runtime_generation = script_runtime_->luaGeneration,
+        .address_refresh_due = refreshDue,
+        .timer_count = toU32(script_runtime_->lua->timerCount()),
+        .timers_fired = toU32(timerResult.callbacksFired),
+        .timer_errors = toU32(timerResult.callbacksFailed),
+        .timers_deferred = toU32(timerResult.callbacksDeferred),
+        .output = std::move(output.text),
+        .output_truncated = output.truncated,
+    };
 }
 
 void EngineFacade::join_scan_worker() noexcept {

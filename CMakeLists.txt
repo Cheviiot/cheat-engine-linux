@@ -594,6 +594,14 @@ if(CECORE_BUILD_GTK_GUI)
                         "${XVFB_RUN_EXECUTABLE}" -a
                         "$<TARGET_FILE:ce-gtk>" --smoke-test)
                 set_tests_properties(gtk_startup_smoke PROPERTIES TIMEOUT 15)
+
+                add_test(NAME gtk_lua_console_smoke
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                        "CE_GTK_LUA_CONSOLE_SMOKE=1"
+                        "${XVFB_RUN_EXECUTABLE}" -a
+                        "$<TARGET_FILE:ce-gtk>" --lua-console-smoke)
+                set_tests_properties(gtk_lua_console_smoke PROPERTIES TIMEOUT 15)
             endif()
         endif()
         message(STATUS "GTK4/libadwaita and Cargo found — building Rust GUI")

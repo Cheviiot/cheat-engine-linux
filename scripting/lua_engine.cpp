@@ -15,6 +15,7 @@ extern "C" {
 #include <chrono>
 #include <vector>
 #include <exception>
+#include <limits>
 #include <utility>
 
 namespace ce {
@@ -481,33 +482,86 @@ void LuaEngine::stringlistClear(int id) {
 }
 
 void LuaEngine::pumpTimers() {
-    if (!L_ || timers_.empty()) return;
-    const double now = steadyNowMs();
-    // Collect due timers first: a callback may create/destroy timers, which would
-    // invalidate an in-progress iterator.
-    std::vector<int> due;
-    for (auto& [id, t] : timers_) {
-        if (t.enabled && t.intervalMs > 0 && t.cbRef >= 0 && (now - t.lastMs) >= t.intervalMs)
-            due.push_back(id);
+    (void)pumpTimersBounded(0, std::numeric_limits<std::size_t>::max());
+}
+
+LuaEngine::TimerPumpResult LuaEngine::pumpTimersBounded(
+    int instructionLimit, std::size_t maxCallbacks) {
+    TimerPumpResult result;
+    if (!L_ || timers_.empty()) return result;
+
+    if (instructionLimit > 0) {
+        // A callback created by the unbounded legacy console may still have
+        // access to debug.sethook. Remove the mutator before installing the
+        // host ceiling so the callback cannot replace it.
+        lua_getglobal(L_, "debug");
+        if (lua_istable(L_, -1)) {
+            lua_pushnil(L_);
+            lua_setfield(L_, -2, "sethook");
+        }
+        lua_pop(L_, 1);
     }
-    for (int id : due) {
+
+    const double now = steadyNowMs();
+    // Collect due timers first: a callback may create/destroy timers. Start after
+    // the last attempted timer and wrap so a group of very short timers cannot
+    // permanently starve later IDs when the host applies a per-tick cap.
+    std::vector<int> due;
+    const auto collect = [&](auto begin, auto end) {
+        for (auto iterator = begin; iterator != end; ++iterator) {
+            const auto& [id, timer] = *iterator;
+            if (timer.enabled && timer.intervalMs > 0 && timer.cbRef >= 0 &&
+                (now - timer.lastMs) >= timer.intervalMs) {
+                due.push_back(id);
+            }
+        }
+    };
+    const auto afterCursor = timers_.upper_bound(timerPumpCursor_);
+    collect(afterCursor, timers_.end());
+    collect(timers_.begin(), afterCursor);
+
+    const auto callbackCount = std::min(due.size(), maxCallbacks);
+    result.callbacksDeferred = due.size() - callbackCount;
+    for (std::size_t index = 0; index < callbackCount; ++index) {
+        const int id = due[index];
+        timerPumpCursor_ = id;
         auto it = timers_.find(id);
         if (it == timers_.end()) continue;          // destroyed by an earlier callback
         it->second.lastMs = now;
         int ref = it->second.cbRef;
+        const int top = lua_gettop(L_);
         lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
         if (lua_isfunction(L_, -1)) {
-            if (lua_pcall(L_, 0, 0, 0) != LUA_OK) {
+            if (instructionLimit > 0) {
+                lua_sethook(L_, [](lua_State* state, lua_Debug*) {
+                    luaL_error(state, "Lua timer callback exceeded its instruction limit");
+                }, LUA_MASKCOUNT, instructionLimit);
+            }
+            const int callResult = lua_pcall(L_, 0, 0, 0);
+            lua_sethook(L_, nullptr, 0, 0);
+            if (callResult != LUA_OK) {
                 const char* msg = lua_tostring(L_, -1);
                 std::string err = msg ? msg : "lua error";
                 lua_pop(L_, 1);
                 ce::log::warn(ce::log::Cat::Lua, "timer callback error: {}", err);
-                if (outputCb_) outputCb_("Timer error: " + err);
+                if (instructionLimit > 0) {
+                    if (auto failed = timers_.find(id); failed != timers_.end())
+                        failed->second.enabled = false;
+                }
+                if (outputCb_) {
+                    outputCb_("Timer error: " + err +
+                              (instructionLimit > 0 ? " (timer disabled)" : ""));
+                }
+                ++result.callbacksFailed;
+            } else {
+                ++result.callbacksFired;
             }
         } else {
             lua_pop(L_, 1);
         }
+        lua_settop(L_, top);
     }
+    return result;
 }
 
 } // namespace ce

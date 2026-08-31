@@ -206,9 +206,12 @@ These are cheap and they underpin trust in everything else.
    `CECORE_LUA_ALLOW_UNSAFE=1` opt-in, and native bindings use the central
    exception firewall. Qt asks before table Lua; GTK never auto-runs it and now
    requires separate table trust plus a per-payload confirmation with bounded
-   input/VM/output. Standard Lua `os`/`io` and target-writing APIs remain part of
-   explicitly trusted execution, so the security boundary is informed consent,
-   not a sandbox. **[RESOLVED for current frontends; keep auditing new loaders]**
+   input/VM/output. GTK's author-driven console is explicit, bounded, and does
+   not grant table trust; its timer pump caps callbacks per tick and disables a
+   callback that errors or exceeds its VM budget. Standard Lua `os`/`io` and
+   target-writing APIs remain part of explicitly trusted execution, so the
+   security boundary is informed consent, not a sandbox. **[RESOLVED for current
+   frontends; keep auditing new loaders and native bindings]**
 7. **No fuzzing / negative-input tests** on any untrusted parser (ELF, DWARF,
    `.CT`/`.CETRAINER`, Mono net protocol, `ExpressionParser`). README claims
    these treat input as untrusted; that's untested. Add libFuzzer harnesses +

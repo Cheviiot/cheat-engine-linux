@@ -19,8 +19,10 @@ const SCAN_PAGE_SIZE: u32 = 128;
 const ADDRESS_PAGE_SIZE: u32 = 256;
 const SCRIPT_REVIEW_PAGE_SIZE: u32 = 64;
 const SCRIPT_TEXT_PAGE_SIZE: u32 = 64 << 10;
-const FREEZE_INTERVAL: Duration = Duration::from_millis(100);
-const ADDRESS_REFRESH_TICKS: u8 = 5;
+const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(30);
+const LUA_CONSOLE_TRANSCRIPT_LIMIT: i32 = 256 << 10;
+const LUA_CONSOLE_HISTORY_LIMIT: usize = 100;
+const LUA_CONSOLE_HISTORY_BYTES_LIMIT: usize = 1 << 20;
 
 #[derive(Clone)]
 struct SessionState {
@@ -36,6 +38,12 @@ struct SessionState {
     table_lua_trusted: Rc<Cell<bool>>,
     table_contains_auto_assembler: Rc<Cell<bool>>,
     table_contains_lua: Rc<Cell<bool>>,
+    lua_runtime_generation: Rc<Cell<u64>>,
+    lua_console_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    lua_console_output: Rc<RefCell<Option<gtk::TextView>>>,
+    lua_console_status: Rc<RefCell<Option<gtk::Label>>>,
+    lua_console_backlog: Rc<RefCell<String>>,
+    lua_console_history: Rc<RefCell<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +107,7 @@ pub fn build_application() -> adw::Application {
 fn build_window(application: &adw::Application) {
     let engine = Engine::new();
     let core_version = engine.version();
+    let lua_runtime_generation = engine.lua_runtime_generation();
     let state = SessionState {
         engine: Rc::new(RefCell::new(Some(engine))),
         selected: Rc::new(RefCell::new(None)),
@@ -112,9 +121,21 @@ fn build_window(application: &adw::Application) {
         table_lua_trusted: Rc::new(Cell::new(false)),
         table_contains_auto_assembler: Rc::new(Cell::new(false)),
         table_contains_lua: Rc::new(Cell::new(false)),
+        lua_runtime_generation: Rc::new(Cell::new(lua_runtime_generation)),
+        lua_console_dialog: Rc::new(RefCell::new(None)),
+        lua_console_output: Rc::new(RefCell::new(None)),
+        lua_console_status: Rc::new(RefCell::new(None)),
+        lua_console_backlog: Rc::new(RefCell::new(String::new())),
+        lua_console_history: Rc::new(RefCell::new(Vec::new())),
     };
 
     let header = adw::HeaderBar::builder().show_title(false).build();
+    let lua_console_button = gtk::Button::builder()
+        .label("Lua Console")
+        .icon_name("utilities-terminal-symbolic")
+        .tooltip_text("Open the bounded interactive Lua console")
+        .build();
+    header.pack_end(&lua_console_button);
 
     let title = gtk::Label::builder()
         .label("Rust/GTK frontend foundation")
@@ -685,7 +706,13 @@ fn build_window(application: &adw::Application) {
         }
     });
 
-    install_address_refresh_timer(&state, &widgets);
+    lua_console_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        move |_| present_lua_console_dialog(&window, &state)
+    });
+
+    install_runtime_tick(&state, &widgets);
 
     window.present();
 }
@@ -2354,27 +2381,330 @@ fn present_save_table_dialog(
     });
 }
 
-fn install_address_refresh_timer(state: &SessionState, widgets: &SessionWidgets) {
+fn append_lua_console_output(state: &SessionState, message: &str) {
+    if message.is_empty() {
+        return;
+    }
+    if let Some(output) = state.lua_console_output.borrow().clone() {
+        let buffer = output.buffer();
+        let mut end = buffer.end_iter();
+        if buffer.char_count() > 0 {
+            buffer.insert(&mut end, "\n");
+        }
+        buffer.insert(&mut end, message);
+        let excess = buffer
+            .char_count()
+            .saturating_sub(LUA_CONSOLE_TRANSCRIPT_LIMIT);
+        if excess > 0 {
+            let mut start = buffer.start_iter();
+            let mut trim_end = buffer.iter_at_offset(excess);
+            buffer.delete(&mut start, &mut trim_end);
+        }
+        let mut end = buffer.end_iter();
+        output.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+        return;
+    }
+
+    let mut backlog = state.lua_console_backlog.borrow_mut();
+    if !backlog.is_empty() {
+        backlog.push('\n');
+    }
+    backlog.push_str(message);
+    let count = backlog.chars().count();
+    if count > LUA_CONSOLE_TRANSCRIPT_LIMIT as usize {
+        *backlog = backlog
+            .chars()
+            .skip(count - LUA_CONSOLE_TRANSCRIPT_LIMIT as usize)
+            .collect();
+    }
+}
+
+fn execute_lua_console_command(
+    state: &SessionState,
+    input: &gtk::Entry,
+    status: &gtk::Label,
+    history_index: &Cell<usize>,
+) {
+    let source = input.text().to_string();
+    if source.trim().is_empty() {
+        return;
+    }
+
+    {
+        let mut history = state.lua_console_history.borrow_mut();
+        if source.len() <= LUA_CONSOLE_HISTORY_BYTES_LIMIT && history.last() != Some(&source) {
+            history.push(source.clone());
+            while history.len() > LUA_CONSOLE_HISTORY_LIMIT
+                || history.iter().map(String::len).sum::<usize>() > LUA_CONSOLE_HISTORY_BYTES_LIMIT
+            {
+                history.remove(0);
+            }
+        }
+        history_index.set(history.len());
+    }
+    input.set_text("");
+    append_lua_console_output(state, &format!("> {source}"));
+
+    let result = {
+        let mut engine_slot = state.engine.borrow_mut();
+        let Some(engine) = engine_slot.as_mut() else {
+            append_lua_console_output(
+                state,
+                "REJECTED: the engine is busy changing process sessions",
+            );
+            status.set_label("Wait for the process operation to finish");
+            return;
+        };
+        engine.execute_lua_console(&source)
+    };
+    match result {
+        Ok(execution) => {
+            state
+                .lua_runtime_generation
+                .set(execution.runtime_generation);
+            if !execution.output.is_empty() {
+                append_lua_console_output(state, &execution.output);
+            }
+            if execution.output_truncated {
+                append_lua_console_output(state, "[Print output truncated at 64 KiB]");
+            }
+            if execution.runtime_error.is_empty() {
+                status.set_label(&format!(
+                    "Runtime generation {} · command completed",
+                    execution.runtime_generation
+                ));
+            } else {
+                append_lua_console_output(state, &format!("ERROR: {}", execution.runtime_error));
+                status.set_label(&format!(
+                    "Runtime generation {} · command stopped",
+                    execution.runtime_generation
+                ));
+            }
+        }
+        Err(error) => {
+            append_lua_console_output(
+                state,
+                &format!("REJECTED: {} ({})", error.message, error.code),
+            );
+            status.set_label("Command was not executed");
+        }
+    }
+}
+
+fn present_lua_console_dialog(window: &adw::ApplicationWindow, state: &SessionState) {
+    if let Some(dialog) = state.lua_console_dialog.borrow().clone() {
+        dialog.present(Some(window));
+        return;
+    }
+
+    let header = adw::HeaderBar::new();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    let warning = gtk::Label::builder()
+        .label(
+            "Commands run only when you press Run or Enter. They share the current Lua state with explicitly executed table scripts and can modify the target or access the system with this application's privileges. Pure Lua is instruction-limited; native functions may still block.",
+        )
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    let output = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    output
+        .buffer()
+        .set_text(&state.lua_console_backlog.borrow());
+    let output_scrolled = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .min_content_height(300)
+        .child(&output)
+        .build();
+    let input = gtk::Entry::builder()
+        .placeholder_text("Enter Lua code; use Up/Down for history")
+        .max_length(1 << 20)
+        .hexpand(true)
+        .build();
+    let run = gtk::Button::builder()
+        .label("Run")
+        .tooltip_text("Execute this command in the current Lua runtime")
+        .css_classes(["destructive-action"])
+        .build();
+    let clear = gtk::Button::builder()
+        .label("Clear")
+        .tooltip_text("Clear the visible console transcript")
+        .build();
+    let input_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    input_row.append(&input);
+    input_row.append(&run);
+    input_row.append(&clear);
+    let status = gtk::Label::builder()
+        .label(format!(
+            "Runtime generation {} · 0 timers",
+            state.lua_runtime_generation.get()
+        ))
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(&warning);
+    content.append(&output_scrolled);
+    content.append(&input_row);
+    content.append(&status);
+    toolbar.set_content(Some(&content));
+    let dialog = adw::Dialog::builder()
+        .title("Lua Console")
+        .content_width(780)
+        .content_height(560)
+        .child(&toolbar)
+        .build();
+
+    let history_index = Rc::new(Cell::new(state.lua_console_history.borrow().len()));
+    run.connect_clicked({
+        let state = state.clone();
+        let input = input.clone();
+        let status = status.clone();
+        let history_index = history_index.clone();
+        move |_| execute_lua_console_command(&state, &input, &status, &history_index)
+    });
+    input.connect_activate({
+        let state = state.clone();
+        let status = status.clone();
+        let history_index = history_index.clone();
+        move |input| execute_lua_console_command(&state, input, &status, &history_index)
+    });
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed({
+        let state = state.clone();
+        let input = input.clone();
+        let history_index = history_index.clone();
+        move |_, key, _, _| match key {
+            gtk::gdk::Key::Up => {
+                let history = state.lua_console_history.borrow();
+                if history_index.get() > 0 {
+                    history_index.set(history_index.get() - 1);
+                    input.set_text(&history[history_index.get()]);
+                    input.set_position(-1);
+                }
+                adw::glib::Propagation::Stop
+            }
+            gtk::gdk::Key::Down => {
+                let history = state.lua_console_history.borrow();
+                if history_index.get() + 1 < history.len() {
+                    history_index.set(history_index.get() + 1);
+                    input.set_text(&history[history_index.get()]);
+                    input.set_position(-1);
+                } else {
+                    history_index.set(history.len());
+                    input.set_text("");
+                }
+                adw::glib::Propagation::Stop
+            }
+            gtk::gdk::Key::Escape => {
+                history_index.set(state.lua_console_history.borrow().len());
+                input.set_text("");
+                adw::glib::Propagation::Stop
+            }
+            _ => adw::glib::Propagation::Proceed,
+        }
+    });
+    input.add_controller(key_controller);
+    clear.connect_clicked({
+        let state = state.clone();
+        let output = output.clone();
+        move |_| {
+            output.buffer().set_text("");
+            state.lua_console_backlog.borrow_mut().clear();
+        }
+    });
+    dialog.connect_closed({
+        let state = state.clone();
+        let output = output.clone();
+        move |_| {
+            let buffer = output.buffer();
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            *state.lua_console_backlog.borrow_mut() = text.to_string();
+            *state.lua_console_output.borrow_mut() = None;
+            *state.lua_console_status.borrow_mut() = None;
+            *state.lua_console_dialog.borrow_mut() = None;
+        }
+    });
+    *state.lua_console_output.borrow_mut() = Some(output);
+    *state.lua_console_status.borrow_mut() = Some(status.clone());
+    *state.lua_console_dialog.borrow_mut() = Some(dialog.clone());
+    if std::env::var_os("CE_GTK_LUA_CONSOLE_SMOKE").is_some() {
+        input.set_text(
+            "print('gtk-lua-console-smoke'); smoke_timer=createTimer(1); timer_onTimer(smoke_timer, function() print('gtk-lua-timer-smoke'); object_destroy(smoke_timer) end)",
+        );
+        execute_lua_console_command(state, &input, &status, &history_index);
+    }
+    dialog.present(Some(window));
+    input.grab_focus();
+}
+
+fn install_runtime_tick(state: &SessionState, widgets: &SessionWidgets) {
     let state = state.clone();
     let widgets = widgets.clone();
-    let ticks = Rc::new(Cell::new(0_u8));
-    adw::glib::timeout_add_local(FREEZE_INTERVAL, move || {
-        if !state.attached.get() {
-            return adw::glib::ControlFlow::Continue;
-        }
-
-        let next_tick = ticks.get().wrapping_add(1);
-        ticks.set(next_tick);
-        let page = {
+    adw::glib::timeout_add_local(RUNTIME_TICK_INTERVAL, move || {
+        let (tick, page) = {
             let mut engine_slot = state.engine.borrow_mut();
             let Some(engine) = engine_slot.as_mut() else {
                 return adw::glib::ControlFlow::Continue;
             };
-            engine.freeze_addresses();
-            next_tick
-                .is_multiple_of(ADDRESS_REFRESH_TICKS)
-                .then(|| engine.address_rows(0, ADDRESS_PAGE_SIZE, true))
+            let tick = engine.periodic_tick();
+            let page = (state.attached.get() && tick.address_refresh_due)
+                .then(|| engine.address_rows(0, ADDRESS_PAGE_SIZE, true));
+            (tick, page)
         };
+
+        if tick.runtime_generation != state.lua_runtime_generation.get() {
+            state.lua_runtime_generation.set(tick.runtime_generation);
+            append_lua_console_output(
+                &state,
+                &format!(
+                    "-- Lua runtime reset to generation {}; globals, callbacks, and timers were discarded --",
+                    tick.runtime_generation
+                ),
+            );
+        }
+        if !tick.output.is_empty() {
+            append_lua_console_output(&state, &tick.output);
+        }
+        if tick.output_truncated {
+            append_lua_console_output(&state, "[Timer output truncated at 64 KiB]");
+        }
+        if let Some(status) = state.lua_console_status.borrow().clone() {
+            let mut summary = format!(
+                "Runtime generation {} · {} timer{}",
+                tick.runtime_generation,
+                tick.timer_count,
+                if tick.timer_count == 1 { "" } else { "s" }
+            );
+            if tick.timer_errors > 0 {
+                summary.push_str(&format!(" · {} stopped with errors", tick.timer_errors));
+            }
+            if tick.timers_deferred > 0 {
+                summary.push_str(&format!(" · {} deferred", tick.timers_deferred));
+            }
+            status.set_label(&summary);
+        }
         if let Some(page) = page {
             update_address_values(&state, &widgets, page);
         }

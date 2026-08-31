@@ -81,6 +81,15 @@ Completed in the foundation and first vertical slices:
   UTF-8-sanitized print output; revocation recreates the Lua state and detaches
   its address-list callbacks, while the UI explicitly warns that completed
   native/target/system side effects cannot be rolled back;
+- a GTK Lua Console sharing that resettable runtime without granting table
+  trust: commands run only from the visible Run/Enter action, retain bounded
+  command history and a bounded transcript, and use the same 1 MiB input,
+  2-million VM-instruction, and 64 KiB output caps as explicit table payloads;
+- toolkit-neutral periodic scheduling through `EngineFacade::periodic_tick`:
+  GTK now drives address freezing, visible-row refresh cadence, and CE-style Lua
+  timers from one 30 ms GLib source; due timers are round-robin fair, capped at
+  32 callbacks per tick and 200,000 VM instructions per callback, with failing
+  callbacks disabled and asynchronous output returned through a bounded DTO;
 - runtime Auto Assembler disable state stays behind the CXX facade and is used
   to restore original target bytes before trust revocation, record/subtree
   deletion, target replacement, detach, or normal facade destruction; failed
@@ -97,7 +106,8 @@ Completed in the foundation and first vertical slices:
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
-- CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
+- CXX contract, Rust unit, GTK/Xvfb startup and Lua-console smokes, Qt smoke, and
+  core regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The current pager deliberately keeps only one bounded page in GTK.  A later
@@ -105,13 +115,13 @@ performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
 contract.  The address-list controller is now the GTK source of truth and the
 Qt model delegates hierarchy plus the safe `IAddressList` surface through a
-lossless adapter.  Qt still owns its periodic refresh and freeze timers, inline
-value-editor verification, and its legacy Auto Assembler adapter.  GTK now has
+lossless adapter.  Qt still owns its own periodic refresh/freeze/Lua pump,
+inline value-editor verification, and its legacy Auto Assembler adapter. GTK now has
 a bounded read-only review UI plus separately explicit-trust Auto Assembler and
-Lua paths.  Lua is intentionally per-payload rather than automatic, and its VM
-instruction ceiling does not interrupt a blocking native binding. Completing
-the periodic timer extraction and the broader Lua console/timer/form parity are
-the remaining Phase 2/advanced work.  The GTK frontend does not yet open
+Lua paths, an interactive bounded console, and toolkit-neutral periodic address/
+Lua timer scheduling. Imported Lua is intentionally per-payload rather than
+automatic, and VM instruction ceilings do not interrupt a blocking native
+binding. Broader Lua GUI/form parity remains advanced work. The GTK frontend does not yet open
 password-protected CETRAINER files, expose a loss report, or virtualize address
 rows beyond its bounded first page. No product identifier should be published
 before the branding decision.
@@ -135,7 +145,8 @@ The first usable release covers the everyday scan loop:
 - an explicit trust prompt before executing table Lua or Auto Assembler scripts.
 
 Advanced tools such as the memory browser, debugger, structure dissector,
-pointer scanner, Lua console, and script editor move in later vertical slices.
+pointer scanner, Lua GUI/forms, and script editor move in later vertical slices.
+The foundational Lua console and CE-style timer lifecycle have already moved.
 Until each slice reaches parity, the legacy Qt binary remains available as a
 separate application.  The two frontends must not attempt to share live process
 state across processes.
@@ -220,6 +231,8 @@ EngineFacade
   table_scripts(start, count) -> TableScriptPage
   table_script_text(record_id, kind, offset, count) -> TableScriptTextPage
   set_table_lua_trusted(bool) / execute_table_lua(record_id, kind)
+  execute_lua_console(source) -> LuaConsoleResult
+  periodic_tick() -> RuntimeTickResult
   save_table(path) -> TableSaveReport
 ```
 
@@ -355,7 +368,7 @@ Move one feature at a time, keeping its controller toolkit-neutral and adding a
 parity test before marking it complete.  Proposed order:
 
 1. memory browser, disassembler, and assembler;
-2. Auto Assembler/script editor and Lua console;
+2. Auto Assembler/script editor and Lua console (console/timer foundation complete);
 3. debugger, breakpoints, find-what-writes/accesses, and tracer;
 4. pointer scanner and structure dissector;
 5. remaining analysis tools, settings, hotkeys, overlay, and trainer workflow.
@@ -441,5 +454,6 @@ recorded in a short decision note before public release.
 10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
 11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
     trust/review, trusted Auto Assembler activation/cleanup, and separately
-    consented per-payload Lua execution with bounded input/VM/output.~~ Next
-    extract periodic scheduling and add Lua timer/console parity.
+    consented per-payload Lua execution with bounded input/VM/output, periodic
+    scheduling, and Lua console/timer parity.~~ Next replace the explicit result
+    pager with a virtualized bounded-cache model and continue Lua GUI/form parity.

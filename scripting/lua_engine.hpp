@@ -6,6 +6,7 @@
 #include "symbols/elf_symbols.hpp"
 #include "core/types.hpp"                // CpuContext
 #include "core/simple_hook.hpp"          // SimpleHook (createSimpleHook registry)
+#include <cstddef>
 #include <string>
 #include <expected>
 #include <functional>
@@ -90,14 +91,26 @@ public:
     // Timers fire their Lua callback from pumpTimers(), which the host calls on the
     // Lua thread (the GUI drives it with a QTimer). cbRef is a luaL_ref into the
     // registry. Returns the new timer id.
+    struct TimerPumpResult {
+        std::size_t callbacksFired = 0;
+        std::size_t callbacksFailed = 0;
+        std::size_t callbacksDeferred = 0;
+    };
     int  createTimer(double intervalMs);
     void setTimerInterval(int id, double intervalMs);
     void setTimerCallback(int id, int cbRef);   // luaL_ref value; replaces+frees any prior
     void setTimerEnabled(int id, bool enabled);
     void destroyTimer(int id);
     bool isTimer(int id) const { return timers_.count(id) != 0; }
+    std::size_t timerCount() const { return timers_.size(); }
     /// Fire every enabled timer whose interval has elapsed. Safe to call often.
     void pumpTimers();
+    /// Fire at most maxCallbacks due timers in round-robin order. Each callback
+    /// gets its own VM-instruction ceiling; a callback that exceeds it or raises
+    /// an error is disabled so it cannot monopolise every subsequent host tick.
+    /// Native bindings can still block for their own duration.
+    TimerPumpResult pumpTimersBounded(int instructionLimit,
+                                      std::size_t maxCallbacks);
 
     // ── CE stringlist object (createStringlist / stringlist_* ) ──
     // A named list of strings; indices are 0-based (CE convention).
@@ -150,6 +163,7 @@ private:
 
     struct LuaTimer { double intervalMs = 1000; double lastMs = 0; int cbRef = -2 /*LUA_NOREF*/; bool enabled = true; };
     std::map<int, LuaTimer> timers_;
+    int timerPumpCursor_ = 0;
     std::map<int, std::vector<std::string>> stringlists_;
     std::map<int, SimpleHook> hooks_;
     int nextObjectId_ = 1;   // shared id space for timers + stringlists + hooks

@@ -179,6 +179,27 @@ mod ffi {
         error_message: String,
     }
 
+    struct LuaConsoleResult {
+        accepted: bool,
+        runtime_generation: u64,
+        output: String,
+        output_truncated: bool,
+        runtime_error: String,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct RuntimeTickResult {
+        runtime_generation: u64,
+        address_refresh_due: bool,
+        timer_count: u32,
+        timers_fired: u32,
+        timer_errors: u32,
+        timers_deferred: u32,
+        output: String,
+        output_truncated: bool,
+    }
+
     unsafe extern "C++" {
         include!("bridge/engine_facade.hpp");
 
@@ -278,7 +299,9 @@ mod ffi {
             record_id: i32,
             kind: u8,
         ) -> LuaExecutionResult;
-        fn freeze_addresses(self: Pin<&mut EngineFacade>);
+        fn execute_lua_console(self: Pin<&mut EngineFacade>, source: &str) -> LuaConsoleResult;
+        fn lua_runtime_generation(self: &EngineFacade) -> u64;
+        fn periodic_tick(self: Pin<&mut EngineFacade>) -> RuntimeTickResult;
     }
 }
 
@@ -719,6 +742,26 @@ pub struct LuaExecution {
     pub runtime_error: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LuaConsoleExecution {
+    pub runtime_generation: u64,
+    pub output: String,
+    pub output_truncated: bool,
+    pub runtime_error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTick {
+    pub runtime_generation: u64,
+    pub address_refresh_due: bool,
+    pub timer_count: u32,
+    pub timers_fired: u32,
+    pub timer_errors: u32,
+    pub timers_deferred: u32,
+    pub output: String,
+    pub output_truncated: bool,
+}
+
 pub struct Engine {
     inner: cxx::UniquePtr<ffi::EngineFacade>,
 }
@@ -1074,8 +1117,42 @@ impl Engine {
         }
     }
 
-    pub fn freeze_addresses(&mut self) {
-        self.inner.pin_mut().freeze_addresses();
+    pub fn execute_lua_console(
+        &mut self,
+        source: &str,
+    ) -> Result<LuaConsoleExecution, AddressError> {
+        let result = self.inner.pin_mut().execute_lua_console(source);
+        if result.accepted {
+            Ok(LuaConsoleExecution {
+                runtime_generation: result.runtime_generation,
+                output: result.output,
+                output_truncated: result.output_truncated,
+                runtime_error: result.runtime_error,
+            })
+        } else {
+            Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            })
+        }
+    }
+
+    pub fn lua_runtime_generation(&self) -> u64 {
+        self.inner.lua_runtime_generation()
+    }
+
+    pub fn periodic_tick(&mut self) -> RuntimeTick {
+        let result = self.inner.pin_mut().periodic_tick();
+        RuntimeTick {
+            runtime_generation: result.runtime_generation,
+            address_refresh_due: result.address_refresh_due,
+            timer_count: result.timer_count,
+            timers_fired: result.timers_fired,
+            timer_errors: result.timer_errors,
+            timers_deferred: result.timers_deferred,
+            output: result.output,
+            output_truncated: result.output_truncated,
+        }
     }
 }
 
@@ -1510,17 +1587,19 @@ mod tests {
             .set_address_active(id, true)
             .expect("freeze the address-list value");
         unsafe { *value.get() = 5 };
-        engine.freeze_addresses();
+        engine.periodic_tick();
         assert_eq!(unsafe { *value.get() }, 77);
 
         engine
             .set_address_freeze_mode(id, FreezeMode::IncreaseOnly)
             .expect("change the freeze mode");
         unsafe { *value.get() = 100 };
-        engine.freeze_addresses();
+        std::thread::sleep(Duration::from_millis(105));
+        engine.periodic_tick();
         assert_eq!(unsafe { *value.get() }, 100, "allowed increase must remain");
         unsafe { *value.get() = 1 };
-        engine.freeze_addresses();
+        std::thread::sleep(Duration::from_millis(105));
+        engine.periodic_tick();
         assert_eq!(
             unsafe { *value.get() },
             77,
@@ -1996,7 +2075,7 @@ dealloc(newmem)</AssemblerScript>
       <LuaScript>print(string.rep('x', 70000)); while true do end</LuaScript>
     </CheatEntry>
   </CheatEntries>
-  <LuaScript>TABLE_MARK = 73; print('table-ready')</LuaScript>
+  <LuaScript>TABLE_MARK = 73; print('table-ready'); table_timer=createTimer(1); timer_onTimer(table_timer, function() print('table-timer'); object_destroy(table_timer) end)</LuaScript>
 </CheatTable>
 "#,
         )
@@ -2025,6 +2104,11 @@ dealloc(newmem)</AssemblerScript>
             .execute_table_lua(0, TableScriptKind::TableLua)
             .expect("run table Lua explicitly");
         assert_eq!(table.output, "table-ready");
+        std::thread::sleep(Duration::from_millis(5));
+        let table_timer = engine.periodic_tick();
+        assert_eq!(table_timer.timers_fired, 1);
+        assert_eq!(table_timer.timer_count, 0);
+        assert_eq!(table_timer.output, "table-timer");
         let after_table = engine
             .execute_table_lua(55, TableScriptKind::RecordLua)
             .expect("run record Lua after table initializer");
@@ -2083,6 +2167,127 @@ dealloc(newmem)</AssemblerScript>
             "lua_script_too_large"
         );
         std::fs::remove_file(oversized_source).expect("remove oversized Lua fixture");
+    }
+
+    #[test]
+    fn lua_console_is_explicit_bounded_and_does_not_grant_table_trust() {
+        let mut engine = Engine::new();
+        let generation = engine.lua_runtime_generation();
+        assert!(generation > 0);
+        assert!(!engine.table_lua_trusted());
+
+        let first = engine
+            .execute_lua_console("CONSOLE_MARK = 91; print('console-ready')")
+            .expect("run explicit console input");
+        assert_eq!(first.runtime_generation, generation);
+        assert_eq!(first.output, "console-ready");
+        assert!(first.runtime_error.is_empty());
+        assert!(
+            !engine.table_lua_trusted(),
+            "console use must not trust a table"
+        );
+
+        let persisted = engine
+            .execute_lua_console("print('marker=' .. tostring(CONSOLE_MARK))")
+            .expect("console shares its live Lua state");
+        assert_eq!(persisted.output, "marker=91");
+
+        let bounded = engine
+            .execute_lua_console("while true do end")
+            .expect("runtime errors are returned as console results");
+        assert!(bounded.runtime_error.contains("instruction limit"));
+
+        let oversized = "x".repeat((1 << 20) + 1);
+        assert_eq!(
+            engine
+                .execute_lua_console(&oversized)
+                .expect_err("oversized console input must be rejected")
+                .code,
+            "lua_console_source_too_large"
+        );
+        assert_eq!(
+            engine
+                .execute_lua_console("print('before')\0print('after')")
+                .expect_err("NUL-bearing console input must be rejected")
+                .code,
+            "lua_console_source_contains_nul"
+        );
+    }
+
+    #[test]
+    fn periodic_tick_pumps_bounded_timers_and_runtime_reset_cancels_them() {
+        let mut engine = Engine::new();
+        let generation = engine.lua_runtime_generation();
+        engine
+            .execute_lua_console(
+                "ticks=0; t=createTimer(1); timer_onTimer(t, function() ticks=ticks+1; print('tick=' .. ticks) end)",
+            )
+            .expect("create a console timer");
+        std::thread::sleep(Duration::from_millis(5));
+        let tick = engine.periodic_tick();
+        assert_eq!(tick.runtime_generation, generation);
+        assert_eq!(tick.timer_count, 1);
+        assert_eq!(tick.timers_fired, 1);
+        assert_eq!(tick.timer_errors, 0);
+        assert_eq!(tick.output, "tick=1");
+
+        engine
+            .execute_lua_console(
+                "bad=createTimer(1); timer_onTimer(bad, function() while true do end end)",
+            )
+            .expect("create a runaway timer without running it synchronously");
+        std::thread::sleep(Duration::from_millis(5));
+        let failed = engine.periodic_tick();
+        assert_eq!(failed.timers_fired, 1);
+        assert_eq!(failed.timer_errors, 1);
+        assert!(failed.output.contains("instruction limit"));
+        assert!(failed.output.contains("timer disabled"));
+        let after_failure = engine.periodic_tick();
+        assert_eq!(after_failure.timer_errors, 0, "failed timer stays disabled");
+
+        engine
+            .set_table_lua_trusted(false)
+            .expect("runtime reset is allowed even without table trust");
+        assert!(engine.lua_runtime_generation() > generation);
+        let reset = engine.periodic_tick();
+        assert_eq!(reset.timer_count, 0);
+        let clean = engine
+            .execute_lua_console("print(tostring(ticks))")
+            .expect("console remains usable after reset");
+        assert_eq!(clean.output, "nil");
+    }
+
+    #[test]
+    fn periodic_tick_caps_due_timer_callbacks_without_starvation() {
+        let mut engine = Engine::new();
+        engine
+            .execute_lua_console(
+                r#"
+                timer_total = 0
+                for index = 1, 40 do
+                    local timer
+                    timer = createTimer(1)
+                    timer_onTimer(timer, function()
+                        timer_total = timer_total + 1
+                        object_destroy(timer)
+                    end)
+                end
+            "#,
+            )
+            .expect("create many one-shot timers");
+        std::thread::sleep(Duration::from_millis(5));
+        let first = engine.periodic_tick();
+        assert_eq!(first.timers_fired, 32);
+        assert_eq!(first.timers_deferred, 8);
+        assert_eq!(first.timer_count, 8);
+        let second = engine.periodic_tick();
+        assert_eq!(second.timers_fired, 8);
+        assert_eq!(second.timers_deferred, 0);
+        assert_eq!(second.timer_count, 0);
+        let total = engine
+            .execute_lua_console("print(timer_total)")
+            .expect("all deferred timers eventually run");
+        assert_eq!(total.output, "40");
     }
 
     #[test]

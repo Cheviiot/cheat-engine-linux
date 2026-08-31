@@ -35,6 +35,8 @@ struct TableScriptRow;
 struct TableScriptPage;
 struct TableScriptTextPage;
 struct LuaExecutionResult;
+struct LuaConsoleResult;
+struct RuntimeTickResult;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -89,7 +91,9 @@ public:
     bool table_lua_trusted() const noexcept;
     LuaExecutionResult execute_table_lua(std::int32_t record_id,
                                          std::uint8_t kind);
-    void freeze_addresses() noexcept;
+    LuaConsoleResult execute_lua_console(rust::Str source);
+    std::uint64_t lua_runtime_generation() const noexcept;
+    RuntimeTickResult periodic_tick();
 
 private:
     struct ScriptRuntime;

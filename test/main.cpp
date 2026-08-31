@@ -1464,6 +1464,34 @@ static void test_lua_bounded_execution_and_callback_lifetime() {
         20000);
     const bool loopStopped = loopError.find("instruction limit") != std::string::npos;
 
+    LuaEngine timerBounded;
+    const auto timerSetup = timerBounded.executeBounded(R"(
+        timer_hits = 0
+        runaway_timer = createTimer(1)
+        timer_onTimer(runaway_timer, function()
+            timer_hits = timer_hits + 1
+            while true do end
+        end)
+    )", 20000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto runawayPump = timerBounded.pumpTimersBounded(20000, 8);
+    const auto disabledPump = timerBounded.pumpTimersBounded(20000, 8);
+    const bool runawayStopped = timerSetup.empty() &&
+        runawayPump.callbacksFailed == 1 && disabledPump.callbacksFailed == 0;
+
+    LuaEngine cappedTimers;
+    const auto cappedSetup = cappedTimers.executeBounded(R"(
+        timer_fires = 0
+        for index = 1, 40 do
+            local timer = createTimer(1)
+            timer_onTimer(timer, function() timer_fires = timer_fires + 1 end)
+        end
+    )", 100000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto cappedPump = cappedTimers.pumpTimersBounded(5000, 8);
+    const bool timerCapApplied = cappedSetup.empty() &&
+        cappedPump.callbacksFired == 8 && cappedPump.callbacksDeferred == 32;
+
     SimpleAddressList list;
     const int record = list.createEntry(0x1000, ValueType::Int32, "Callback owner");
     int callbackOutput = 0;
@@ -1482,9 +1510,11 @@ static void test_lua_bounded_execution_and_callback_lifetime() {
     }
     list.setActive(record, false);
     const bool callbackDetached = callbackOutput == 1;
-    printf("  normal=%d infinite-loop-stopped=%d callback-detached=%d: %s\n",
-           normal, loopStopped, callbackDetached,
-           normal && loopStopped && callbackDetached ? "OK" : "FAILED");
+    printf("  normal=%d infinite-loop-stopped=%d runaway-timer-stopped=%d "
+           "timer-cap=%d callback-detached=%d: %s\n",
+           normal, loopStopped, runawayStopped, timerCapApplied, callbackDetached,
+           normal && loopStopped && runawayStopped && timerCapApplied && callbackDetached
+               ? "OK" : "FAILED");
 }
 
 // The diagnostic logging facility: level parsing, per-category gating, Off.

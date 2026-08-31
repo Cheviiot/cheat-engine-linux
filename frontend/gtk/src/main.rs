@@ -17,13 +17,17 @@ fn main() -> adw::glib::ExitCode {
     }
 
     let application = application::build_application();
-    if arguments.iter().any(|argument| argument == "--smoke-test") {
-        application.connect_activate(|application| {
-            if let Some(window) = application.active_window() {
+    let startup_smoke = arguments.iter().any(|argument| argument == "--smoke-test");
+    let lua_console_smoke = arguments
+        .iter()
+        .any(|argument| argument == "--lua-console-smoke");
+    if startup_smoke || lua_console_smoke {
+        application.connect_activate(move |application| {
+            if startup_smoke && let Some(window) = application.active_window() {
                 process_dialog::present(&window, |_| {});
             }
             let application = application.clone();
-            adw::glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            adw::glib::timeout_add_local_once(Duration::from_millis(350), move || {
                 application.quit();
             });
         });
