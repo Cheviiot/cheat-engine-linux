@@ -126,6 +126,12 @@ public:
     /// Iterate all results.
     void forEach(std::function<void(uintptr_t addr, const void* value, size_t valueSize)> callback, size_t valueSize) const;
 
+    /// Iterate a bounded result range without opening the backing files once per
+    /// row. Used by paged UIs; `start` and `count` are clamped to the result.
+    void forRange(size_t start, size_t count,
+                  std::function<void(uintptr_t addr, const void* value, size_t valueSize)> callback,
+                  size_t valueSize) const;
+
     const std::filesystem::path& directory() const { return dir_; }
 
     /// Each backing shard's directory and record count, in address order. A scan

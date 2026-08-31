@@ -11,6 +11,7 @@ use crate::process_dialog;
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SCAN_PAGE_SIZE: u32 = 128;
 
 #[derive(Clone)]
 struct SessionState {
@@ -18,6 +19,8 @@ struct SessionState {
     selected: Rc<RefCell<Option<Process>>>,
     attached: Rc<Cell<bool>>,
     scanning: Rc<Cell<bool>>,
+    scan_generation: Rc<Cell<u64>>,
+    scan_page_start: Rc<Cell<u64>>,
 }
 
 #[derive(Clone)]
@@ -32,6 +35,9 @@ struct SessionWidgets {
     scan_progress: gtk::ProgressBar,
     scan_summary: gtk::Label,
     scan_results: gtk::ListBox,
+    previous_page_button: gtk::Button,
+    next_page_button: gtk::Button,
+    page_label: gtk::Label,
 }
 
 pub fn build_application() -> adw::Application {
@@ -51,6 +57,8 @@ fn build_window(application: &adw::Application) {
         selected: Rc::new(RefCell::new(None)),
         attached: Rc::new(Cell::new(false)),
         scanning: Rc::new(Cell::new(false)),
+        scan_generation: Rc::new(Cell::new(0)),
+        scan_page_start: Rc::new(Cell::new(0)),
     };
 
     let header = adw::HeaderBar::builder().show_title(false).build();
@@ -158,6 +166,27 @@ fn build_window(application: &adw::Application) {
         .child(&scan_results)
         .build();
 
+    let previous_page_button = gtk::Button::builder()
+        .label("Previous")
+        .sensitive(false)
+        .build();
+    let next_page_button = gtk::Button::builder()
+        .label("Next")
+        .sensitive(false)
+        .build();
+    let page_label = gtk::Label::builder()
+        .label("No results")
+        .hexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let page_actions = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    page_actions.append(&previous_page_button);
+    page_actions.append(&page_label);
+    page_actions.append(&next_page_button);
+
     let content = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(18)
@@ -178,6 +207,7 @@ fn build_window(application: &adw::Application) {
     content.append(&scan_progress);
     content.append(&scan_summary);
     content.append(&scan_results_scrolled);
+    content.append(&page_actions);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(720)
@@ -208,6 +238,9 @@ fn build_window(application: &adw::Application) {
         scan_progress,
         scan_summary,
         scan_results,
+        previous_page_button,
+        next_page_button,
+        page_label,
     };
 
     widgets.process_button.connect_clicked({
@@ -264,6 +297,30 @@ fn build_window(application: &adw::Application) {
             }
             widgets.cancel_scan_button.set_sensitive(false);
             widgets.scan_progress.set_text(Some("Cancelling…"));
+        }
+    });
+
+    widgets.previous_page_button.connect_clicked({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| {
+            let start = state
+                .scan_page_start
+                .get()
+                .saturating_sub(u64::from(SCAN_PAGE_SIZE));
+            load_scan_page(&state, &widgets, start);
+        }
+    });
+
+    widgets.next_page_button.connect_clicked({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| {
+            let start = state
+                .scan_page_start
+                .get()
+                .saturating_add(u64::from(SCAN_PAGE_SIZE));
+            load_scan_page(&state, &widgets, start);
         }
     });
 
@@ -432,7 +489,7 @@ fn start_first_scan(
     widgets.scan_progress.set_fraction(0.0);
     widgets.scan_progress.set_text(Some("Scanning… 0%"));
     widgets.scan_summary.set_label("Reading target memory…");
-    clear_scan_results(&widgets.scan_results);
+    reset_scan_pages(state, widgets);
 
     let window = window.clone();
     let state = state.clone();
@@ -479,21 +536,17 @@ fn start_first_scan(
         } else if status.completed {
             widgets.scan_progress.set_fraction(1.0);
             widgets.scan_progress.set_text(Some("Complete"));
-            let preview_note = if status.result_count > status.preview.len() as u64 {
-                format!(" Showing the first {}.", status.preview.len())
-            } else {
-                String::new()
-            };
             let disk_note = if status.write_error {
                 " Result storage was truncated; check available disk space."
             } else {
                 ""
             };
             widgets.scan_summary.set_label(&format!(
-                "Found {} addresses.{}{}",
-                status.result_count, preview_note, disk_note
+                "Found {} addresses.{}",
+                status.result_count, disk_note
             ));
-            render_scan_results(&widgets.scan_results, &status.preview);
+            state.scan_generation.set(status.generation);
+            load_scan_page(&state, &widgets, 0);
         }
         adw::glib::ControlFlow::Break
     });
@@ -527,6 +580,53 @@ fn render_scan_results(list: &gtk::ListBox, hits: &[crate::bridge::ScanHit]) {
     }
 }
 
+fn load_scan_page(state: &SessionState, widgets: &SessionWidgets, start: u64) {
+    let generation = state.scan_generation.get();
+    if generation == 0 {
+        return;
+    }
+    let page = state
+        .engine
+        .borrow()
+        .as_ref()
+        .expect("engine remains present while paging")
+        .scan_rows(generation, start, SCAN_PAGE_SIZE);
+    if page.stale || page.generation != generation {
+        reset_scan_pages(state, widgets);
+        widgets
+            .scan_summary
+            .set_label("Scan results changed; the stale page was discarded.");
+        return;
+    }
+    if !page.error_message.is_empty() {
+        clear_scan_results(&widgets.scan_results);
+        widgets.page_label.set_label("Results unavailable");
+        widgets.scan_summary.set_label(&page.error_message);
+        return;
+    }
+
+    state.scan_page_start.set(page.start);
+    render_scan_results(&widgets.scan_results, &page.rows);
+
+    let shown_end = page.start.saturating_add(page.rows.len() as u64);
+    if page.total_count == 0 {
+        widgets.page_label.set_label("No results");
+    } else if page.rows.is_empty() {
+        widgets.page_label.set_label("No rows on this page");
+    } else {
+        widgets.page_label.set_label(&format!(
+            "{}–{} of {}",
+            page.start + 1,
+            shown_end,
+            page.total_count
+        ));
+    }
+    widgets.previous_page_button.set_sensitive(page.start > 0);
+    widgets
+        .next_page_button
+        .set_sensitive(shown_end < page.total_count);
+}
+
 fn clear_scan_results(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -543,6 +643,15 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
     widgets
         .scan_summary
         .set_label("Attach to a process to enable exact 4-byte scans.");
+    reset_scan_pages(state, widgets);
+}
+
+fn reset_scan_pages(state: &SessionState, widgets: &SessionWidgets) {
+    state.scan_generation.set(0);
+    state.scan_page_start.set(0);
+    widgets.previous_page_button.set_sensitive(false);
+    widgets.next_page_button.set_sensitive(false);
+    widgets.page_label.set_label("No results");
     clear_scan_results(&widgets.scan_results);
 }
 

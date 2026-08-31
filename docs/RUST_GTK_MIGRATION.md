@@ -19,15 +19,17 @@ Completed in the foundation and first vertical slices:
   `CAP_SYS_PTRACE` denial, already-traced targets, and unreadable mappings;
 - an asynchronous exact Int32 first scan backed by the existing
   `MemoryScanner`, with progress, cancellation, result count, write-error state,
-  and a strictly bounded 100-row preview;
+  and generation-aware result paging (128-row GTK pages, 256-row bridge cap);
 - deterministic bridge tests for self attach, child-process attach, failed
   reattach state preservation, and a known value in a bounded memory range;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
-The bounded scan preview is deliberately not the final result model.  The next
-slice replaces it with generation-aware paging and then adds next/undo scans.
-No product identifier should be published before the branding decision.
+The current pager deliberately keeps only one bounded page in GTK.  A later
+performance slice can replace the explicit Previous/Next controls with a
+virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
+contract.  The next functional slice adds next/undo scans.  No product
+identifier should be published before the branding decision.
 
 ## Goal
 
@@ -341,6 +343,7 @@ recorded in a short decision note before public release.
 2. ~~Minimal Cargo/GTK application and CXX/Corrosion version spike.~~
 3. ~~Bounded process list, attach/detach, and target diagnostics.~~
 4. ~~Asynchronous Int32 first-scan spike with progress and cancellation.~~
-5. Replace the 100-row preview with generation-aware, bounded result paging.
+5. ~~Replace the preview with generation-aware, bounded result paging.~~
 6. Add next scan, undo, and the complete scan request/value-type surface.
-7. Extract the toolkit-neutral address-list controller and adapt Qt to it.
+7. Replace the explicit pager with a virtualized bounded-cache GTK model.
+8. Extract the toolkit-neutral address-list controller and adapt Qt to it.

@@ -2053,6 +2053,53 @@ void ScanResult::forEach(std::function<void(uintptr_t, const void*, size_t)> cal
     }
 }
 
+void ScanResult::forRange(
+    size_t start, size_t count,
+    std::function<void(uintptr_t, const void*, size_t)> callback,
+    size_t valueSize) const {
+    if (start >= count_ || count == 0 || valueSize == 0) return;
+    const size_t end = start + std::min(count, count_ - start);
+    constexpr size_t kBatch = 4096;
+
+    for (const auto& shard : shards_) {
+        const size_t shardBegin = shard.cum;
+        const size_t shardEnd = shard.cum + shard.count;
+        const size_t rangeBegin = std::max(start, shardBegin);
+        const size_t rangeEnd = std::min(end, shardEnd);
+        if (rangeBegin >= rangeEnd) continue;
+
+        int offsetFd = open((shard.dir / "offsets.bin").c_str(), O_RDONLY);
+        int valueFd = open((shard.dir / "values.bin").c_str(), O_RDONLY);
+        if (offsetFd < 0 || valueFd < 0) {
+            if (offsetFd >= 0) close(offsetFd);
+            if (valueFd >= 0) close(valueFd);
+            continue;
+        }
+
+        std::vector<uint32_t> offsets(kBatch);
+        std::vector<uint8_t> values(kBatch * valueSize);
+        size_t local = rangeBegin - shard.cum;
+        const size_t localEnd = rangeEnd - shard.cum;
+        while (local < localEnd) {
+            const size_t batch = std::min(kBatch, localEnd - local);
+            const bool offsetsOk = preadFull(offsetFd, offsets.data(), batch * sizeof(uint32_t),
+                                              local * sizeof(uint32_t));
+            const bool valuesOk = preadFull(valueFd, values.data(), batch * valueSize,
+                                             local * valueSize);
+            if (!offsetsOk) break;
+            if (!valuesOk) std::fill_n(values.data(), batch * valueSize, uint8_t{0});
+
+            for (size_t index = 0; index < batch; ++index) {
+                callback(reconstruct(shard.frames, local + index, offsets[index]),
+                         values.data() + index * valueSize, valueSize);
+            }
+            local += batch;
+        }
+        close(offsetFd);
+        close(valueFd);
+    }
+}
+
 // ── MemoryScanner ──
 
 MemoryScanner::MemoryScanner(int threadCount)

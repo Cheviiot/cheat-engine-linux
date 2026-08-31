@@ -21,6 +21,7 @@ struct ProcessRow;
 struct AttachResult;
 struct ScanStartResult;
 struct ScanStatus;
+struct ScanPage;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -40,6 +41,8 @@ public:
     ScanStartResult start_first_scan_i32(std::int32_t value, std::uint64_t start_address,
                                          std::uint64_t stop_address, std::uint32_t alignment);
     ScanStatus scan_status() const;
+    ScanPage scan_rows(std::uint64_t generation, std::uint64_t start,
+                       std::uint32_t limit) const;
     void cancel_scan() noexcept;
 
 private:
@@ -55,6 +58,7 @@ private:
     std::atomic<bool> scan_started_{false};
     std::atomic<bool> scan_running_{false};
     std::atomic<bool> scan_cancel_requested_{false};
+    std::atomic<std::uint64_t> scan_generation_{0};
 };
 
 std::unique_ptr<EngineFacade> create_engine_facade();

@@ -37,6 +37,7 @@ mod ffi {
 
     struct ScanStatus {
         started: bool,
+        generation: u64,
         running: bool,
         cancel_requested: bool,
         cancelled: bool,
@@ -45,7 +46,15 @@ mod ffi {
         result_count: u64,
         write_error: bool,
         error_message: String,
-        preview: Vec<ScanHit>,
+    }
+
+    struct ScanPage {
+        generation: u64,
+        start: u64,
+        total_count: u64,
+        stale: bool,
+        error_message: String,
+        rows: Vec<ScanHit>,
     }
 
     unsafe extern "C++" {
@@ -68,6 +77,7 @@ mod ffi {
             alignment: u32,
         ) -> ScanStartResult;
         fn scan_status(self: &EngineFacade) -> ScanStatus;
+        fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
     }
 }
@@ -110,6 +120,7 @@ pub struct ScanHit {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanStatus {
     pub started: bool,
+    pub generation: u64,
     pub running: bool,
     pub cancel_requested: bool,
     pub cancelled: bool,
@@ -118,7 +129,16 @@ pub struct ScanStatus {
     pub result_count: u64,
     pub write_error: bool,
     pub error_message: String,
-    pub preview: Vec<ScanHit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanPage {
+    pub generation: u64,
+    pub start: u64,
+    pub total_count: u64,
+    pub stale: bool,
+    pub error_message: String,
+    pub rows: Vec<ScanHit>,
 }
 
 pub struct Engine {
@@ -217,6 +237,7 @@ impl Engine {
         let status = self.inner.scan_status();
         ScanStatus {
             started: status.started,
+            generation: status.generation,
             running: status.running,
             cancel_requested: status.cancel_requested,
             cancelled: status.cancelled,
@@ -225,8 +246,19 @@ impl Engine {
             result_count: status.result_count,
             write_error: status.write_error,
             error_message: status.error_message,
-            preview: status
-                .preview
+        }
+    }
+
+    pub fn scan_rows(&self, generation: u64, start: u64, limit: u32) -> ScanPage {
+        let page = self.inner.scan_rows(generation, start, limit);
+        ScanPage {
+            generation: page.generation,
+            start: page.start,
+            total_count: page.total_count,
+            stale: page.stale,
+            error_message: page.error_message,
+            rows: page
+                .rows
                 .into_iter()
                 .map(|hit| ScanHit {
                     address: hit.address,
@@ -319,16 +351,18 @@ mod tests {
     }
 
     #[test]
-    fn first_scan_finds_known_value_in_bounded_self_range() {
-        let sentinel = Box::new(0x0123_4567_i32);
-        let address = (&raw const *sentinel) as u64;
+    fn first_scan_pages_known_values_and_rejects_stale_generation() {
+        let sentinel = 0x0123_4567_i32;
+        let values = vec![sentinel; 300].into_boxed_slice();
+        let address = values.as_ptr() as u64;
+        let byte_len = std::mem::size_of_val(&*values) as u64;
         let mut engine = Engine::new();
         engine
             .attach(std::process::id() as i32, "scan fixture")
             .expect("attach to self");
 
         engine
-            .start_first_scan_i32(*sentinel, address, address + 4, 1)
+            .start_first_scan_i32(sentinel, address, address + byte_len, 4)
             .expect("start bounded first scan");
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -341,9 +375,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(status.completed, "scan failed: {}", status.error_message);
-        assert_eq!(status.result_count, 1);
-        assert_eq!(status.preview[0].address, address);
-        assert_eq!(status.preview[0].value, sentinel.to_string());
+        assert_eq!(status.result_count, 300);
+
+        let first_page = engine.scan_rows(status.generation, 0, 10_000);
+        assert!(!first_page.stale);
+        assert_eq!(first_page.rows.len(), 256, "facade page cap");
+        assert_eq!(first_page.rows[0].address, address);
+        assert_eq!(first_page.rows[0].value, sentinel.to_string());
+
+        let second_page = engine.scan_rows(status.generation, 256, 256);
+        assert_eq!(second_page.rows.len(), 44);
+        assert_eq!(second_page.total_count, 300);
+
+        engine.detach();
+        assert!(engine.scan_rows(status.generation, 0, 1).stale);
     }
 
     #[test]

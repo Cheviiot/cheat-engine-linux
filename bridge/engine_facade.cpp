@@ -9,9 +9,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstring>
 #include <fstream>
-#include <optional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -29,7 +30,7 @@ constexpr std::uint32_t kMaxProcessPageSize = 512;
 constexpr std::size_t kMaxProcessQuerySize = 256;
 constexpr std::size_t kMaxDisplayNameSize = 256;
 constexpr std::size_t kMemoryProbeLimit = 8;
-constexpr std::size_t kScanPreviewLimit = 100;
+constexpr std::uint32_t kMaxScanPageSize = 256;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -275,6 +276,7 @@ ScanStartResult EngineFacade::start_first_scan_i32(std::int32_t value,
         std::lock_guard lock(scan_mutex_);
         scan_result_.reset();
         scan_error_.clear();
+        scan_generation_.fetch_add(1, std::memory_order_acq_rel);
     }
     scanner_ = std::make_unique<ce::MemoryScanner>();
     scan_cancel_requested_.store(false, std::memory_order_release);
@@ -320,6 +322,7 @@ ScanStartResult EngineFacade::start_first_scan_i32(std::int32_t value,
 ScanStatus EngineFacade::scan_status() const {
     ScanStatus status;
     status.started = scan_started_.load(std::memory_order_acquire);
+    status.generation = scan_generation_.load(std::memory_order_acquire);
     status.running = scan_running_.load(std::memory_order_acquire);
     status.cancel_requested = scan_cancel_requested_.load(std::memory_order_acquire);
     status.cancelled = false;
@@ -334,22 +337,53 @@ ScanStatus EngineFacade::scan_status() const {
     status.cancelled = status.started && !status.running && status.cancel_requested;
     status.completed = status.started && !status.running && !status.cancelled &&
                        scan_error_.empty() && scan_result_ != nullptr;
-    if (!scan_result_) return status;
-
-    status.result_count = static_cast<std::uint64_t>(scan_result_->count());
-    status.write_error = scan_result_->hasWriteError();
-    if (!status.completed) return status;
-
-    const auto preview_size = std::min(scan_result_->count(), kScanPreviewLimit);
-    for (std::size_t index = 0; index < preview_size; ++index) {
-        std::int32_t value = 0;
-        scan_result_->value(index, &value, sizeof value);
-        status.preview.push_back(ScanHit{
-            .address = static_cast<std::uint64_t>(scan_result_->address(index)),
-            .value = std::to_string(value),
-        });
+    if (scan_result_) {
+        status.result_count = static_cast<std::uint64_t>(scan_result_->count());
+        status.write_error = scan_result_->hasWriteError();
     }
     return status;
+}
+
+ScanPage EngineFacade::scan_rows(std::uint64_t generation, std::uint64_t start,
+                                 std::uint32_t limit) const {
+    ScanPage page;
+    page.generation = scan_generation_.load(std::memory_order_acquire);
+    page.start = start;
+    page.total_count = 0;
+    page.stale = false;
+    page.error_message = "";
+
+    std::lock_guard lock(scan_mutex_);
+    page.generation = scan_generation_.load(std::memory_order_acquire);
+    page.stale = generation != page.generation;
+    if (page.stale) return page;
+    if (scan_running_.load(std::memory_order_acquire)) {
+        page.error_message = "Scan results are not ready yet.";
+        return page;
+    }
+    if (!scan_result_) {
+        page.error_message = "No completed scan result is available.";
+        return page;
+    }
+
+    page.total_count = static_cast<std::uint64_t>(scan_result_->count());
+    page.start = std::min<std::uint64_t>(start, page.total_count);
+    const auto bounded_start = static_cast<std::size_t>(std::min<std::uint64_t>(
+        page.start, std::numeric_limits<std::size_t>::max()));
+    const auto bounded_limit = static_cast<std::size_t>(std::min(limit, kMaxScanPageSize));
+    scan_result_->forRange(
+        bounded_start, bounded_limit,
+        [&page](std::uintptr_t address, const void* bytes, std::size_t size) {
+            if (size != sizeof(std::int32_t)) return;
+            std::int32_t value = 0;
+            std::memcpy(&value, bytes, sizeof value);
+            page.rows.push_back(ScanHit{
+                .address = static_cast<std::uint64_t>(address),
+                .value = std::to_string(value),
+            });
+        },
+        sizeof(std::int32_t));
+    return page;
 }
 
 void EngineFacade::cancel_scan() noexcept {
@@ -370,6 +404,7 @@ void EngineFacade::clear_scan_state() noexcept {
     scan_started_.store(false, std::memory_order_release);
     scan_running_.store(false, std::memory_order_release);
     scan_cancel_requested_.store(false, std::memory_order_release);
+    scan_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 std::unique_ptr<EngineFacade> create_engine_facade() {
