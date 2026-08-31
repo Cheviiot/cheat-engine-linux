@@ -96,6 +96,7 @@ struct SessionWidgets {
     page_label: gtk::Label,
     address_list_model: AddressListModel,
     address_summary: gtk::Label,
+    memory_view_button: gtk::Button,
     group_selected_button: gtk::Button,
     script_trust_button: gtk::Button,
     compatibility_report_button: gtk::Button,
@@ -127,6 +128,7 @@ pub fn main_layout_smoke_ok() -> bool {
 fn build_window(application: &adw::Application) {
     let mut engine = Engine::new();
     let address_list_smoke = std::env::var_os("CE_GTK_ADDRESS_LIST_SMOKE").is_some();
+    let memory_view_smoke = std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some();
     if address_list_smoke {
         for index in 0..600_u64 {
             engine
@@ -140,12 +142,28 @@ fn build_window(application: &adw::Application) {
                 .expect("populate the virtual address-list smoke fixture");
         }
     }
+    let memory_view_smoke_session = if memory_view_smoke {
+        Some(
+            engine
+                .attach(std::process::id() as i32, "GTK memory-view smoke")
+                .expect("attach the memory-view smoke fixture to itself"),
+        )
+    } else {
+        None
+    };
     let core_version = engine.version();
     let lua_runtime_generation = engine.lua_runtime_generation();
     let state = SessionState {
         engine: Rc::new(RefCell::new(Some(engine))),
-        selected: Rc::new(RefCell::new(None)),
-        attached: Rc::new(Cell::new(false)),
+        selected: Rc::new(RefCell::new(memory_view_smoke_session.as_ref().map(
+            |session| Process {
+                pid: session.pid,
+                name: session.name.clone(),
+                path: String::new(),
+                sandboxed: session.sandboxed,
+            },
+        ))),
+        attached: Rc::new(Cell::new(memory_view_smoke_session.is_some())),
         scanning: Rc::new(Cell::new(false)),
         scan_generation: Rc::new(Cell::new(0)),
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
@@ -395,7 +413,15 @@ fn build_window(application: &adw::Application) {
     let page_label = gtk::Label::builder()
         .label("No results")
         .xalign(0.0)
+        .hexpand(true)
         .css_classes(["dim-label"])
+        .build();
+
+    let memory_view_button = gtk::Button::builder()
+        .label("Memory View")
+        .icon_name("document-properties-symbolic")
+        .tooltip_text("Open the disassembler and hex dump")
+        .sensitive(false)
         .build();
 
     let address_title = gtk::Label::builder()
@@ -494,7 +520,7 @@ fn build_window(application: &adw::Application) {
     result_value_column.set_hexpand(true);
     result_columns.append(&result_address_column);
     result_columns.append(&result_value_column);
-    result_columns.append(&compact_column_header("", 4, false));
+    result_columns.append(&compact_column_header("", 8, false));
 
     let results_footer = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -502,6 +528,7 @@ fn build_window(application: &adw::Application) {
         .margin_top(6)
         .build();
     results_footer.append(&page_label);
+    results_footer.append(&memory_view_button);
     results_footer.append(&add_address_button);
 
     let results_panel = gtk::Box::builder()
@@ -682,13 +709,17 @@ fn build_window(application: &adw::Application) {
         page_label,
         address_list_model,
         address_summary,
+        memory_view_button,
         group_selected_button,
         script_trust_button,
         compatibility_report_button,
     };
 
-    configure_scan_result_factory(&scan_result_factory, &state, &widgets);
-    configure_address_list_factory(&address_factory, &state, &widgets);
+    configure_scan_result_factory(&scan_result_factory, &state, &widgets, &window);
+    configure_address_list_factory(&address_factory, &state, &widgets, &window);
+    if let Some(session) = memory_view_smoke_session.as_ref() {
+        show_attached(&state, &widgets, session);
+    }
 
     update_scan_option_visibility(&widgets);
     widgets.value_type.connect_selected_notify({
@@ -842,6 +873,12 @@ fn build_window(application: &adw::Application) {
         move |_| present_lua_console_dialog(&window, &state)
     });
 
+    widgets.memory_view_button.connect_clicked({
+        let window = window.clone();
+        let engine = state.engine.clone();
+        move |_| crate::memory_view::present(&window, engine.clone(), 0)
+    });
+
     if address_list_smoke {
         reload_address_list(&state, &widgets, false);
         let address_list = address_list.clone();
@@ -860,6 +897,9 @@ fn build_window(application: &adw::Application) {
     install_runtime_tick(&state, &widgets);
 
     window.present();
+    if memory_view_smoke {
+        crate::memory_view::present(&window, state.engine.clone(), 0);
+    }
 }
 
 fn attach_advanced_row<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, title: &str, child: &W) {
@@ -1082,6 +1122,7 @@ fn show_attached(state: &SessionState, widgets: &SessionWidgets, session: &Sessi
     widgets.process_button.set_sensitive(false);
     widgets.session_button.set_label("Detach");
     widgets.session_button.set_sensitive(true);
+    widgets.memory_view_button.set_sensitive(true);
     widgets.first_scan_button.set_sensitive(true);
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
@@ -1107,6 +1148,7 @@ fn show_attach_error(
     widgets.first_scan_button.set_sensitive(false);
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
+    widgets.memory_view_button.set_sensitive(false);
 
     let dialog = adw::AlertDialog::builder()
         .heading("Could not attach to process")
@@ -1143,6 +1185,7 @@ fn detach(state: &SessionState, widgets: &SessionWidgets) {
     widgets
         .session_button
         .set_sensitive(state.selected.borrow().is_some());
+    widgets.memory_view_button.set_sensitive(false);
     reset_scan_ui(state, widgets);
     reload_address_list(state, widgets, false);
 }
@@ -1400,10 +1443,12 @@ fn configure_scan_result_factory(
     factory: &gtk::SignalListItemFactory,
     state: &SessionState,
     widgets: &SessionWidgets,
+    window: &adw::ApplicationWindow,
 ) {
     factory.connect_setup({
         let state = state.clone();
         let widgets = widgets.clone();
+        let window = window.clone();
         move |_, object| {
             let list_item = object
                 .downcast_ref::<gtk::ListItem>()
@@ -1427,6 +1472,32 @@ fn configure_scan_result_factory(
                 .sensitive(false)
                 .css_classes(["flat"])
                 .build();
+            let browse_button = gtk::Button::builder()
+                .icon_name("document-properties-symbolic")
+                .tooltip_text("Browse this memory region")
+                .valign(Align::Center)
+                .sensitive(false)
+                .css_classes(["flat"])
+                .build();
+            browse_button.connect_clicked({
+                let list_item = list_item.downgrade();
+                let engine = state.engine.clone();
+                let window = window.clone();
+                move |_| {
+                    let Some(list_item) = list_item.upgrade() else {
+                        return;
+                    };
+                    let Some(item) = list_item.item().and_downcast::<adw::glib::BoxedAnyObject>()
+                    else {
+                        return;
+                    };
+                    let row = item.borrow::<VirtualScanRow>();
+                    let VirtualScanRow::Loaded { address, .. } = &*row else {
+                        return;
+                    };
+                    crate::memory_view::present(&window, engine.clone(), *address);
+                }
+            });
             add_button.connect_clicked({
                 let list_item = list_item.downgrade();
                 let state = state.clone();
@@ -1456,6 +1527,7 @@ fn configure_scan_result_factory(
                 .build();
             row.append(&address);
             row.append(&value);
+            row.append(&browse_button);
             row.append(&add_button);
             list_item.set_child(Some(&row));
         }
@@ -1477,7 +1549,11 @@ fn configure_scan_result_factory(
             .next_sibling()
             .and_downcast::<gtk::Label>()
             .expect("scan result value");
-        let add_button = value
+        let browse_button = value
+            .next_sibling()
+            .and_downcast::<gtk::Button>()
+            .expect("scan result browse button");
+        let add_button = browse_button
             .next_sibling()
             .and_downcast::<gtk::Button>()
             .expect("scan result add button");
@@ -1492,6 +1568,7 @@ fn configure_scan_result_factory(
                 address.set_label(&format!("Result #{}", index + 1));
                 value.set_label("Loading…");
                 value.add_css_class("dim-label");
+                browse_button.set_sensitive(false);
                 add_button.set_sensitive(false);
             }
             VirtualScanRow::Loaded {
@@ -1501,12 +1578,14 @@ fn configure_scan_result_factory(
             } => {
                 address.set_label(&format!("0x{hit_address:016X}"));
                 value.set_label(hit_value);
+                browse_button.set_sensitive(true);
                 add_button.set_sensitive(true);
             }
             VirtualScanRow::Error { index, message } => {
                 address.set_label(&format!("Result #{}", index + 1));
                 value.set_label(message);
                 value.add_css_class("error");
+                browse_button.set_sensitive(false);
                 add_button.set_sensitive(false);
             }
         }
@@ -3285,6 +3364,7 @@ fn configure_address_list_factory(
     factory: &gtk::SignalListItemFactory,
     state: &SessionState,
     widgets: &SessionWidgets,
+    window: &adw::ApplicationWindow,
 ) {
     factory.connect_setup(|_, object| {
         let list_item = object
@@ -3296,6 +3376,7 @@ fn configure_address_list_factory(
     factory.connect_bind({
         let state = state.clone();
         let widgets = widgets.clone();
+        let window = window.clone();
         move |_, object| {
             let list_item = object
                 .downcast_ref::<gtk::ListItem>()
@@ -3319,7 +3400,7 @@ fn configure_address_list_factory(
                 )
                 .upcast(),
                 VirtualAddressRow::Loaded { record, .. } => {
-                    build_address_record_row(&state, &widgets, &record).upcast()
+                    build_address_record_row(&state, &widgets, &window, &record).upcast()
                 }
                 VirtualAddressRow::Error { index, message } => build_address_status_row(
                     &format!("Address record #{} is unavailable", index + 1),
@@ -3506,6 +3587,7 @@ fn build_address_status_row(title: &str, detail: &str) -> gtk::Box {
 fn build_address_record_row(
     state: &SessionState,
     widgets: &SessionWidgets,
+    window: &adw::ApplicationWindow,
     record: &AddressRecord,
 ) -> gtk::Box {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
@@ -3778,6 +3860,20 @@ fn build_address_record_row(
         }
     });
 
+    let browse = gtk::Button::builder()
+        .icon_name("document-properties-symbolic")
+        .tooltip_text("Browse this address in Memory View")
+        .valign(Align::Center)
+        .sensitive(state.attached.get() && !record.is_group && !record.has_script)
+        .css_classes(["flat"])
+        .build();
+    browse.connect_clicked({
+        let engine = state.engine.clone();
+        let window = window.clone();
+        let address = record.address;
+        move |_| crate::memory_view::present(&window, engine.clone(), address)
+    });
+
     let move_up = gtk::Button::builder()
         .icon_name("go-up-symbolic")
         .tooltip_text("Move up")
@@ -3845,6 +3941,7 @@ fn build_address_record_row(
         .build();
     if !record.is_group {
         action_cell.append(&freeze_mode);
+        action_cell.append(&browse);
         state
             .address_value_entries
             .borrow_mut()

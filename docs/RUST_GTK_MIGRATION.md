@@ -28,6 +28,11 @@ Completed in the foundation and first vertical slices:
   on the left, scan controls stay on the right, and the address table occupies
   the full lower pane; horizontal and vertical splitters remain user-resizable,
   while compact column rows replace the earlier single-column prototype;
+- a bounded native GTK Memory View that preserves the original two-pane mental
+  model: disassembly above, a 16-byte-wide hexadecimal/ASCII dump below, address
+  navigation and 512-byte paging around them; reads are capped at 4 KiB and 256
+  instructions, and scan hits plus address records open directly at their
+  corresponding memory location;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -121,8 +126,9 @@ Completed in the foundation and first vertical slices:
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
-- CXX contract, Rust unit, GTK/Xvfb startup, main-layout, Lua-console, and
-  600-record virtual address-list smokes, Qt smoke, and core regression tests.
+- CXX contract, Rust unit, GTK/Xvfb startup, main-layout, live memory-view,
+  Lua-console, and 600-record virtual address-list smokes, Qt smoke, and core
+  regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The scan-result view now uses a custom virtual `gio::ListModel`: GTK sees the
@@ -479,4 +485,8 @@ recorded in a short decision note before public release.
     consented per-payload Lua execution with bounded input/VM/output, periodic
     scheduling, Lua console/timer parity, transactional protected-table password
     loading, and a structured compatibility/loss report with lossy-save
-    confirmation.~~ Next continue Lua GUI/form parity and complete branding review.
+    confirmation.~~
+12. ~~Restore the classic main-window geometry and add the first bounded GTK
+    Memory View with disassembly/hex panes and direct address navigation.~~ Next
+    deepen debugger/memory-browser interactions, continue Lua GUI/form parity,
+    and complete the branding review.

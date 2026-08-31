@@ -27,6 +27,7 @@ struct ScanActionResult;
 struct ScanRequest;
 struct ScanStatus;
 struct ScanPage;
+struct MemoryViewResult;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
@@ -60,6 +61,8 @@ public:
     ScanStatus scan_status() const;
     ScanPage scan_rows(std::uint64_t generation, std::uint64_t start,
                        std::uint32_t limit) const;
+    MemoryViewResult memory_view(std::uint64_t address, std::uint32_t byte_count,
+                                 std::uint32_t instruction_limit) const;
     void cancel_scan() noexcept;
     AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
                              bool refresh_values);

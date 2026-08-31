@@ -1,6 +1,7 @@
 mod address_list_model;
 mod application;
 mod bridge;
+mod memory_view;
 mod process_dialog;
 mod scan_result_model;
 
@@ -29,13 +30,27 @@ fn main() -> adw::glib::ExitCode {
     let main_layout_smoke = arguments
         .iter()
         .any(|argument| argument == "--main-layout-smoke");
-    if startup_smoke || lua_console_smoke || address_list_smoke || main_layout_smoke {
+    let memory_view_smoke = arguments
+        .iter()
+        .any(|argument| argument == "--memory-view-smoke");
+    if startup_smoke
+        || lua_console_smoke
+        || address_list_smoke
+        || main_layout_smoke
+        || memory_view_smoke
+    {
         application.connect_activate(move |application| {
             if startup_smoke && let Some(window) = application.active_window() {
                 process_dialog::present(&window, |_| {});
             }
             let application = application.clone();
-            let timeout = if address_list_smoke { 1800 } else { 350 };
+            let timeout = if address_list_smoke {
+                1800
+            } else if memory_view_smoke {
+                900
+            } else {
+                350
+            };
             adw::glib::timeout_add_local_once(Duration::from_millis(timeout), move || {
                 application.quit();
             });
@@ -50,6 +65,9 @@ fn main() -> adw::glib::ExitCode {
         adw::glib::ExitCode::FAILURE
     } else if main_layout_smoke && !application::main_layout_smoke_ok() {
         eprintln!("main window does not preserve the process/results/controls/address-list layout");
+        adw::glib::ExitCode::FAILURE
+    } else if memory_view_smoke && !memory_view::smoke_ok() {
+        eprintln!("GTK Memory View did not render live bytes and disassembly");
         adw::glib::ExitCode::FAILURE
     } else {
         exit_code

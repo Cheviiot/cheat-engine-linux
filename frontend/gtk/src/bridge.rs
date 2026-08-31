@@ -93,6 +93,26 @@ mod ffi {
         rows: Vec<ScanHit>,
     }
 
+    struct DisassemblyRow {
+        address: u64,
+        bytes: String,
+        mnemonic: String,
+        operands: String,
+        size: u8,
+    }
+
+    struct MemoryViewResult {
+        accepted: bool,
+        address: u64,
+        next_address: u64,
+        arch: String,
+        region: String,
+        bytes: Vec<u8>,
+        instructions: Vec<DisassemblyRow>,
+        error_code: String,
+        error_message: String,
+    }
+
     struct AddressRow {
         id: i32,
         description: String,
@@ -229,6 +249,12 @@ mod ffi {
         fn undo_scan(self: Pin<&mut EngineFacade>) -> ScanActionResult;
         fn scan_status(self: &EngineFacade) -> ScanStatus;
         fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
+        fn memory_view(
+            self: &EngineFacade,
+            address: u64,
+            byte_count: u32,
+            instruction_limit: u32,
+        ) -> MemoryViewResult;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
         fn visible_address_rows(
             self: Pin<&mut EngineFacade>,
@@ -620,6 +646,25 @@ pub struct ScanPage {
     pub rows: Vec<ScanHit>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisassemblyRow {
+    pub address: u64,
+    pub bytes: String,
+    pub mnemonic: String,
+    pub operands: String,
+    pub size: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryView {
+    pub address: u64,
+    pub next_address: u64,
+    pub arch: String,
+    pub region: String,
+    pub bytes: Vec<u8>,
+    pub instructions: Vec<DisassemblyRow>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FreezeMode {
@@ -977,6 +1022,41 @@ impl Engine {
                 })
                 .collect(),
         }
+    }
+
+    pub fn memory_view(
+        &self,
+        address: u64,
+        byte_count: u32,
+        instruction_limit: u32,
+    ) -> Result<MemoryView, AddressError> {
+        let view = self
+            .inner
+            .memory_view(address, byte_count, instruction_limit);
+        if !view.accepted {
+            return Err(AddressError {
+                code: view.error_code,
+                message: view.error_message,
+            });
+        }
+        Ok(MemoryView {
+            address: view.address,
+            next_address: view.next_address,
+            arch: view.arch,
+            region: view.region,
+            bytes: view.bytes,
+            instructions: view
+                .instructions
+                .into_iter()
+                .map(|row| DisassemblyRow {
+                    address: row.address,
+                    bytes: row.bytes,
+                    mnemonic: row.mnemonic,
+                    operands: row.operands,
+                    size: row.size,
+                })
+                .collect(),
+        })
     }
 
     pub fn cancel_scan(&mut self) {
@@ -1364,6 +1444,42 @@ mod tests {
         engine.detach().expect("detach from self");
         assert!(!engine.is_attached());
         assert_eq!(engine.attached_pid(), 0);
+    }
+
+    #[test]
+    fn memory_view_reads_and_disassembles_a_bounded_page() {
+        let code = Box::new([0x90_u8, 0xC3, 0xCC, 0x48, 0x31, 0xC0, 0xC3, 0x90]);
+        let address = code.as_ptr() as u64;
+        let mut engine = Engine::new();
+        engine
+            .attach(std::process::id() as i32, "memory-view fixture")
+            .expect("attach to self");
+
+        let view = engine
+            .memory_view(address, code.len() as u32, 16)
+            .expect("read memory-view page");
+        assert_eq!(view.address, address);
+        assert_eq!(view.bytes, code.as_slice());
+        assert_eq!(view.next_address, address + code.len() as u64);
+        assert!(view.arch == "x86-64" || view.arch == "x86-32");
+        assert!(!view.region.is_empty());
+        assert_eq!(view.instructions[0].address, address);
+        assert_eq!(view.instructions[0].mnemonic, "nop");
+        assert_eq!(view.instructions[1].mnemonic, "ret");
+
+        let bounded = engine
+            .memory_view(address, u32::MAX, u32::MAX)
+            .expect("bounded memory-view page");
+        assert!(bounded.bytes.len() <= 4096);
+        assert!(bounded.instructions.len() <= 256);
+    }
+
+    #[test]
+    fn memory_view_requires_an_attached_process() {
+        let error = Engine::new()
+            .memory_view(0x1000, 256, 64)
+            .expect_err("memory view without a process must fail");
+        assert_eq!(error.code, "no_session");
     }
 
     #[test]

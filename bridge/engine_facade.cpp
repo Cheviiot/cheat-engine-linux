@@ -1,6 +1,7 @@
 #include "bridge/engine_facade.hpp"
 
 #include "ce-gtk/src/bridge.rs.h"
+#include "arch/disassembler.hpp"
 #include "core/address_list_controller.hpp"
 #include "core/autoasm.hpp"
 #include "core/target_profile.hpp"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -41,6 +43,10 @@ constexpr std::size_t kMaxProcessQuerySize = 256;
 constexpr std::size_t kMaxDisplayNameSize = 256;
 constexpr std::size_t kMemoryProbeLimit = 8;
 constexpr std::uint32_t kMaxScanPageSize = 256;
+constexpr std::uint32_t kDefaultMemoryViewBytes = 512;
+constexpr std::uint32_t kMaxMemoryViewBytes = 4096;
+constexpr std::uint32_t kDefaultDisassemblyRows = 128;
+constexpr std::uint32_t kMaxDisassemblyRows = 256;
 constexpr std::uint32_t kMaxAddressPageSize = 256;
 constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
@@ -97,6 +103,38 @@ std::string endian_name(ce::TargetProfile::Endian endian) {
         case ce::TargetProfile::Endian::Big: return "big";
         default: return "unknown";
     }
+}
+
+std::string instruction_bytes(const std::vector<std::uint8_t>& bytes) {
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string result;
+    if (!bytes.empty()) result.reserve(bytes.size() * 3 - 1);
+    for (const auto byte : bytes) {
+        if (!result.empty()) result.push_back(' ');
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
+std::string memory_region_description(const ce::MemoryRegion& region) {
+    std::string protection;
+    protection.push_back(region.protection & ce::MemProt::Read ? 'r' : '-');
+    protection.push_back(region.protection & ce::MemProt::Write ? 'w' : '-');
+    protection.push_back(region.protection & ce::MemProt::Exec ? 'x' : '-');
+    const char* type = "private";
+    if (region.type == ce::MemType::Mapped) type = "mapped";
+    else if (region.type == ce::MemType::Image) type = "image";
+
+    const auto regionEnd = region.size > std::numeric_limits<std::uintptr_t>::max() - region.base
+        ? std::numeric_limits<std::uintptr_t>::max()
+        : region.base + region.size;
+    std::ostringstream summary;
+    summary << "0x" << std::hex << std::uppercase << region.base << "–0x"
+            << regionEnd << std::dec << " · " << protection
+            << " · " << type;
+    if (!region.path.empty()) summary << " · " << region.path;
+    return summary.str();
 }
 
 AttachResult base_attach_result(std::int32_t pid, const std::string& name) {
@@ -1250,6 +1288,124 @@ ScanPage EngineFacade::scan_rows(std::uint64_t generation, std::uint64_t start,
         },
         value_size);
     return page;
+}
+
+MemoryViewResult EngineFacade::memory_view(std::uint64_t address,
+                                           std::uint32_t byte_count,
+                                           std::uint32_t instruction_limit) const {
+    MemoryViewResult result;
+    result.accepted = false;
+    result.address = address;
+    result.next_address = address;
+    result.arch = "unknown";
+    result.region = "";
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!process_) {
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before opening Memory View.";
+        return result;
+    }
+    if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+        if (address > std::numeric_limits<std::uintptr_t>::max()) {
+            result.error_code = "address_out_of_range";
+            result.error_message = "The requested address does not fit this host architecture.";
+            return result;
+        }
+    }
+
+    auto target = static_cast<std::uintptr_t>(address);
+    if (address == 0) {
+        const auto regions = process_->queryRegions();
+        const auto usable = [](const ce::MemoryRegion& candidate) {
+            return candidate.size > 0 && (candidate.protection & ce::MemProt::Read);
+        };
+        auto selected = std::find_if(regions.begin(), regions.end(), [&](const auto& candidate) {
+            return usable(candidate) && (candidate.protection & ce::MemProt::Exec);
+        });
+        if (selected == regions.end())
+            selected = std::find_if(regions.begin(), regions.end(), usable);
+        if (selected == regions.end()) {
+            result.error_code = "no_readable_memory";
+            result.error_message = "The attached process has no readable memory regions.";
+            return result;
+        }
+        target = selected->base;
+        result.address = static_cast<std::uint64_t>(target);
+    }
+    const auto region = process_->queryRegion(target);
+    if (!region || target < region->base || region->size == 0) {
+        result.error_code = "address_unmapped";
+        result.error_message = "The requested address is not inside a mapped memory region.";
+        return result;
+    }
+    if (!(region->protection & ce::MemProt::Read)) {
+        result.error_code = "region_unreadable";
+        result.error_message = "The requested memory region is not readable.";
+        return result;
+    }
+
+    const auto offset = target - region->base;
+    if (offset >= region->size) {
+        result.error_code = "address_unmapped";
+        result.error_message = "The requested address is outside the mapped memory region.";
+        return result;
+    }
+    const auto requested = static_cast<std::size_t>(std::min(
+        byte_count == 0 ? kDefaultMemoryViewBytes : byte_count,
+        kMaxMemoryViewBytes));
+    const auto readable = std::min<std::size_t>(requested, region->size - offset);
+    if (readable == 0) {
+        result.error_code = "empty_region";
+        result.error_message = "There are no readable bytes at the requested address.";
+        return result;
+    }
+
+    std::vector<std::uint8_t> bytes(readable);
+    const auto read = process_->read(target, bytes.data(), bytes.size());
+    if (!read || *read == 0) {
+        result.error_code = "memory_read_failed";
+        result.error_message = read
+            ? "The process returned an empty memory read."
+            : "Could not read process memory: " + read.error().message() + ".";
+        return result;
+    }
+    bytes.resize(*read);
+
+    const bool code32 = process_->runs32BitCode();
+    result.arch = code32 ? "x86-32" : "x86-64";
+    result.region = sanitize_utf8(memory_region_description(*region));
+    for (const auto byte : bytes) result.bytes.push_back(byte);
+
+    const auto maxRows = static_cast<std::size_t>(std::min(
+        instruction_limit == 0 ? kDefaultDisassemblyRows : instruction_limit,
+        kMaxDisassemblyRows));
+    try {
+        ce::Disassembler disassembler(code32 ? ce::Arch::X86_32 : ce::Arch::X86_64);
+        for (const auto& instruction : disassembler.disassemble(
+                 target, {bytes.data(), bytes.size()}, maxRows, true)) {
+            result.instructions.push_back(DisassemblyRow{
+                .address = static_cast<std::uint64_t>(instruction.address),
+                .bytes = instruction_bytes(instruction.bytes),
+                .mnemonic = instruction.mnemonic,
+                .operands = instruction.operands,
+                .size = instruction.size,
+            });
+        }
+    } catch (const std::exception& error) {
+        result.error_code = "disassembly_failed";
+        result.error_message = "Could not initialize the disassembler: " +
+            std::string(error.what());
+        return result;
+    }
+
+    result.next_address = bytes.size() >
+            std::numeric_limits<std::uint64_t>::max() - result.address
+        ? std::numeric_limits<std::uint64_t>::max()
+        : result.address + static_cast<std::uint64_t>(bytes.size());
+    result.accepted = true;
+    return result;
 }
 
 void EngineFacade::cancel_scan() noexcept {
