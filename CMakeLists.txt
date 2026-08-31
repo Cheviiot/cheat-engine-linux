@@ -11,8 +11,13 @@ add_compile_definitions(CECORE_VERSION="${PROJECT_VERSION}")
 
 # ── Options ──
 option(CECORE_BUILD_TESTS "Build test programs" ON)
+option(CECORE_BUILD_QT_GUI "Build the legacy Qt6 frontend when Qt6 is available" ON)
+option(CECORE_BUILD_GTK_GUI "Build the Rust GTK4/libadwaita frontend when its dependencies are available" ON)
 option(CECORE_FORCE_FETCHCONTENT "Always use FetchContent for Capstone/Keystone, even if installed" OFF)
 option(CECORE_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+if(CECORE_BUILD_TESTS)
+    enable_testing()
+endif()
 if(CECORE_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
     add_link_options(-fsanitize=address,undefined)
@@ -173,6 +178,7 @@ endif()
 # ── libcecore C++ library ──
 add_library(cecore SHARED
     core/types.cpp
+    core/version.cpp
     core/autoasm.cpp
     core/aa_templates.cpp
     core/injection_gen.cpp
@@ -313,8 +319,10 @@ set_target_properties(ce_vulkan_overlay_layer PROPERTIES
 )
 
 # ── Qt6 GUI ──
-find_package(Qt6 COMPONENTS Widgets)
-if(Qt6_FOUND)
+if(CECORE_BUILD_QT_GUI)
+    find_package(Qt6 COMPONENTS Widgets)
+endif()
+if(CECORE_BUILD_QT_GUI AND Qt6_FOUND)
     set(CMAKE_AUTOMOC ON)
     qt_add_executable(cheatengine
         gui/resources.qrc
@@ -519,14 +527,82 @@ if(Qt6_FOUND)
     else()
         message(STATUS "Global hotkeys: Wayland portal backend disabled (Qt6::DBus not found)")
     endif()
-else()
+elseif(CECORE_BUILD_QT_GUI)
     message(STATUS "Qt6 not found — skipping GUI build")
+else()
+    message(STATUS "Qt6 GUI disabled (CECORE_BUILD_QT_GUI=OFF)")
+endif()
+
+# ── Rust GTK4/libadwaita GUI ──
+# Cargo owns the Rust dependency graph and cxx-build generates the narrow CXX
+# bridge. Corrosion imports the resulting binary as a normal CMake target and
+# supplies the final link to libcecore.
+if(CECORE_BUILD_GTK_GUI)
+    find_package(PkgConfig QUIET)
+    find_program(CECORE_CARGO_EXECUTABLE cargo)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GTK4 QUIET gtk4>=4.14)
+        pkg_check_modules(LIBADWAITA QUIET libadwaita-1>=1.5)
+    endif()
+
+    if(CECORE_CARGO_EXECUTABLE AND GTK4_FOUND AND LIBADWAITA_FOUND)
+        set(Rust_CARGO "${CECORE_CARGO_EXECUTABLE}" CACHE FILEPATH
+            "Cargo executable used by Corrosion")
+        set(CORROSION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(Corrosion
+            GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+            # Immutable commit behind v0.6.1.
+            GIT_TAG 1499b14e4906a2890f5cee1547c8848db261753d)
+        FetchContent_MakeAvailable(Corrosion)
+
+        corrosion_import_crate(
+            MANIFEST_PATH ${CMAKE_SOURCE_DIR}/frontend/gtk/Cargo.toml
+            CRATES ce-gtk
+            LOCKED)
+        corrosion_link_libraries(ce-gtk cecore)
+
+        if(CECORE_BUILD_TESTS)
+            add_test(NAME gtk_core_bridge
+                COMMAND ${CMAKE_COMMAND} -E env
+                    "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                    "$<TARGET_FILE:ce-gtk>" --core-version)
+
+            add_test(NAME gtk_bridge_unit
+                COMMAND ${CMAKE_COMMAND} -E env
+                    "CECORE_LIB_DIR=$<TARGET_FILE_DIR:cecore>"
+                    "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                    "CARGO_TARGET_DIR=${CMAKE_BINARY_DIR}/cargo-tests"
+                    "${Rust_CARGO}" test
+                    --manifest-path ${CMAKE_SOURCE_DIR}/frontend/gtk/Cargo.toml
+                    --locked)
+
+            find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+            if(XVFB_RUN_EXECUTABLE)
+                add_test(NAME gtk_startup_smoke
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                        "${XVFB_RUN_EXECUTABLE}" -a
+                        "$<TARGET_FILE:ce-gtk>" --smoke-test)
+                set_tests_properties(gtk_startup_smoke PROPERTIES TIMEOUT 15)
+            endif()
+        endif()
+        message(STATUS "GTK4/libadwaita and Cargo found — building Rust GUI")
+    else()
+        message(STATUS
+            "Rust GTK GUI dependencies not found — skipping (need cargo, gtk4>=4.14, libadwaita-1>=1.5)")
+    endif()
+else()
+    message(STATUS "Rust GTK GUI disabled (CECORE_BUILD_GTK_GUI=OFF)")
 endif()
 
 # ── Test programs ──
 if(CECORE_BUILD_TESTS)
     add_executable(cecore_test test/main.cpp)
     target_link_libraries(cecore_test PRIVATE cecore)
+    # The dlopen-injection regression test loads the sibling library by path.
+    # Make a targeted test build self-contained instead of relying on an earlier
+    # all-target build having happened to produce libspeedhack.so.
+    add_dependencies(cecore_test speedhack)
     # So the example-scripts test can find the repo's examples/ directory.
     target_compile_definitions(cecore_test PRIVATE CE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 

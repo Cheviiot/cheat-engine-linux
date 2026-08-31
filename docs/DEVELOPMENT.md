@@ -6,6 +6,55 @@ official Cheat Engine Linux build. (User-facing docs live in `README.md`; releas
 history in `CHANGELOG.md`; contribution + security policy in `CONTRIBUTING.md` /
 `SECURITY.md`.)
 
+The parallel Rust GTK4/libadwaita frontend migration is specified in
+[`RUST_GTK_MIGRATION.md`](RUST_GTK_MIGRATION.md).
+
+## Rust/GTK development Distrobox
+
+The migration toolchain lives in an Ubuntu 24.04 Distrobox so project-specific
+packages do not modify the ALT Workstation host.  Create it once:
+
+```bash
+distrobox create --name lch-rust-gtk-dev \
+  --image docker.io/library/ubuntu:24.04 --yes
+
+distrobox enter lch-rust-gtk-dev -- bash -lc '
+  sudo apt-get update &&
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential gcc-multilib g++-multilib cmake ninja-build pkg-config \
+    git curl ca-certificates dbus xvfb xauth \
+    libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev qt6-base-dev \
+    libcapstone-dev zlib1g-dev libdw-dev libasound2-dev libsoundtouch-dev \
+    libvulkan-dev libx11-dev libxcb1-dev libxkbcommon-dev libxtst-dev'
+```
+
+Install the pinned Rust toolchain into the container filesystem, not the shared
+home directory:
+
+```bash
+distrobox enter lch-rust-gtk-dev -- bash -lc '
+  sudo mkdir -p /opt/lch-rust/cargo /opt/lch-rust/rustup &&
+  sudo chown -R "$(id -u):$(id -g)" /opt/lch-rust &&
+  curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+    CARGO_HOME=/opt/lch-rust/cargo RUSTUP_HOME=/opt/lch-rust/rustup \
+    sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.92.0 &&
+  CARGO_HOME=/opt/lch-rust/cargo RUSTUP_HOME=/opt/lch-rust/rustup \
+    /opt/lch-rust/cargo/bin/rustup component add rustfmt clippy \
+      --toolchain 1.92.0'
+```
+
+Run project commands through the helper, which supplies the container-only Rust
+paths without changing the host shell profile:
+
+```bash
+tools/dev-container.sh rustc --version
+tools/dev-container.sh cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug
+tools/dev-container.sh cmake --build build --target ce-gtk
+tools/dev-container.sh env LD_LIBRARY_PATH="$PWD/build" \
+  ./build/ce-gtk --core-version
+```
+
 ## Before pushing: `tools/ci-check.sh`
 
 Run `tools/ci-check.sh --config` (seconds) before every push, and

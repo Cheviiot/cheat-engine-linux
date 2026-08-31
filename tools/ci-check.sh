@@ -27,7 +27,8 @@ step(){ printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 step "sanitizers job (ASan, no-GUI): configure"
 rm -rf build-ci-asan
 cmake -S . -B build-ci-asan "${GEN[@]}" -DCMAKE_BUILD_TYPE=Debug \
-    -DCECORE_SANITIZE=ON -DCMAKE_DISABLE_FIND_PACKAGE_Qt6=ON >/dev/null
+    -DCECORE_SANITIZE=ON -DCECORE_BUILD_QT_GUI=OFF \
+    -DCECORE_BUILD_GTK_GUI=OFF >/dev/null
 ok "configured (Qt disabled, as in CI)"
 if [ "$MODE" != "--config" ]; then
     step "sanitizers job: build test targets (instrumented)"
@@ -48,6 +49,9 @@ if [ "$MODE" != "--config" ]; then
     ok "built"
     step "ubuntu-build job: regression suite + GUI smokes"
     ./build/cecore_test >/dev/null && ok "cecore_test"
+    if [ -x ./build/ce-gtk ]; then
+        ctest --test-dir build -R '^gtk_' --output-on-failure >/dev/null && ok "Rust/CXX + GTK smokes"
+    fi
     QT_QPA_PLATFORM=offscreen ./build/gui_debugger_smoke >/dev/null && ok "gui_debugger_smoke"
     QT_QPA_PLATFORM=offscreen ./build/gui_theme_smoke >/dev/null && ok "gui_theme_smoke"
     QT_QPA_PLATFORM=offscreen ./build/gui_guest_scan_smoke >/dev/null && ok "gui_guest_scan_smoke"
