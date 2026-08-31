@@ -73,20 +73,27 @@ struct SessionWidgets {
     hexadecimal: gtk::CheckButton,
     start_address: gtk::Entry,
     stop_address: gtk::Entry,
+    fast_scan: gtk::CheckButton,
     alignment: gtk::Entry,
     value_size: gtk::Entry,
+    value_size_label: gtk::Label,
     writable_match: gtk::DropDown,
     executable_match: gtk::DropDown,
     scan_private: gtk::CheckButton,
     scan_image: gtk::CheckButton,
     scan_mapped: gtk::CheckButton,
     rounding_type: gtk::DropDown,
+    rounding_type_label: gtk::Label,
     float_tolerance: gtk::Entry,
+    float_tolerance_label: gtk::Label,
     percentage_scan: gtk::CheckButton,
+    percentage_label: gtk::Label,
     percentage_value: gtk::Entry,
     percentage_value2: gtk::Entry,
     case_sensitive: gtk::CheckButton,
+    string_matching_label: gtk::Label,
     string_encoding: gtk::Entry,
+    string_encoding_label: gtk::Label,
     first_scan_button: gtk::Button,
     next_scan_button: gtk::Button,
     undo_scan_button: gtk::Button,
@@ -95,8 +102,10 @@ struct SessionWidgets {
     scan_summary: gtk::Label,
     scan_result_model: ScanResultModel,
     page_label: gtk::Label,
+    scan_empty_hint: gtk::Label,
     address_list_model: AddressListModel,
     address_summary: gtk::Label,
+    address_empty_hint: gtk::Label,
     memory_view_button: gtk::Button,
     group_selected_button: gtk::Button,
     script_trust_button: gtk::Button,
@@ -249,7 +258,6 @@ fn build_window(application: &adw::Application) {
         .icon_name("utilities-terminal-symbolic")
         .tooltip_text("Open the bounded interactive Lua console")
         .build();
-    header.pack_end(&lua_console_button);
 
     let selected_process = gtk::Label::builder()
         .label("No process selected")
@@ -259,9 +267,10 @@ fn build_window(application: &adw::Application) {
         .build();
 
     let session_details = gtk::Label::builder()
-        .label("Choose a running process to begin.")
+        .label("")
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .xalign(0.0)
+        .hexpand(true)
         .selectable(true)
         .css_classes(["dim-label"])
         .build();
@@ -276,12 +285,11 @@ fn build_window(application: &adw::Application) {
         .label("Attach")
         .css_classes(["suggested-action"])
         .sensitive(false)
-        .halign(Align::Start)
         .build();
 
     let process_identity = gtk::Box::builder()
-        .orientation(Orientation::Vertical)
-        .spacing(2)
+        .orientation(Orientation::Horizontal)
+        .spacing(10)
         .hexpand(true)
         .valign(Align::Center)
         .build();
@@ -298,7 +306,6 @@ fn build_window(application: &adw::Application) {
         .build();
     session_actions.append(&process_button);
     session_actions.append(&process_identity);
-    session_actions.append(&session_button);
 
     let value_type = gtk::DropDown::from_strings(&ScanValueType::LABELS);
     value_type.set_selected(ScanValueType::Int32 as u32);
@@ -336,12 +343,13 @@ fn build_window(application: &adw::Application) {
         .sensitive(false)
         .build();
     let undo_scan_button = gtk::Button::builder()
-        .label("Undo")
+        .label("Undo Scan")
         .sensitive(false)
         .build();
     let cancel_scan_button = gtk::Button::builder()
         .label("Cancel")
         .sensitive(false)
+        .visible(false)
         .build();
 
     let scan_actions = gtk::Box::builder()
@@ -359,7 +367,21 @@ fn build_window(application: &adw::Application) {
         .text("0x00007FFFFFFFFFFF")
         .hexpand(true)
         .build();
-    let alignment = gtk::Entry::builder().text("4").hexpand(true).build();
+    let fast_scan = gtk::CheckButton::builder()
+        .label("Fast Scan")
+        .active(true)
+        .build();
+    let alignment = gtk::Entry::builder()
+        .text("4")
+        .width_chars(5)
+        .max_width_chars(8)
+        .build();
+    let fast_scan_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    fast_scan_row.append(&fast_scan);
+    fast_scan_row.append(&alignment);
     let value_size = gtk::Entry::builder()
         .placeholder_text("Automatic")
         .hexpand(true)
@@ -384,7 +406,7 @@ fn build_window(application: &adw::Application) {
         gtk::DropDown::from_strings(&["Exact", "Rounded", "Truncated", "Tolerance"]);
     rounding_type.set_hexpand(true);
     let float_tolerance = gtk::Entry::builder().text("0").hexpand(true).build();
-    let percentage_scan = gtk::CheckButton::builder().label("Percentage scan").build();
+    let percentage_scan = gtk::CheckButton::builder().label("Compare by %").build();
     let percentage_value = gtk::Entry::builder()
         .text("0")
         .placeholder_text("Percent")
@@ -418,27 +440,51 @@ fn build_window(application: &adw::Application) {
 
     let advanced_grid = gtk::Grid::builder()
         .column_spacing(12)
-        .row_spacing(9)
-        .margin_top(12)
+        .row_spacing(5)
+        .margin_top(6)
         .build();
-    attach_advanced_row(&advanced_grid, 0, "Start address", &start_address);
-    attach_advanced_row(&advanced_grid, 1, "Stop address", &stop_address);
-    attach_advanced_row(&advanced_grid, 2, "Alignment", &alignment);
-    attach_advanced_row(&advanced_grid, 3, "Value size (bytes)", &value_size);
-    attach_advanced_row(&advanced_grid, 4, "Writable", &writable_match);
-    attach_advanced_row(&advanced_grid, 5, "Executable", &executable_match);
-    attach_advanced_row(&advanced_grid, 6, "Region types", &regions_row);
-    attach_advanced_row(&advanced_grid, 7, "Float rounding", &rounding_type);
-    attach_advanced_row(&advanced_grid, 8, "Float tolerance", &float_tolerance);
-    attach_advanced_row(&advanced_grid, 9, "Percentage", &percentage_row);
-    attach_advanced_row(&advanced_grid, 10, "String matching", &case_sensitive);
-    attach_advanced_row(&advanced_grid, 11, "String encoding", &string_encoding);
+    let range_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    range_row.append(&gtk::Label::new(Some("From")));
+    range_row.append(&start_address);
+    range_row.append(&gtk::Label::new(Some("To")));
+    range_row.append(&stop_address);
+    advanced_grid.attach(&range_row, 0, 0, 2, 1);
+    advanced_grid.attach(&fast_scan_row, 0, 1, 2, 1);
+
+    let protection_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    protection_row.append(&gtk::Label::new(Some("Writable")));
+    protection_row.append(&writable_match);
+    protection_row.append(&gtk::Label::new(Some("Executable")));
+    protection_row.append(&executable_match);
+    advanced_grid.attach(&protection_row, 0, 2, 2, 1);
+    attach_advanced_row(&advanced_grid, 3, "Region types", &regions_row);
+    let percentage_label = attach_advanced_row(&advanced_grid, 4, "", &percentage_row);
+    let value_size_label =
+        attach_advanced_row(&advanced_grid, 5, "Value size (bytes)", &value_size);
+    let rounding_type_label =
+        attach_advanced_row(&advanced_grid, 6, "Float rounding", &rounding_type);
+    let float_tolerance_label =
+        attach_advanced_row(&advanced_grid, 7, "Float tolerance", &float_tolerance);
+    let string_matching_label =
+        attach_advanced_row(&advanced_grid, 8, "String matching", &case_sensitive);
+    let string_encoding_label =
+        attach_advanced_row(&advanced_grid, 9, "String encoding", &string_encoding);
     let advanced_options = gtk::Expander::builder()
-        .label("Advanced scan options")
+        .label("Memory Scan Options")
+        .expanded(true)
         .child(&advanced_grid)
         .build();
 
-    let scan_progress = gtk::ProgressBar::builder().show_text(true).build();
+    let scan_progress = gtk::ProgressBar::builder()
+        .show_text(true)
+        .visible(false)
+        .build();
     scan_progress.set_fraction(0.0);
     scan_progress.set_text(Some("Ready"));
 
@@ -446,6 +492,7 @@ fn build_window(application: &adw::Application) {
         .label("Attach to a process to begin scanning memory.")
         .wrap(true)
         .xalign(0.0)
+        .visible(false)
         .css_classes(["dim-label"])
         .build();
 
@@ -464,6 +511,17 @@ fn build_window(application: &adw::Application) {
         .vexpand(true)
         .child(&scan_results)
         .build();
+    let scan_empty_hint = gtk::Label::builder()
+        .label("No results yet.\n\nEnter a value and press First Scan,\nor choose a process from the toolbar.")
+        .justify(gtk::Justification::Center)
+        .halign(Align::Center)
+        .valign(Align::Center)
+        .css_classes(["dim-label"])
+        .build();
+    scan_empty_hint.set_can_target(false);
+    let scan_results_overlay = gtk::Overlay::new();
+    scan_results_overlay.set_child(Some(&scan_results_scrolled));
+    scan_results_overlay.add_overlay(&scan_empty_hint);
 
     let page_label = gtk::Label::builder()
         .label("Found: 0")
@@ -543,6 +601,17 @@ fn build_window(application: &adw::Application) {
         .vexpand(true)
         .child(&address_list)
         .build();
+    let address_empty_hint = gtk::Label::builder()
+        .label("No saved addresses.\n\nDouble-click a scan result to add it here,\nor use Add Address.")
+        .justify(gtk::Justification::Center)
+        .halign(Align::Center)
+        .valign(Align::Center)
+        .css_classes(["dim-label"])
+        .build();
+    address_empty_hint.set_can_target(false);
+    let address_list_overlay = gtk::Overlay::new();
+    address_list_overlay.set_child(Some(&address_list_scrolled));
+    address_list_overlay.add_overlay(&address_empty_hint);
 
     // Keep Cheat Engine's proven information architecture while using native
     // GTK/libadwaita widgets: process across the top, found addresses beside a
@@ -590,7 +659,7 @@ fn build_window(application: &adw::Application) {
     results_panel.append(&page_label);
     results_panel.append(&result_columns);
     results_panel.append(&gtk::Separator::new(Orientation::Horizontal));
-    results_panel.append(&scan_results_scrolled);
+    results_panel.append(&scan_results_overlay);
     results_panel.append(&results_footer);
     let results_frame = gtk::Frame::builder().child(&results_panel).build();
 
@@ -669,7 +738,7 @@ fn build_window(application: &adw::Application) {
         .build();
     address_panel.append(&address_columns);
     address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
-    address_panel.append(&address_list_scrolled);
+    address_panel.append(&address_list_overlay);
     address_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     address_panel.append(&address_toolbar);
     let address_frame = gtk::Frame::builder().child(&address_panel).build();
@@ -698,6 +767,13 @@ fn build_window(application: &adw::Application) {
     MAIN_LAYOUT_SMOKE_OK.store(
         main_menu_model.n_items() == 5
             && process_bar.last_child().is_some()
+            && session_actions
+                .first_child()
+                .and_then(|child| child.next_sibling())
+                .is_some_and(|child| child.next_sibling().is_none())
+            && advanced_options.is_expanded()
+            && scan_empty_hint.is_visible()
+            && address_empty_hint.is_visible()
             && memory_view_button.label().as_deref() == Some("Memory View")
             && add_address_button.label().as_deref() == Some("Add Address")
             && top_paned.orientation() == Orientation::Horizontal
@@ -758,20 +834,27 @@ fn build_window(application: &adw::Application) {
         hexadecimal,
         start_address,
         stop_address,
+        fast_scan,
         alignment,
         value_size,
+        value_size_label,
         writable_match,
         executable_match,
         scan_private,
         scan_image,
         scan_mapped,
         rounding_type,
+        rounding_type_label,
         float_tolerance,
+        float_tolerance_label,
         percentage_scan,
+        percentage_label,
         percentage_value,
         percentage_value2,
         case_sensitive,
+        string_matching_label,
         string_encoding,
+        string_encoding_label,
         first_scan_button,
         next_scan_button,
         undo_scan_button,
@@ -780,8 +863,10 @@ fn build_window(application: &adw::Application) {
         scan_summary,
         scan_result_model,
         page_label,
+        scan_empty_hint,
         address_list_model,
         address_summary,
+        address_empty_hint,
         memory_view_button,
         group_selected_button,
         script_trust_button,
@@ -807,6 +892,10 @@ fn build_window(application: &adw::Application) {
         let widgets = widgets.clone();
         move |_| update_scan_option_visibility(&widgets)
     });
+    widgets.fast_scan.connect_toggled({
+        let widgets = widgets.clone();
+        move |_| update_scan_option_visibility(&widgets)
+    });
     widgets.rounding_type.connect_selected_notify({
         let widgets = widgets.clone();
         move |_| update_scan_option_visibility(&widgets)
@@ -818,17 +907,17 @@ fn build_window(application: &adw::Application) {
         let widgets = widgets.clone();
         move |_| {
             process_dialog::present(&window, {
+                let window = window.clone();
                 let state = state.clone();
                 let widgets = widgets.clone();
                 move |process| {
                     widgets
                         .selected_process
                         .set_label(&format!("Selected {} (PID {})", process.name, process.pid));
-                    widgets
-                        .session_details
-                        .set_label("Ready to open a memory session.");
+                    widgets.session_details.set_label("Opening memory session…");
                     widgets.session_button.set_sensitive(true);
                     *state.selected.borrow_mut() = Some(process);
+                    start_attach(&window, &state, &widgets);
                 }
             });
         }
@@ -952,6 +1041,26 @@ fn build_window(application: &adw::Application) {
         move |_| crate::memory_view::present(&window, engine.clone(), 0)
     });
 
+    scan_results.set_single_click_activate(false);
+    scan_results.connect_activate({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |list, position| {
+            let Some(item) = list
+                .model()
+                .and_then(|model| model.item(position))
+                .and_downcast::<adw::glib::BoxedAnyObject>()
+            else {
+                return;
+            };
+            let row = item.borrow::<VirtualScanRow>();
+            let VirtualScanRow::Loaded { index, .. } = &*row else {
+                return;
+            };
+            add_virtual_scan_result(&state, &widgets, None, *index);
+        }
+    });
+
     if address_list_smoke {
         reload_address_list(&state, &widgets, false);
         let address_list = address_list.clone();
@@ -975,7 +1084,12 @@ fn build_window(application: &adw::Application) {
     }
 }
 
-fn attach_advanced_row<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, title: &str, child: &W) {
+fn attach_advanced_row<W: IsA<gtk::Widget>>(
+    grid: &gtk::Grid,
+    row: i32,
+    title: &str,
+    child: &W,
+) -> gtk::Label {
     let label = gtk::Label::builder()
         .label(title)
         .halign(Align::Start)
@@ -983,6 +1097,7 @@ fn attach_advanced_row<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, title: &
         .build();
     grid.attach(&label, 0, row, 1, 1);
     grid.attach(child, 1, row, 1, 1);
+    label
 }
 
 fn attach_scan_control_row<W: IsA<gtk::Widget>>(
@@ -1055,6 +1170,9 @@ fn update_scan_option_visibility(widgets: &SessionWidgets) {
                 | ScanValueType::ByteArray
                 | ScanValueType::Binary
         );
+    let show_value_size = variable_snapshot || value_type == ScanValueType::Custom;
+    let show_float_tolerance = floating && widgets.rounding_type.selected() == 3;
+    let show_percentage = floating || (integer && value_type != ScanValueType::All);
 
     widgets.scan_value.set_visible(takes_value);
     if value_type == ScanValueType::Grouped {
@@ -1063,18 +1181,36 @@ fn update_scan_option_visibility(widgets: &SessionWidgets) {
     widgets.scan_value2.set_visible(between);
     widgets.hexadecimal.set_visible(takes_value && integer);
     widgets.rounding_type.set_sensitive(floating);
+    widgets.float_tolerance.set_sensitive(show_float_tolerance);
+    widgets.rounding_type.set_visible(floating);
+    widgets.rounding_type_label.set_visible(floating);
+    widgets.float_tolerance.set_visible(show_float_tolerance);
     widgets
-        .float_tolerance
-        .set_sensitive(floating && widgets.rounding_type.selected() == 3);
+        .float_tolerance_label
+        .set_visible(show_float_tolerance);
     widgets.case_sensitive.set_sensitive(string);
     widgets.string_encoding.set_sensitive(string);
-    widgets.alignment.set_sensitive(!bytewise);
+    widgets.case_sensitive.set_visible(string);
+    widgets.string_matching_label.set_visible(string);
+    widgets.string_encoding.set_visible(string);
+    widgets.string_encoding_label.set_visible(string);
     widgets
-        .value_size
-        .set_sensitive(variable_snapshot || value_type == ScanValueType::Custom);
+        .alignment
+        .set_sensitive(!bytewise && widgets.fast_scan.is_active());
+    widgets.value_size.set_sensitive(show_value_size);
+    widgets.value_size.set_visible(show_value_size);
+    widgets.value_size_label.set_visible(show_value_size);
+    widgets.percentage_scan.set_sensitive(show_percentage);
+    widgets.percentage_scan.set_visible(show_percentage);
+    widgets.percentage_label.set_visible(show_percentage);
     widgets
-        .percentage_scan
-        .set_sensitive(floating || (integer && value_type != ScanValueType::All));
+        .percentage_value
+        .set_visible(show_percentage && widgets.percentage_scan.is_active());
+    widgets.percentage_value2.set_visible(
+        show_percentage
+            && widgets.percentage_scan.is_active()
+            && comparison == ScanComparison::Between,
+    );
     widgets
         .percentage_value
         .set_sensitive(widgets.percentage_scan.is_active());
@@ -1102,6 +1238,7 @@ fn set_scan_inputs_sensitive(widgets: &SessionWidgets, sensitive: bool) {
     widgets.hexadecimal.set_sensitive(sensitive);
     widgets.start_address.set_sensitive(sensitive);
     widgets.stop_address.set_sensitive(sensitive);
+    widgets.fast_scan.set_sensitive(sensitive);
     widgets.alignment.set_sensitive(sensitive);
     widgets.value_size.set_sensitive(sensitive);
     widgets.writable_match.set_sensitive(sensitive);
@@ -1192,7 +1329,7 @@ fn show_attached(state: &SessionState, widgets: &SessionWidgets, session: &Sessi
     widgets
         .session_details
         .set_label(&session_description(session));
-    widgets.process_button.set_sensitive(false);
+    widgets.process_button.set_sensitive(true);
     widgets.session_button.set_label("Detach");
     widgets.session_button.set_sensitive(true);
     widgets.memory_view_button.set_sensitive(true);
@@ -1313,6 +1450,9 @@ fn start_scan(
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
     widgets.cancel_scan_button.set_sensitive(true);
+    widgets.cancel_scan_button.set_visible(true);
+    widgets.scan_progress.set_visible(true);
+    widgets.scan_summary.set_visible(true);
     widgets.scan_progress.set_fraction(0.0);
     widgets.scan_progress.set_text(Some("Scanning… 0%"));
     widgets.scan_summary.set_label(match kind {
@@ -1350,7 +1490,7 @@ fn start_scan(
         }
 
         state.scanning.set(false);
-        widgets.process_button.set_sensitive(false);
+        widgets.process_button.set_sensitive(true);
         widgets.session_button.set_sensitive(true);
         set_scan_inputs_sensitive(&widgets, true);
         widgets.first_scan_button.set_sensitive(true);
@@ -1361,6 +1501,7 @@ fn start_scan(
             .undo_scan_button
             .set_sensitive(status.undo_available);
         widgets.cancel_scan_button.set_sensitive(false);
+        widgets.cancel_scan_button.set_visible(false);
 
         if status.cancelled {
             widgets.scan_progress.set_text(Some("Cancelled"));
@@ -1484,7 +1625,11 @@ fn build_scan_request(widgets: &SessionWidgets) -> Result<ScanRequest, String> {
         value: widgets.scan_value.text().trim().to_owned(),
         value2: widgets.scan_value2.text().trim().to_owned(),
         hexadecimal: widgets.hexadecimal.is_active(),
-        alignment: parse_u32_or_zero(&widgets.alignment.text(), "Alignment")?,
+        alignment: if widgets.fast_scan.is_active() {
+            parse_u32_or_zero(&widgets.alignment.text(), "Alignment")?
+        } else {
+            1
+        },
         start_address: parse_u64(&widgets.start_address.text(), "Start address")?,
         stop_address: parse_u64(&widgets.stop_address.text(), "Stop address")?,
         writable_match,
@@ -1587,7 +1732,7 @@ fn configure_scan_result_factory(
                     let VirtualScanRow::Loaded { index, .. } = &*row else {
                         return;
                     };
-                    add_virtual_scan_result(&state, &widgets, button, *index);
+                    add_virtual_scan_result(&state, &widgets, Some(button), *index);
                 }
             });
             let row = gtk::Box::builder()
@@ -1668,25 +1813,31 @@ fn configure_scan_result_factory(
 fn add_virtual_scan_result(
     state: &SessionState,
     widgets: &SessionWidgets,
-    button: &gtk::Button,
+    button: Option<&gtk::Button>,
     scan_index: u64,
 ) {
     let generation = state.scan_generation.get();
     if generation == 0 {
-        button.set_sensitive(false);
+        if let Some(button) = button {
+            button.set_sensitive(false);
+        }
         widgets
             .address_summary
             .set_label("The scan results are no longer current.");
         return;
     }
-    button.set_sensitive(false);
+    if let Some(button) = button {
+        button.set_sensitive(false);
+    }
     let result = {
         let mut engine_slot = state.engine.borrow_mut();
         let Some(engine) = engine_slot.as_mut() else {
             widgets
                 .address_summary
                 .set_label("The engine is temporarily unavailable.");
-            button.set_sensitive(true);
+            if let Some(button) = button {
+                button.set_sensitive(true);
+            }
             return;
         };
         engine.add_scan_result(generation, scan_index, "No description")
@@ -1712,7 +1863,9 @@ fn add_virtual_scan_result(
                 "Could not add the result: {} ({})",
                 error.message, error.code
             ));
-            button.set_sensitive(true);
+            if let Some(button) = button {
+                button.set_sensitive(true);
+            }
         }
     }
 }
@@ -1724,6 +1877,7 @@ fn show_scan_results(
     total_count: u64,
 ) {
     state.scan_generation.set(generation);
+    widgets.scan_empty_hint.set_visible(total_count == 0);
     let engine = Rc::downgrade(&state.engine);
     let loader: PageLoader = Rc::new(move |generation, start, limit| {
         let Some(engine) = engine.upgrade() else {
@@ -3546,9 +3700,13 @@ fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_v
 
     if !metadata.error_message.is_empty() {
         widgets.address_list_model.clear();
+        widgets.address_empty_hint.set_visible(true);
         widgets.address_summary.set_label(&metadata.error_message);
         return;
     }
+    widgets
+        .address_empty_hint
+        .set_visible(metadata.raw_total_count == 0);
     let engine = Rc::downgrade(&state.engine);
     let load_live_values = refresh_values;
     let loader: AddressPageLoader = Rc::new(move |generation, start, limit, refresh| {
@@ -4085,17 +4243,21 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
     widgets.cancel_scan_button.set_sensitive(false);
+    widgets.cancel_scan_button.set_visible(false);
     widgets.scan_progress.set_fraction(0.0);
     widgets.scan_progress.set_text(Some("Ready"));
+    widgets.scan_progress.set_visible(false);
     widgets
         .scan_summary
         .set_label("Attach to a process to begin scanning memory.");
+    widgets.scan_summary.set_visible(false);
     reset_scan_pages(state, widgets);
 }
 
 fn reset_scan_pages(state: &SessionState, widgets: &SessionWidgets) {
     state.scan_generation.set(0);
     widgets.scan_result_model.clear();
+    widgets.scan_empty_hint.set_visible(true);
     widgets.page_label.set_label("Found: 0");
     widgets.page_label.set_tooltip_text(None);
 }

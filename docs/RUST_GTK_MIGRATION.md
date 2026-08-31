@@ -31,6 +31,12 @@ Completed in the foundation and first vertical slices:
   parity pass also restores a functional File/Process/Table/Tools/Help menu,
   removes the oversized card treatment, moves address-table actions back under
   the lower table, and keeps LCH explicitly marked as a development codename;
+  a reference-driven density pass now also matches the live Qt window more
+  closely: the process chooser is a single compact toolbar row and attaches
+  immediately after selection, scanning exposes Memory Scan Options by default,
+  common address/protection/region filters share dense rows, Fast Scan is an
+  explicit functional toggle, idle-only progress chrome disappears, and both
+  result panes carry the same centered empty-state guidance as the source UI;
 - a bounded native GTK Memory View that preserves the original two-pane mental
   model: disassembly above, a 16-byte-wide hexadecimal/ASCII dump below, address
   navigation and 512-byte paging around them; reads are capped at 4 KiB and 256
@@ -525,5 +531,9 @@ recorded in a short decision note before public release.
     confirmed NOP replacement.~~
 16. ~~Integrate shared debugger state, Run/Step controls, software breakpoint
     markers, byte restoration, child-process contract tests, and a live GTK
-    debugger smoke test.~~ Next continue Lua GUI/form parity, expand debugger
+    debugger smoke test.~~
+17. ~~Run a direct Qt-versus-GTK main-window comparison and restore the compact
+    one-line process workflow, default-open Memory Scan Options, functional Fast
+    Scan toggle, type-aware option density, empty-list guidance, and result-row
+    double-click behavior.~~ Next continue Lua GUI/form parity, expand debugger
     event views and hardware breakpoints, and complete the branding review.
