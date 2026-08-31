@@ -1,6 +1,7 @@
 mod application;
 mod bridge;
 mod process_dialog;
+mod scan_result_model;
 
 use adw::prelude::*;
 use std::time::Duration;

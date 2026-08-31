@@ -25,8 +25,9 @@ Completed in the foundation and first vertical slices:
   a collapsed advanced-options panel;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
-  formatting, write-error state, and generation-aware result paging (128-row
-  GTK pages, 256-row bridge cap);
+  formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
+  visible positions fetch 256-row bridge pages lazily, placeholders are replaced
+  in place, and an eight-page LRU bounds GTK-side scan data to 2048 rows;
 - deterministic bridge tests for self attach, child-process attach, failed
   reattach state preservation, bounded Int32 paging, float ranges,
   case-insensitive text plus Next Scan, AOB wildcards, variable-width
@@ -110,11 +111,13 @@ Completed in the foundation and first vertical slices:
   core regression tests.
 
 The application ID and window title are explicitly development placeholders.
-The current pager deliberately keeps only one bounded page in GTK.  A later
-performance slice can replace the explicit Previous/Next controls with a
-virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
-contract.  The address-list controller is now the GTK source of truth and the
-Qt model delegates hierarchy plus the safe `IAddressList` surface through a
+The scan-result view now uses a custom virtual `gio::ListModel`: GTK sees the
+complete result count up to its `u32` position limit while only requested
+256-row pages are materialized, at most eight pages remain cached, and stale
+generation responses invalidate the model. The real `u64` result count remains
+visible even when GTK's position range is capped. The address-list controller
+is now the GTK source of truth and the Qt model delegates hierarchy plus the
+safe `IAddressList` surface through a
 lossless adapter.  Qt still owns its own periodic refresh/freeze/Lua pump,
 inline value-editor verification, and its legacy Auto Assembler adapter. GTK now has
 a bounded read-only review UI plus separately explicit-trust Auto Assembler and
@@ -242,17 +245,18 @@ stale asynchronous page responses instead of showing rows from a previous scan.
 ### Scan results and GTK models
 
 Keep the disk-backed `ScanResult` in C++.  The Rust side implements a bounded
-page cache for the visible range and exposes rows to `gtk::ColumnView` through a
-custom `gio::ListModel`.  Visible pages are fetched on demand; old pages are
-evicted with an LRU policy.  Live values refresh only for visible rows and at a
-rate that does not starve scanning.
+page cache for the visible range and exposes rows to `gtk::ListView` through a
+custom `gio::ListModel`. Missing positions return stable placeholder objects and
+schedule an idle page fetch; loaded and error rows replace that page through
+`items_changed`. Old pages are evicted with an LRU policy, and generation or
+paging-contract mismatches invalidate the model instead of mixing scan epochs.
 
 The initial performance budgets are:
 
 - attaching and opening an existing result set must not copy the full set;
 - UI actions remain responsive during a scan;
 - each page request is capped (initially 256 rows);
-- the cache is bounded (initially 16 pages, configurable after profiling);
+- the cache is bounded (eight 256-row pages, or at most 2048 materialized rows);
 - cancellation reaches a terminal state promptly and never leaves a detached
   worker touching a destroyed process handle.
 
@@ -447,7 +451,7 @@ recorded in a short decision note before public release.
 5. ~~Replace the preview with generation-aware, bounded result paging.~~
 6. ~~Add exact Int32 next scan and one-level undo.~~
 7. ~~Add the complete scan request/value-type/comparison surface.~~
-8. Replace the explicit pager with a virtualized bounded-cache GTK model.
+8. ~~Replace the explicit pager with a virtualized bounded-cache GTK model.~~
 9. Extract the toolkit-neutral address-list controller and adapt Qt to it
    (controller, GTK ownership, hierarchy, and the safe live `IAddressList`
    surface complete; Qt's periodic refresh/freeze timers remain).
@@ -455,5 +459,5 @@ recorded in a short decision note before public release.
 11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
     trust/review, trusted Auto Assembler activation/cleanup, and separately
     consented per-payload Lua execution with bounded input/VM/output, periodic
-    scheduling, and Lua console/timer parity.~~ Next replace the explicit result
-    pager with a virtualized bounded-cache model and continue Lua GUI/form parity.
+    scheduling, and Lua console/timer parity.~~ Next continue Lua GUI/form parity
+    and virtualize the address list beyond its bounded first page.

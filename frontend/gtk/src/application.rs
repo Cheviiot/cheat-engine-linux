@@ -12,10 +12,13 @@ use crate::bridge::{
     ScanComparison, ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
 };
 use crate::process_dialog;
+use crate::scan_result_model::{
+    DEFAULT_CACHE_PAGES, IssueHandler, MAX_BRIDGE_PAGE_SIZE, ModelIssue, PageLoader,
+    ScanResultModel, VirtualScanRow,
+};
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const SCAN_PAGE_SIZE: u32 = 128;
 const ADDRESS_PAGE_SIZE: u32 = 256;
 const SCRIPT_REVIEW_PAGE_SIZE: u32 = 64;
 const SCRIPT_TEXT_PAGE_SIZE: u32 = 64 << 10;
@@ -31,7 +34,6 @@ struct SessionState {
     attached: Rc<Cell<bool>>,
     scanning: Rc<Cell<bool>>,
     scan_generation: Rc<Cell<u64>>,
-    scan_page_start: Rc<Cell<u64>>,
     address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
     selected_address_ids: Rc<RefCell<HashSet<i32>>>,
     table_scripts_trusted: Rc<Cell<bool>>,
@@ -79,9 +81,7 @@ struct SessionWidgets {
     cancel_scan_button: gtk::Button,
     scan_progress: gtk::ProgressBar,
     scan_summary: gtk::Label,
-    scan_results: gtk::ListBox,
-    previous_page_button: gtk::Button,
-    next_page_button: gtk::Button,
+    scan_result_model: ScanResultModel,
     page_label: gtk::Label,
     address_list: gtk::ListBox,
     address_summary: gtk::Label,
@@ -114,7 +114,6 @@ fn build_window(application: &adw::Application) {
         attached: Rc::new(Cell::new(false)),
         scanning: Rc::new(Cell::new(false)),
         scan_generation: Rc::new(Cell::new(0)),
-        scan_page_start: Rc::new(Cell::new(0)),
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
         selected_address_ids: Rc::new(RefCell::new(HashSet::new())),
         table_scripts_trusted: Rc::new(Cell::new(false)),
@@ -350,10 +349,15 @@ fn build_window(application: &adw::Application) {
         .css_classes(["dim-label"])
         .build();
 
-    let scan_results = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
+    let scan_result_model = ScanResultModel::new(MAX_BRIDGE_PAGE_SIZE, DEFAULT_CACHE_PAGES);
+    let scan_result_selection = gtk::NoSelection::new(Some(scan_result_model.clone()));
+    let scan_result_factory = gtk::SignalListItemFactory::new();
+    let scan_results = gtk::ListView::new(
+        Some(scan_result_selection),
+        Some(scan_result_factory.clone()),
+    );
+    scan_results.set_show_separators(true);
+    scan_results.add_css_class("boxed-list");
     let scan_results_scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .min_content_height(160)
@@ -361,26 +365,11 @@ fn build_window(application: &adw::Application) {
         .child(&scan_results)
         .build();
 
-    let previous_page_button = gtk::Button::builder()
-        .label("Previous")
-        .sensitive(false)
-        .build();
-    let next_page_button = gtk::Button::builder()
-        .label("Next")
-        .sensitive(false)
-        .build();
     let page_label = gtk::Label::builder()
         .label("No results")
-        .hexpand(true)
+        .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    let page_actions = gtk::Box::builder()
-        .orientation(Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    page_actions.append(&previous_page_button);
-    page_actions.append(&page_label);
-    page_actions.append(&next_page_button);
 
     let address_title = gtk::Label::builder()
         .label("Address list")
@@ -472,7 +461,7 @@ fn build_window(application: &adw::Application) {
     content.append(&scan_progress);
     content.append(&scan_summary);
     content.append(&scan_results_scrolled);
-    content.append(&page_actions);
+    content.append(&page_label);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&address_header);
     content.append(&address_structure_actions);
@@ -533,15 +522,15 @@ fn build_window(application: &adw::Application) {
         cancel_scan_button,
         scan_progress,
         scan_summary,
-        scan_results,
-        previous_page_button,
-        next_page_button,
+        scan_result_model,
         page_label,
         address_list,
         address_summary,
         group_selected_button,
         script_trust_button,
     };
+
+    configure_scan_result_factory(&scan_result_factory, &state, &widgets);
 
     update_scan_option_visibility(&widgets);
     widgets.value_type.connect_selected_notify({
@@ -629,30 +618,6 @@ fn build_window(application: &adw::Application) {
             }
             widgets.cancel_scan_button.set_sensitive(false);
             widgets.scan_progress.set_text(Some("Cancelling…"));
-        }
-    });
-
-    widgets.previous_page_button.connect_clicked({
-        let state = state.clone();
-        let widgets = widgets.clone();
-        move |_| {
-            let start = state
-                .scan_page_start
-                .get()
-                .saturating_sub(u64::from(SCAN_PAGE_SIZE));
-            load_scan_page(&state, &widgets, start);
-        }
-    });
-
-    widgets.next_page_button.connect_clicked({
-        let state = state.clone();
-        let widgets = widgets.clone();
-        move |_| {
-            let start = state
-                .scan_page_start
-                .get()
-                .saturating_add(u64::from(SCAN_PAGE_SIZE));
-            load_scan_page(&state, &widgets, start);
         }
     });
 
@@ -1097,8 +1062,7 @@ fn start_scan(
                 "Found {} addresses.{}",
                 status.result_count, disk_note
             ));
-            state.scan_generation.set(status.generation);
-            load_scan_page(&state, &widgets, 0);
+            show_scan_results(&state, &widgets, status.generation, status.result_count);
         }
         adw::glib::ControlFlow::Break
     });
@@ -1110,8 +1074,7 @@ fn restore_available_result(
     status: &crate::bridge::ScanStatus,
 ) {
     if status.result_available {
-        state.scan_generation.set(status.generation);
-        load_scan_page(state, widgets, 0);
+        show_scan_results(state, widgets, status.generation, status.result_count);
     }
 }
 
@@ -1124,7 +1087,6 @@ fn undo_scan(window: &adw::ApplicationWindow, state: &SessionState, widgets: &Se
         .undo_scan();
     match result {
         Ok(action) => {
-            state.scan_generation.set(action.generation);
             widgets.scan_summary.set_label(&format!(
                 "Restored the previous scan with {} addresses.",
                 action.result_count
@@ -1133,7 +1095,7 @@ fn undo_scan(window: &adw::ApplicationWindow, state: &SessionState, widgets: &Se
             widgets
                 .undo_scan_button
                 .set_sensitive(action.undo_available);
-            load_scan_page(state, widgets, 0);
+            show_scan_results(state, widgets, action.generation, action.result_count);
         }
         Err(error) => show_message(window, "Could not undo scan", &error.message),
     }
@@ -1225,108 +1187,226 @@ fn build_scan_request(widgets: &SessionWidgets) -> Result<ScanRequest, String> {
     })
 }
 
-fn render_scan_results(
+fn configure_scan_result_factory(
+    factory: &gtk::SignalListItemFactory,
     state: &SessionState,
     widgets: &SessionWidgets,
-    hits: &[crate::bridge::ScanHit],
-    page_start: u64,
 ) {
-    clear_scan_results(&widgets.scan_results);
-    for (offset, hit) in hits.iter().enumerate() {
-        let row = adw::ActionRow::builder()
-            .title(format!("0x{:016X}", hit.address))
-            .subtitle(format!("Value: {}", hit.value))
-            .build();
-        let add_button = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Add to the address list")
-            .valign(Align::Center)
-            .css_classes(["flat"])
-            .build();
-        add_button.connect_clicked({
-            let state = state.clone();
-            let widgets = widgets.clone();
-            let scan_index = page_start.saturating_add(offset as u64);
-            move |button| {
-                button.set_sensitive(false);
-                let result = state
-                    .engine
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("engine remains present while adding a scan result")
-                    .add_scan_result(state.scan_generation.get(), scan_index, "No description");
-                match result {
-                    Ok(_) => {
-                        widgets
-                            .address_summary
-                            .set_label("The scan result was added to the address list.");
-                        reload_address_list(&state, &widgets, true);
-                    }
-                    Err(error) => {
-                        widgets.address_summary.set_label(&format!(
-                            "Could not add the result: {} ({})",
-                            error.message, error.code
-                        ));
-                        button.set_sensitive(true);
-                    }
+    factory.connect_setup({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, object| {
+            let list_item = object
+                .downcast_ref::<gtk::ListItem>()
+                .expect("scan result factory receives list items");
+            let title = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            let subtitle = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["dim-label"])
+                .build();
+            let labels = gtk::Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(3)
+                .hexpand(true)
+                .build();
+            labels.append(&title);
+            labels.append(&subtitle);
+            let add_button = gtk::Button::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text("Add to the address list")
+                .valign(Align::Center)
+                .sensitive(false)
+                .css_classes(["flat"])
+                .build();
+            add_button.connect_clicked({
+                let list_item = list_item.downgrade();
+                let state = state.clone();
+                let widgets = widgets.clone();
+                move |button| {
+                    let Some(list_item) = list_item.upgrade() else {
+                        return;
+                    };
+                    let Some(item) = list_item.item().and_downcast::<adw::glib::BoxedAnyObject>()
+                    else {
+                        return;
+                    };
+                    let row = item.borrow::<VirtualScanRow>();
+                    let VirtualScanRow::Loaded { index, .. } = &*row else {
+                        return;
+                    };
+                    add_virtual_scan_result(&state, &widgets, button, *index);
                 }
+            });
+            let row = gtk::Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(12)
+                .margin_top(9)
+                .margin_bottom(9)
+                .margin_start(12)
+                .margin_end(12)
+                .build();
+            row.append(&labels);
+            row.append(&add_button);
+            list_item.set_child(Some(&row));
+        }
+    });
+
+    factory.connect_bind(|_, object| {
+        let list_item = object
+            .downcast_ref::<gtk::ListItem>()
+            .expect("scan result factory receives list items");
+        let row = list_item
+            .child()
+            .and_downcast::<gtk::Box>()
+            .expect("scan result row");
+        let labels = row
+            .first_child()
+            .and_downcast::<gtk::Box>()
+            .expect("scan result labels");
+        let title = labels
+            .first_child()
+            .and_downcast::<gtk::Label>()
+            .expect("scan result title");
+        let subtitle = title
+            .next_sibling()
+            .and_downcast::<gtk::Label>()
+            .expect("scan result subtitle");
+        let add_button = labels
+            .next_sibling()
+            .and_downcast::<gtk::Button>()
+            .expect("scan result add button");
+        let item = list_item
+            .item()
+            .and_downcast::<adw::glib::BoxedAnyObject>()
+            .expect("virtual scan result item");
+        match &*item.borrow::<VirtualScanRow>() {
+            VirtualScanRow::Loading { index } => {
+                title.set_label(&format!("Loading result #{}…", index + 1));
+                subtitle.set_label("Fetching this page from the scan result store");
+                add_button.set_sensitive(false);
             }
-        });
-        row.add_suffix(&add_button);
-        widgets.scan_results.append(&row);
-    }
+            VirtualScanRow::Loaded { address, value, .. } => {
+                title.set_label(&format!("0x{address:016X}"));
+                subtitle.set_label(&format!("Value: {value}"));
+                add_button.set_sensitive(true);
+            }
+            VirtualScanRow::Error { index, message } => {
+                title.set_label(&format!("Result #{} is unavailable", index + 1));
+                subtitle.set_label(message);
+                add_button.set_sensitive(false);
+            }
+        }
+    });
 }
 
-fn load_scan_page(state: &SessionState, widgets: &SessionWidgets, start: u64) {
+fn add_virtual_scan_result(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    button: &gtk::Button,
+    scan_index: u64,
+) {
     let generation = state.scan_generation.get();
     if generation == 0 {
-        return;
-    }
-    let page = state
-        .engine
-        .borrow()
-        .as_ref()
-        .expect("engine remains present while paging")
-        .scan_rows(generation, start, SCAN_PAGE_SIZE);
-    if page.stale || page.generation != generation {
-        reset_scan_pages(state, widgets);
+        button.set_sensitive(false);
         widgets
-            .scan_summary
-            .set_label("Scan results changed; the stale page was discarded.");
+            .address_summary
+            .set_label("The scan results are no longer current.");
         return;
     }
-    if !page.error_message.is_empty() {
-        clear_scan_results(&widgets.scan_results);
-        widgets.page_label.set_label("Results unavailable");
-        widgets.scan_summary.set_label(&page.error_message);
-        return;
+    button.set_sensitive(false);
+    let result = {
+        let mut engine_slot = state.engine.borrow_mut();
+        let Some(engine) = engine_slot.as_mut() else {
+            widgets
+                .address_summary
+                .set_label("The engine is temporarily unavailable.");
+            button.set_sensitive(true);
+            return;
+        };
+        engine.add_scan_result(generation, scan_index, "No description")
+    };
+    match result {
+        Ok(_) => {
+            widgets
+                .address_summary
+                .set_label("The scan result was added to the address list.");
+            reload_address_list(state, widgets, true);
+        }
+        Err(error) if error.code == "stale_scan_result" => {
+            reset_scan_pages(state, widgets);
+            widgets
+                .scan_summary
+                .set_label("Scan results changed; the stale result was discarded.");
+            widgets
+                .address_summary
+                .set_label("The selected scan result is no longer current.");
+        }
+        Err(error) => {
+            widgets.address_summary.set_label(&format!(
+                "Could not add the result: {} ({})",
+                error.message, error.code
+            ));
+            button.set_sensitive(true);
+        }
     }
-
-    state.scan_page_start.set(page.start);
-    render_scan_results(state, widgets, &page.rows, page.start);
-
-    let shown_end = page.start.saturating_add(page.rows.len() as u64);
-    if page.total_count == 0 {
-        widgets.page_label.set_label("No results");
-    } else if page.rows.is_empty() {
-        widgets.page_label.set_label("No rows on this page");
-    } else {
-        widgets.page_label.set_label(&format!(
-            "{}–{} of {}",
-            page.start + 1,
-            shown_end,
-            page.total_count
-        ));
-    }
-    widgets.previous_page_button.set_sensitive(page.start > 0);
-    widgets
-        .next_page_button
-        .set_sensitive(shown_end < page.total_count);
 }
 
-fn clear_scan_results(list: &gtk::ListBox) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
+fn show_scan_results(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    generation: u64,
+    total_count: u64,
+) {
+    state.scan_generation.set(generation);
+    let engine = Rc::downgrade(&state.engine);
+    let loader: PageLoader = Rc::new(move |generation, start, limit| {
+        let Some(engine) = engine.upgrade() else {
+            return Err("The scan engine is no longer available.".to_owned());
+        };
+        let engine_slot = engine
+            .try_borrow()
+            .map_err(|_| "The scan engine is busy; scroll away and back to retry.".to_owned())?;
+        let Some(engine) = engine_slot.as_ref() else {
+            return Err("The scan engine is temporarily unavailable.".to_owned());
+        };
+        Ok(engine.scan_rows(generation, start, limit))
+    });
+    let scan_generation = state.scan_generation.clone();
+    let scan_summary = widgets.scan_summary.clone();
+    let page_label = widgets.page_label.clone();
+    let issue_handler: IssueHandler = Rc::new(move |issue| match issue {
+        ModelIssue::Page(message) => {
+            scan_summary.set_label(&message);
+            page_label.set_label("Some results could not be loaded");
+        }
+        ModelIssue::Stale(message) => {
+            scan_generation.set(0);
+            scan_summary.set_label(&message);
+            page_label.set_label("Results changed; scan again to refresh them");
+        }
+    });
+    widgets
+        .scan_result_model
+        .configure(generation, total_count, loader, issue_handler);
+
+    if total_count == 0 {
+        widgets.page_label.set_label("No results");
+        return;
+    }
+    let displayed_count = u64::from(widgets.scan_result_model.displayed_count());
+    let cache_capacity = widgets.scan_result_model.cached_row_capacity();
+    if widgets.scan_result_model.total_count() > displayed_count {
+        widgets.page_label.set_label(&format!(
+            "Virtualized first {displayed_count} of {total_count} results · pages load while scrolling · cache up to {cache_capacity} rows"
+        ));
+    } else {
+        widgets.page_label.set_label(&format!(
+            "{total_count} results · pages load while scrolling · cache up to {cache_capacity} rows"
+        ));
     }
 }
 
@@ -3178,11 +3258,8 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
 
 fn reset_scan_pages(state: &SessionState, widgets: &SessionWidgets) {
     state.scan_generation.set(0);
-    state.scan_page_start.set(0);
-    widgets.previous_page_button.set_sensitive(false);
-    widgets.next_page_button.set_sensitive(false);
+    widgets.scan_result_model.clear();
     widgets.page_label.set_label("No results");
-    clear_scan_results(&widgets.scan_results);
 }
 
 fn show_message(window: &adw::ApplicationWindow, heading: &str, body: &str) {
