@@ -6,7 +6,10 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 
-use crate::bridge::{AttachError, Engine, Process, Session};
+use crate::bridge::{
+    AttachError, Engine, Process, ProtectionMatch, ScanComparison, ScanRequest, ScanValueType,
+    Session,
+};
 use crate::process_dialog;
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
@@ -29,7 +32,27 @@ struct SessionWidgets {
     session_details: gtk::Label,
     process_button: gtk::Button,
     session_button: gtk::Button,
+    value_type: gtk::DropDown,
+    comparison: gtk::DropDown,
     scan_value: gtk::Entry,
+    scan_value2: gtk::Entry,
+    hexadecimal: gtk::CheckButton,
+    start_address: gtk::Entry,
+    stop_address: gtk::Entry,
+    alignment: gtk::Entry,
+    value_size: gtk::Entry,
+    writable_match: gtk::DropDown,
+    executable_match: gtk::DropDown,
+    scan_private: gtk::CheckButton,
+    scan_image: gtk::CheckButton,
+    scan_mapped: gtk::CheckButton,
+    rounding_type: gtk::DropDown,
+    float_tolerance: gtk::Entry,
+    percentage_scan: gtk::CheckButton,
+    percentage_value: gtk::Entry,
+    percentage_value2: gtk::Entry,
+    case_sensitive: gtk::CheckButton,
+    string_encoding: gtk::Entry,
     first_scan_button: gtk::Button,
     next_scan_button: gtk::Button,
     undo_scan_button: gtk::Button,
@@ -125,15 +148,43 @@ fn build_window(application: &adw::Application) {
     session_actions.append(&session_button);
 
     let scan_title = gtk::Label::builder()
-        .label("First scan")
+        .label("Memory scan")
         .css_classes(["title-3"])
         .halign(Align::Start)
         .build();
 
+    let value_type = gtk::DropDown::from_strings(&ScanValueType::LABELS);
+    value_type.set_selected(ScanValueType::Int32 as u32);
+    value_type.set_hexpand(true);
+    let comparison = gtk::DropDown::from_strings(&ScanComparison::LABELS);
+    comparison.set_selected(ScanComparison::Exact as u32);
+    comparison.set_hexpand(true);
+    let scan_mode_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    scan_mode_row.append(&value_type);
+    scan_mode_row.append(&comparison);
+
     let scan_value = gtk::Entry::builder()
-        .placeholder_text("32-bit integer value")
+        .placeholder_text("Value")
         .hexpand(true)
         .build();
+    let scan_value2 = gtk::Entry::builder()
+        .placeholder_text("Upper value")
+        .hexpand(true)
+        .visible(false)
+        .build();
+    let hexadecimal = gtk::CheckButton::builder().label("Hex").build();
+
+    let scan_values_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    scan_values_row.append(&scan_value);
+    scan_values_row.append(&scan_value2);
+    scan_values_row.append(&hexadecimal);
+
     let first_scan_button = gtk::Button::builder()
         .label("First Scan")
         .css_classes(["suggested-action"])
@@ -156,18 +207,101 @@ fn build_window(application: &adw::Application) {
         .orientation(Orientation::Horizontal)
         .spacing(12)
         .build();
-    scan_actions.append(&scan_value);
     scan_actions.append(&first_scan_button);
     scan_actions.append(&next_scan_button);
     scan_actions.append(&undo_scan_button);
     scan_actions.append(&cancel_scan_button);
+
+    let start_address = gtk::Entry::builder().text("0x0").hexpand(true).build();
+    let stop_address = gtk::Entry::builder()
+        .text("0x00007FFFFFFFFFFF")
+        .hexpand(true)
+        .build();
+    let alignment = gtk::Entry::builder().text("4").hexpand(true).build();
+    let value_size = gtk::Entry::builder()
+        .placeholder_text("Automatic")
+        .hexpand(true)
+        .build();
+    let writable_match = gtk::DropDown::from_strings(&ProtectionMatch::LABELS);
+    writable_match.set_hexpand(true);
+    let executable_match = gtk::DropDown::from_strings(&ProtectionMatch::LABELS);
+    executable_match.set_hexpand(true);
+    let scan_private = gtk::CheckButton::builder()
+        .label("Private")
+        .active(true)
+        .build();
+    let scan_image = gtk::CheckButton::builder()
+        .label("Image")
+        .active(true)
+        .build();
+    let scan_mapped = gtk::CheckButton::builder()
+        .label("Mapped")
+        .active(true)
+        .build();
+    let rounding_type =
+        gtk::DropDown::from_strings(&["Exact", "Rounded", "Truncated", "Tolerance"]);
+    rounding_type.set_hexpand(true);
+    let float_tolerance = gtk::Entry::builder().text("0").hexpand(true).build();
+    let percentage_scan = gtk::CheckButton::builder().label("Percentage scan").build();
+    let percentage_value = gtk::Entry::builder()
+        .text("0")
+        .placeholder_text("Percent")
+        .hexpand(true)
+        .build();
+    let percentage_value2 = gtk::Entry::builder()
+        .text("0")
+        .placeholder_text("Upper percent")
+        .hexpand(true)
+        .build();
+    let case_sensitive = gtk::CheckButton::builder()
+        .label("Case sensitive")
+        .active(true)
+        .build();
+    let string_encoding = gtk::Entry::builder().text("UTF-8").hexpand(true).build();
+
+    let regions_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    regions_row.append(&scan_private);
+    regions_row.append(&scan_image);
+    regions_row.append(&scan_mapped);
+    let percentage_row = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    percentage_row.append(&percentage_scan);
+    percentage_row.append(&percentage_value);
+    percentage_row.append(&percentage_value2);
+
+    let advanced_grid = gtk::Grid::builder()
+        .column_spacing(12)
+        .row_spacing(9)
+        .margin_top(12)
+        .build();
+    attach_advanced_row(&advanced_grid, 0, "Start address", &start_address);
+    attach_advanced_row(&advanced_grid, 1, "Stop address", &stop_address);
+    attach_advanced_row(&advanced_grid, 2, "Alignment", &alignment);
+    attach_advanced_row(&advanced_grid, 3, "Value size (bytes)", &value_size);
+    attach_advanced_row(&advanced_grid, 4, "Writable", &writable_match);
+    attach_advanced_row(&advanced_grid, 5, "Executable", &executable_match);
+    attach_advanced_row(&advanced_grid, 6, "Region types", &regions_row);
+    attach_advanced_row(&advanced_grid, 7, "Float rounding", &rounding_type);
+    attach_advanced_row(&advanced_grid, 8, "Float tolerance", &float_tolerance);
+    attach_advanced_row(&advanced_grid, 9, "Percentage", &percentage_row);
+    attach_advanced_row(&advanced_grid, 10, "String matching", &case_sensitive);
+    attach_advanced_row(&advanced_grid, 11, "String encoding", &string_encoding);
+    let advanced_options = gtk::Expander::builder()
+        .label("Advanced scan options")
+        .child(&advanced_grid)
+        .build();
 
     let scan_progress = gtk::ProgressBar::builder().show_text(true).build();
     scan_progress.set_fraction(0.0);
     scan_progress.set_text(Some("Ready"));
 
     let scan_summary = gtk::Label::builder()
-        .label("Attach to a process to enable exact 4-byte scans.")
+        .label("Attach to a process to begin scanning memory.")
         .wrap(true)
         .xalign(0.0)
         .css_classes(["dim-label"])
@@ -221,7 +355,10 @@ fn build_window(application: &adw::Application) {
     content.append(&session_actions);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&scan_title);
+    content.append(&scan_mode_row);
+    content.append(&scan_values_row);
     content.append(&scan_actions);
+    content.append(&advanced_options);
     content.append(&scan_progress);
     content.append(&scan_summary);
     content.append(&scan_results_scrolled);
@@ -250,7 +387,27 @@ fn build_window(application: &adw::Application) {
         session_details,
         process_button,
         session_button,
+        value_type,
+        comparison,
         scan_value,
+        scan_value2,
+        hexadecimal,
+        start_address,
+        stop_address,
+        alignment,
+        value_size,
+        writable_match,
+        executable_match,
+        scan_private,
+        scan_image,
+        scan_mapped,
+        rounding_type,
+        float_tolerance,
+        percentage_scan,
+        percentage_value,
+        percentage_value2,
+        case_sensitive,
+        string_encoding,
         first_scan_button,
         next_scan_button,
         undo_scan_button,
@@ -262,6 +419,24 @@ fn build_window(application: &adw::Application) {
         next_page_button,
         page_label,
     };
+
+    update_scan_option_visibility(&widgets);
+    widgets.value_type.connect_selected_notify({
+        let widgets = widgets.clone();
+        move |_| update_scan_option_visibility(&widgets)
+    });
+    widgets.comparison.connect_selected_notify({
+        let widgets = widgets.clone();
+        move |_| update_scan_option_visibility(&widgets)
+    });
+    widgets.percentage_scan.connect_toggled({
+        let widgets = widgets.clone();
+        move |_| update_scan_option_visibility(&widgets)
+    });
+    widgets.rounding_type.connect_selected_notify({
+        let widgets = widgets.clone();
+        move |_| update_scan_option_visibility(&widgets)
+    });
 
     widgets.process_button.connect_clicked({
         let window = window.clone();
@@ -361,6 +536,123 @@ fn build_window(application: &adw::Application) {
     window.present();
 }
 
+fn attach_advanced_row<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, title: &str, child: &W) {
+    let label = gtk::Label::builder()
+        .label(title)
+        .halign(Align::Start)
+        .xalign(0.0)
+        .build();
+    grid.attach(&label, 0, row, 1, 1);
+    grid.attach(child, 1, row, 1, 1);
+}
+
+fn update_scan_option_visibility(widgets: &SessionWidgets) {
+    let value_type =
+        ScanValueType::from_index(widgets.value_type.selected()).unwrap_or(ScanValueType::Int32);
+    let comparison =
+        ScanComparison::from_index(widgets.comparison.selected()).unwrap_or(ScanComparison::Exact);
+    let takes_value = comparison.takes_value();
+    let between = comparison == ScanComparison::Between;
+    let integer = matches!(
+        value_type,
+        ScanValueType::Byte
+            | ScanValueType::Int16
+            | ScanValueType::Int32
+            | ScanValueType::Int64
+            | ScanValueType::All
+            | ScanValueType::Pointer
+    );
+    let floating = matches!(
+        value_type,
+        ScanValueType::Float | ScanValueType::Double | ScanValueType::All
+    );
+    let string = matches!(
+        value_type,
+        ScanValueType::String | ScanValueType::UnicodeString
+    );
+    let bytewise = matches!(
+        value_type,
+        ScanValueType::String
+            | ScanValueType::UnicodeString
+            | ScanValueType::ByteArray
+            | ScanValueType::Binary
+            | ScanValueType::Grouped
+            | ScanValueType::Custom
+    );
+    let variable_snapshot = !takes_value
+        && matches!(
+            value_type,
+            ScanValueType::String
+                | ScanValueType::UnicodeString
+                | ScanValueType::ByteArray
+                | ScanValueType::Binary
+        );
+
+    widgets.scan_value.set_visible(takes_value);
+    if value_type == ScanValueType::Grouped {
+        widgets.scan_value.set_visible(true);
+    }
+    widgets.scan_value2.set_visible(between);
+    widgets.hexadecimal.set_visible(takes_value && integer);
+    widgets.rounding_type.set_sensitive(floating);
+    widgets
+        .float_tolerance
+        .set_sensitive(floating && widgets.rounding_type.selected() == 3);
+    widgets.case_sensitive.set_sensitive(string);
+    widgets.string_encoding.set_sensitive(string);
+    widgets.alignment.set_sensitive(!bytewise);
+    widgets
+        .value_size
+        .set_sensitive(variable_snapshot || value_type == ScanValueType::Custom);
+    widgets
+        .percentage_scan
+        .set_sensitive(floating || (integer && value_type != ScanValueType::All));
+    widgets
+        .percentage_value
+        .set_sensitive(widgets.percentage_scan.is_active());
+    widgets.percentage_value2.set_sensitive(
+        widgets.percentage_scan.is_active() && comparison == ScanComparison::Between,
+    );
+    widgets
+        .scan_value
+        .set_placeholder_text(Some(match value_type {
+            ScanValueType::ByteArray => "Bytes, for example 7F 45 ?? 46",
+            ScanValueType::Binary => "Bits, for example 0110??01",
+            ScanValueType::String | ScanValueType::UnicodeString => "Text to find",
+            ScanValueType::Grouped => "Grouped expression",
+            ScanValueType::Custom => "Custom formula",
+            ScanValueType::Float | ScanValueType::Double => "Floating-point value",
+            _ => "Value",
+        }));
+}
+
+fn set_scan_inputs_sensitive(widgets: &SessionWidgets, sensitive: bool) {
+    widgets.value_type.set_sensitive(sensitive);
+    widgets.comparison.set_sensitive(sensitive);
+    widgets.scan_value.set_sensitive(sensitive);
+    widgets.scan_value2.set_sensitive(sensitive);
+    widgets.hexadecimal.set_sensitive(sensitive);
+    widgets.start_address.set_sensitive(sensitive);
+    widgets.stop_address.set_sensitive(sensitive);
+    widgets.alignment.set_sensitive(sensitive);
+    widgets.value_size.set_sensitive(sensitive);
+    widgets.writable_match.set_sensitive(sensitive);
+    widgets.executable_match.set_sensitive(sensitive);
+    widgets.scan_private.set_sensitive(sensitive);
+    widgets.scan_image.set_sensitive(sensitive);
+    widgets.scan_mapped.set_sensitive(sensitive);
+    widgets.rounding_type.set_sensitive(sensitive);
+    widgets.float_tolerance.set_sensitive(sensitive);
+    widgets.percentage_scan.set_sensitive(sensitive);
+    widgets.percentage_value.set_sensitive(sensitive);
+    widgets.percentage_value2.set_sensitive(sensitive);
+    widgets.case_sensitive.set_sensitive(sensitive);
+    widgets.string_encoding.set_sensitive(sensitive);
+    if sensitive {
+        update_scan_option_visibility(widgets);
+    }
+}
+
 fn start_attach(window: &adw::ApplicationWindow, state: &SessionState, widgets: &SessionWidgets) {
     let Some(process) = state.selected.borrow().clone() else {
         return;
@@ -440,7 +732,7 @@ fn show_attached(state: &SessionState, widgets: &SessionWidgets, session: &Sessi
     widgets.undo_scan_button.set_sensitive(false);
     widgets
         .scan_summary
-        .set_label("Enter a signed 32-bit value for an exact scan.");
+        .set_label("Choose a value type, comparison, and scan value.");
 }
 
 fn show_attach_error(
@@ -500,14 +792,12 @@ fn start_scan(
     widgets: &SessionWidgets,
     kind: ScanKind,
 ) {
-    let value_text = widgets.scan_value.text();
-    let Some(value) = parse_i32(&value_text) else {
-        show_message(
-            window,
-            "Invalid scan value",
-            "Enter a signed 32-bit integer, for example 100 or 0x64.",
-        );
-        return;
+    let request = match build_scan_request(widgets) {
+        Ok(request) => request,
+        Err(message) => {
+            show_message(window, "Invalid scan options", &message);
+            return;
+        }
     };
 
     let start_result = {
@@ -516,19 +806,23 @@ fn start_scan(
             .as_mut()
             .expect("engine is present outside attach worker");
         match kind {
-            ScanKind::First => engine.start_first_scan_i32(value, 0, 0x0000_7fff_ffff_ffff, 4),
-            ScanKind::Next => engine.start_next_scan_i32(value),
+            ScanKind::First => engine.start_first_scan(&request),
+            ScanKind::Next => engine.start_next_scan(&request),
         }
     };
     if let Err(error) = start_result {
-        show_message(window, "Could not start scan", &error.message);
+        show_message(
+            window,
+            "Could not start scan",
+            &format!("{}\n\nDiagnostic: {}", error.message, error.code),
+        );
         return;
     }
 
     state.scanning.set(true);
     widgets.process_button.set_sensitive(false);
     widgets.session_button.set_sensitive(false);
-    widgets.scan_value.set_sensitive(false);
+    set_scan_inputs_sensitive(widgets, false);
     widgets.first_scan_button.set_sensitive(false);
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
@@ -572,7 +866,7 @@ fn start_scan(
         state.scanning.set(false);
         widgets.process_button.set_sensitive(false);
         widgets.session_button.set_sensitive(true);
-        widgets.scan_value.set_sensitive(true);
+        set_scan_inputs_sensitive(&widgets, true);
         widgets.first_scan_button.set_sensitive(true);
         widgets
             .next_scan_button
@@ -649,21 +943,90 @@ fn undo_scan(window: &adw::ApplicationWindow, state: &SessionState, widgets: &Se
     }
 }
 
-fn parse_i32(text: &str) -> Option<i32> {
+fn parse_u64(text: &str, label: &str) -> Result<u64, String> {
     let trimmed = text.trim();
-    let (negative, digits) = trimmed
-        .strip_prefix('-')
-        .map_or((false, trimmed), |digits| (true, digits));
-    if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        let magnitude = i64::from_str_radix(hex, 16).ok()?;
-        let signed = if negative { -magnitude } else { magnitude };
-        i32::try_from(signed).ok()
-    } else {
-        trimmed.parse().ok()
+    if trimmed.is_empty() {
+        return Err(format!("{label} cannot be empty."));
     }
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse()
+    };
+    parsed.map_err(|_| format!("{label} must be a decimal number or start with 0x."))
+}
+
+fn parse_u32_or_zero(text: &str, label: &str) -> Result<u32, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    trimmed
+        .parse()
+        .map_err(|_| format!("{label} must be a non-negative whole number."))
+}
+
+fn parse_f64(text: &str, label: &str) -> Result<f64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} cannot be empty."));
+    }
+    let normalized = if trimmed.contains('.') {
+        trimmed.to_owned()
+    } else {
+        trimmed.replace(',', ".")
+    };
+    normalized
+        .parse()
+        .map_err(|_| format!("{label} must be a valid number."))
+}
+
+fn build_scan_request(widgets: &SessionWidgets) -> Result<ScanRequest, String> {
+    let value_type = ScanValueType::from_index(widgets.value_type.selected())
+        .ok_or_else(|| "Select a supported value type.".to_owned())?;
+    let comparison = ScanComparison::from_index(widgets.comparison.selected())
+        .ok_or_else(|| "Select a supported comparison.".to_owned())?;
+    let writable_match = ProtectionMatch::from_index(widgets.writable_match.selected())
+        .ok_or_else(|| "Select a valid writable-memory filter.".to_owned())?;
+    let executable_match = ProtectionMatch::from_index(widgets.executable_match.selected())
+        .ok_or_else(|| "Select a valid executable-memory filter.".to_owned())?;
+    let percentage_scan = widgets.percentage_scan.is_active();
+
+    Ok(ScanRequest {
+        value_type,
+        comparison,
+        value: widgets.scan_value.text().trim().to_owned(),
+        value2: widgets.scan_value2.text().trim().to_owned(),
+        hexadecimal: widgets.hexadecimal.is_active(),
+        alignment: parse_u32_or_zero(&widgets.alignment.text(), "Alignment")?,
+        start_address: parse_u64(&widgets.start_address.text(), "Start address")?,
+        stop_address: parse_u64(&widgets.stop_address.text(), "Stop address")?,
+        writable_match,
+        executable_match,
+        scan_private: widgets.scan_private.is_active(),
+        scan_image: widgets.scan_image.is_active(),
+        scan_mapped: widgets.scan_mapped.is_active(),
+        rounding_type: widgets.rounding_type.selected() as i32,
+        float_decimals: -1,
+        float_tolerance: parse_f64(&widgets.float_tolerance.text(), "Float tolerance")?,
+        percentage_scan,
+        percentage_value: if percentage_scan {
+            parse_f64(&widgets.percentage_value.text(), "Percentage")?
+        } else {
+            0.0
+        },
+        percentage_value2: if percentage_scan {
+            parse_f64(&widgets.percentage_value2.text(), "Second percentage")?
+        } else {
+            0.0
+        },
+        case_sensitive: widgets.case_sensitive.is_active(),
+        string_encoding: widgets.string_encoding.text().trim().to_owned(),
+        value_size: parse_u32_or_zero(&widgets.value_size.text(), "Value size")?,
+    })
 }
 
 fn render_scan_results(list: &gtk::ListBox, hits: &[crate::bridge::ScanHit]) {
@@ -732,7 +1095,7 @@ fn clear_scan_results(list: &gtk::ListBox) {
 
 fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
     state.scanning.set(false);
-    widgets.scan_value.set_sensitive(true);
+    set_scan_inputs_sensitive(widgets, true);
     widgets.first_scan_button.set_sensitive(false);
     widgets.next_scan_button.set_sensitive(false);
     widgets.undo_scan_button.set_sensitive(false);
@@ -741,7 +1104,7 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
     widgets.scan_progress.set_text(Some("Ready"));
     widgets
         .scan_summary
-        .set_label("Attach to a process to enable exact 4-byte scans.");
+        .set_label("Attach to a process to begin scanning memory.");
     reset_scan_pages(state, widgets);
 }
 

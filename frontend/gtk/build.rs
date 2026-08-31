@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CECORE_LIB_DIR");
     println!("cargo:rerun-if-changed=src/bridge.rs");
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.hpp");
+    println!("cargo:rerun-if-changed=../../core/value_transform.hpp");
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.cpp");
     println!("cargo:rerun-if-changed=../../core/version.hpp");
     println!("cargo:rerun-if-changed=../../core/target_profile.hpp");

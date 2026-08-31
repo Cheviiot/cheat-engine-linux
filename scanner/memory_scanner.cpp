@@ -879,7 +879,8 @@ void scanBufferBinary(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
 // so a match starting at the last owned offset completes without the next
 // window re-emitting it. When there is no overlap, pass emitLimit == bufSize.
 void scanBufferAllTypes(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
-                        size_t alignment, int64_t intVal, double floatVal,
+                        size_t alignment, int64_t intVal, int64_t intVal2,
+                        double floatVal, double floatVal2,
                         ScanCompare cmp, ScanResult& result, size_t emitLimit)
 {
     auto cmpI8  = getCompare<int8_t>(cmp);
@@ -901,29 +902,38 @@ void scanBufferAllTypes(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
         std::memcpy(w, buf + off, std::min<size_t>(8, bufSize - off));
         result.addResult(baseAddr + off, w, 8);
     };
+    // An unknown All scan is a raw 8-byte snapshot, not six duplicate records
+    // (one for every numeric interpretation) at every address.
+    if (cmp == ScanCompare::Unknown) {
+        for (size_t offset = 0;
+             offset < emitLimit && offset + 8 <= bufSize;
+             offset += alignment)
+            addAll(offset);
+        return;
+    }
     for (size_t offset = 0; offset < emitLimit; offset += alignment) {
         // Byte
         if (offset < bufSize) {
             int8_t v; std::memcpy(&v, buf + offset, 1);
-            if (cmpI8(v, (int8_t)intVal, 0))
+            if (cmpI8(v, (int8_t)intVal, (int8_t)intVal2))
                 addAll(offset);
         }
         // Int16
         if (offset + 2 <= bufSize) {
             int16_t v; std::memcpy(&v, buf + offset, 2);
-            if (cmpI16(v, (int16_t)intVal, 0))
+            if (cmpI16(v, (int16_t)intVal, (int16_t)intVal2))
                 addAll(offset);
         }
         // Int32
         if (offset + 4 <= bufSize) {
             int32_t v; std::memcpy(&v, buf + offset, 4);
-            if (cmpI32(v, (int32_t)intVal, 0))
+            if (cmpI32(v, (int32_t)intVal, (int32_t)intVal2))
                 addAll(offset);
         }
         // Int64
         if (offset + 8 <= bufSize) {
             int64_t v; std::memcpy(&v, buf + offset, 8);
-            if (cmpI64(v, intVal, 0))
+            if (cmpI64(v, intVal, intVal2))
                 addAll(offset);
         }
         // Float
@@ -937,7 +947,7 @@ void scanBufferAllTypes(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
                              (v == 0.0f) ||
                              (std::abs(v) < 1e15f && std::abs(v) > 1e-15f);
             if (!std::isnan(v) && !std::isinf(v) && plausible)
-                if (cmpF32(v, (float)floatVal, 0))
+                if (cmpF32(v, (float)floatVal, (float)floatVal2))
                     addAll(offset);
         }
         // Double
@@ -947,7 +957,7 @@ void scanBufferAllTypes(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
                              (v == 0.0) ||
                              (std::abs(v) < 1e100 && std::abs(v) > 1e-100);
             if (!std::isnan(v) && !std::isinf(v) && plausible)
-                if (cmpF64(v, floatVal, 0))
+                if (cmpF64(v, floatVal, floatVal2))
                     addAll(offset);
         }
     }
@@ -1847,9 +1857,17 @@ static bool nextScanCompare(const ScanConfig& config, size_t valueSize,
                         (config.compareType == ScanCompare::Changed ||
                          config.compareType == ScanCompare::Increased ||
                          config.compareType == ScanCompare::Decreased);
-            else if (config.compareType == ScanCompare::Exact)
-                match = stringNeedle.size() == valueSize &&
-                        std::memcmp(currentVal, stringNeedle.data(), valueSize) == 0;
+            else if (config.compareType == ScanCompare::Exact) {
+                match = stringNeedle.size() == valueSize;
+                if (match && config.caseSensitive)
+                    match = std::memcmp(currentVal, stringNeedle.data(), valueSize) == 0;
+                else if (match)
+                    for (size_t i = 0; i < valueSize; ++i)
+                        if (std::tolower(currentVal[i]) != std::tolower(stringNeedle[i])) {
+                            match = false;
+                            break;
+                        }
+            }
             else if (config.compareType == ScanCompare::Unknown)
                 match = true;
             break;
@@ -1862,9 +1880,18 @@ static bool nextScanCompare(const ScanConfig& config, size_t valueSize,
                         (config.compareType == ScanCompare::Changed ||
                          config.compareType == ScanCompare::Increased ||
                          config.compareType == ScanCompare::Decreased);
-            else if (config.compareType == ScanCompare::Exact)
-                match = unicodeNeedle.size() == valueSize &&
-                        std::memcmp(currentVal, unicodeNeedle.data(), valueSize) == 0;
+            else if (config.compareType == ScanCompare::Exact) {
+                match = unicodeNeedle.size() == valueSize;
+                if (match && config.caseSensitive)
+                    match = std::memcmp(currentVal, unicodeNeedle.data(), valueSize) == 0;
+                else if (match)
+                    for (size_t i = 0; i + 1 < valueSize; i += 2)
+                        if (std::tolower(currentVal[i]) != std::tolower(unicodeNeedle[i]) ||
+                            currentVal[i + 1] != unicodeNeedle[i + 1]) {
+                            match = false;
+                            break;
+                        }
+            }
             else if (config.compareType == ScanCompare::Unknown)
                 match = true;
             break;
@@ -1921,6 +1948,16 @@ static bool nextScanCompare(const ScanConfig& config, size_t valueSize,
                 match = std::memcmp(currentVal, compareVal, valueSize) == 0;
             else if (config.compareType == ScanCompare::Exact)
                 customEval.eval(currentVal, compareVal, valueSize, true, match);
+            break;
+        case ValueType::All:
+            if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            else if (config.compareType == ScanCompare::Changed)
+                match = std::memcmp(currentVal, oldVal, valueSize) != 0;
+            else if (config.compareType == ScanCompare::Exact ||
+                     config.compareType == ScanCompare::Unchanged ||
+                     config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, compareVal, valueSize) == 0;
             break;
         default:
             if (config.compareType == ScanCompare::SameAsFirst)
@@ -2240,21 +2277,44 @@ ScanResult MemoryScanner::firstScan(ProcessHandle& proc, const ScanConfig& confi
                     scanBufferFloating<double>(buf, bytesRead, base, config.alignment, config, res);
                 break;
             case ValueType::String:
-                scanBufferString(buf, bytesRead, base,
-                    encodeStringBytes(config.stringValue, config.stringEncoding), res,
-                    !config.caseSensitive); break;
+                if (config.compareType == ScanCompare::Unknown)
+                    scanBufferUnknown(buf, bytesRead, base, config.alignment,
+                                      config.stringValueSize(), res);
+                else
+                    scanBufferString(buf, bytesRead, base,
+                        encodeStringBytes(config.stringValue, config.stringEncoding), res,
+                        !config.caseSensitive);
+                break;
             case ValueType::UnicodeString:
-                scanBufferUnicode(buf, bytesRead, base, config.stringValue, res,
-                    !config.caseSensitive); break;
+                if (config.compareType == ScanCompare::Unknown)
+                    scanBufferUnknown(buf, bytesRead, base, config.alignment,
+                                      config.stringValue.size() * 2, res);
+                else
+                    scanBufferUnicode(buf, bytesRead, base, config.stringValue, res,
+                                      !config.caseSensitive);
+                break;
             case ValueType::ByteArray:
-                scanBufferAOB(buf, bytesRead, base, config.byteArray, config.byteArrayMask, res); break;
+                if (config.compareType == ScanCompare::Unknown)
+                    scanBufferUnknown(buf, bytesRead, base, config.alignment,
+                                      config.byteArray.size(), res);
+                else
+                    scanBufferAOB(buf, bytesRead, base, config.byteArray,
+                                  config.byteArrayMask, res);
+                break;
             case ValueType::Binary: {
-                scanBufferBinary(buf, bytesRead, base, config.byteArray, config.byteMask, config.alignment, res);
+                if (config.compareType == ScanCompare::Unknown)
+                    scanBufferUnknown(buf, bytesRead, base, config.alignment,
+                                      config.byteArray.size(), res);
+                else
+                    scanBufferBinary(buf, bytesRead, base, config.byteArray,
+                                     config.byteMask, config.alignment, res);
                 break;
             }
             case ValueType::All:
                 scanBufferAllTypes(buf, bytesRead, base, config.alignment,
-                    config.intValue, config.floatValue, config.compareType, res, emitLimit); break;
+                    config.intValue, config.intValue2, config.floatValue,
+                    config.floatValue2, config.compareType, res, emitLimit);
+                break;
             case ValueType::Grouped:
                 if (config.compareType == ScanCompare::Unknown)
                     scanBufferUnknown(buf, bytesRead, base, config.alignment, config.groupedValueSize(), res);

@@ -17,21 +17,29 @@ Completed in the foundation and first vertical slices:
   tracer diagnostics plus an actual target-memory readability probe;
 - stable, actionable errors for missing processes, restricted `/proc`, Yama/
   `CAP_SYS_PTRACE` denial, already-traced targets, and unreadable mappings;
-- asynchronous exact Int32 first/next scans backed by the existing
-  `MemoryScanner`, with progress, cancellation, one-level undo, result count,
-  write-error state, and generation-aware result paging (128-row GTK pages,
-  256-row bridge cap);
+- a validated, toolkit-neutral `ScanRequest` covering every existing value
+  type and comparison plus address range, alignment, region/protection filters,
+  integer hex mode, float rounding/tolerance/percentage options, string
+  encoding/case mode, and explicit variable-width snapshots;
+- GTK scan controls for that request, including a compact default workflow and
+  a collapsed advanced-options panel;
+- asynchronous first/next scans backed by the existing `MemoryScanner`, with
+  progress, cancellation, one-level undo, result count, type-aware value
+  formatting, write-error state, and generation-aware result paging (128-row
+  GTK pages, 256-row bridge cap);
 - deterministic bridge tests for self attach, child-process attach, failed
-  reattach state preservation, and a known value in a bounded memory range;
+  reattach state preservation, bounded Int32 paging, float ranges,
+  case-insensitive text plus Next Scan, AOB wildcards, variable-width
+  Unknown/Changed scans, and All-type ranges/snapshots;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The current pager deliberately keeps only one bounded page in GTK.  A later
 performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
-contract.  The next functional slice generalizes the request DTO beyond exact
-Int32 scans.  No product identifier should be published before the branding
-decision.
+contract.  The next functional slice extracts the toolkit-neutral address-list
+controller and then connects scan results to editable/freezeable records.  No
+product identifier should be published before the branding decision.
 
 ## Goal
 

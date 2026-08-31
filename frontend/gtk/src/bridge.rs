@@ -39,6 +39,31 @@ mod ffi {
         error_message: String,
     }
 
+    struct ScanRequest {
+        value_type: u8,
+        comparison: u8,
+        value: String,
+        value2: String,
+        hexadecimal: bool,
+        alignment: u32,
+        start_address: u64,
+        stop_address: u64,
+        writable_match: u8,
+        executable_match: u8,
+        scan_private: bool,
+        scan_image: bool,
+        scan_mapped: bool,
+        rounding_type: i32,
+        float_decimals: i32,
+        float_tolerance: f64,
+        percentage_scan: bool,
+        percentage_value: f64,
+        percentage_value2: f64,
+        case_sensitive: bool,
+        string_encoding: String,
+        value_size: u32,
+    }
+
     struct ScanHit {
         address: u64,
         value: String,
@@ -80,14 +105,9 @@ mod ffi {
         fn detach(self: Pin<&mut EngineFacade>);
         fn is_attached(self: &EngineFacade) -> bool;
         fn attached_pid(self: &EngineFacade) -> i32;
-        fn start_first_scan_i32(
-            self: Pin<&mut EngineFacade>,
-            value: i32,
-            start_address: u64,
-            stop_address: u64,
-            alignment: u32,
-        ) -> ScanStartResult;
-        fn start_next_scan_i32(self: Pin<&mut EngineFacade>, value: i32) -> ScanStartResult;
+        fn start_first_scan(self: Pin<&mut EngineFacade>, request: &ScanRequest)
+        -> ScanStartResult;
+        fn start_next_scan(self: Pin<&mut EngineFacade>, request: &ScanRequest) -> ScanStartResult;
         fn undo_scan(self: Pin<&mut EngineFacade>) -> ScanActionResult;
         fn scan_status(self: &EngineFacade) -> ScanStatus;
         fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
@@ -122,6 +142,233 @@ pub struct Session {
 pub struct AttachError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ScanValueType {
+    Byte = 0,
+    Int16 = 1,
+    Int32 = 2,
+    Int64 = 3,
+    Float = 4,
+    Double = 5,
+    String = 6,
+    UnicodeString = 7,
+    ByteArray = 8,
+    Binary = 9,
+    All = 10,
+    Pointer = 11,
+    Grouped = 12,
+    Custom = 13,
+}
+
+impl ScanValueType {
+    pub const LABELS: [&'static str; 14] = [
+        "Byte",
+        "2 Bytes",
+        "4 Bytes",
+        "8 Bytes",
+        "Float",
+        "Double",
+        "String",
+        "Unicode String",
+        "Array of byte",
+        "Binary",
+        "All",
+        "Pointer",
+        "Grouped",
+        "Custom",
+    ];
+
+    pub fn from_index(index: u32) -> Option<Self> {
+        Some(match index {
+            0 => Self::Byte,
+            1 => Self::Int16,
+            2 => Self::Int32,
+            3 => Self::Int64,
+            4 => Self::Float,
+            5 => Self::Double,
+            6 => Self::String,
+            7 => Self::UnicodeString,
+            8 => Self::ByteArray,
+            9 => Self::Binary,
+            10 => Self::All,
+            11 => Self::Pointer,
+            12 => Self::Grouped,
+            13 => Self::Custom,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ScanComparison {
+    Exact = 0,
+    Greater = 1,
+    Less = 2,
+    Between = 3,
+    Unknown = 4,
+    Changed = 5,
+    Unchanged = 6,
+    Increased = 7,
+    Decreased = 8,
+    IncreasedBy = 9,
+    DecreasedBy = 10,
+    SameAsFirst = 11,
+}
+
+impl ScanComparison {
+    pub const LABELS: [&'static str; 12] = [
+        "Exact value",
+        "Greater than",
+        "Less than",
+        "Value between",
+        "Unknown initial value",
+        "Changed value",
+        "Unchanged value",
+        "Increased value",
+        "Decreased value",
+        "Increased by",
+        "Decreased by",
+        "Same as first scan",
+    ];
+
+    pub fn from_index(index: u32) -> Option<Self> {
+        Some(match index {
+            0 => Self::Exact,
+            1 => Self::Greater,
+            2 => Self::Less,
+            3 => Self::Between,
+            4 => Self::Unknown,
+            5 => Self::Changed,
+            6 => Self::Unchanged,
+            7 => Self::Increased,
+            8 => Self::Decreased,
+            9 => Self::IncreasedBy,
+            10 => Self::DecreasedBy,
+            11 => Self::SameAsFirst,
+            _ => return None,
+        })
+    }
+
+    pub fn takes_value(self) -> bool {
+        matches!(
+            self,
+            Self::Exact
+                | Self::Greater
+                | Self::Less
+                | Self::Between
+                | Self::IncreasedBy
+                | Self::DecreasedBy
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProtectionMatch {
+    Any = 0,
+    Yes = 1,
+    No = 2,
+}
+
+impl ProtectionMatch {
+    pub const LABELS: [&'static str; 3] = ["Any", "Required", "Excluded"];
+
+    pub fn from_index(index: u32) -> Option<Self> {
+        Some(match index {
+            0 => Self::Any,
+            1 => Self::Yes,
+            2 => Self::No,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanRequest {
+    pub value_type: ScanValueType,
+    pub comparison: ScanComparison,
+    pub value: String,
+    pub value2: String,
+    pub hexadecimal: bool,
+    pub alignment: u32,
+    pub start_address: u64,
+    pub stop_address: u64,
+    pub writable_match: ProtectionMatch,
+    pub executable_match: ProtectionMatch,
+    pub scan_private: bool,
+    pub scan_image: bool,
+    pub scan_mapped: bool,
+    pub rounding_type: i32,
+    pub float_decimals: i32,
+    pub float_tolerance: f64,
+    pub percentage_scan: bool,
+    pub percentage_value: f64,
+    pub percentage_value2: f64,
+    pub case_sensitive: bool,
+    pub string_encoding: String,
+    pub value_size: u32,
+}
+
+impl Default for ScanRequest {
+    fn default() -> Self {
+        Self {
+            value_type: ScanValueType::Int32,
+            comparison: ScanComparison::Exact,
+            value: String::new(),
+            value2: String::new(),
+            hexadecimal: false,
+            alignment: 4,
+            start_address: 0,
+            stop_address: 0x0000_7fff_ffff_ffff,
+            writable_match: ProtectionMatch::Any,
+            executable_match: ProtectionMatch::Any,
+            scan_private: true,
+            scan_image: true,
+            scan_mapped: true,
+            rounding_type: 0,
+            float_decimals: -1,
+            float_tolerance: 0.0,
+            percentage_scan: false,
+            percentage_value: 0.0,
+            percentage_value2: 0.0,
+            case_sensitive: true,
+            string_encoding: "UTF-8".to_owned(),
+            value_size: 0,
+        }
+    }
+}
+
+impl ScanRequest {
+    fn to_ffi(&self) -> ffi::ScanRequest {
+        ffi::ScanRequest {
+            value_type: self.value_type as u8,
+            comparison: self.comparison as u8,
+            value: self.value.clone(),
+            value2: self.value2.clone(),
+            hexadecimal: self.hexadecimal,
+            alignment: self.alignment,
+            start_address: self.start_address,
+            stop_address: self.stop_address,
+            writable_match: self.writable_match as u8,
+            executable_match: self.executable_match as u8,
+            scan_private: self.scan_private,
+            scan_image: self.scan_image,
+            scan_mapped: self.scan_mapped,
+            rounding_type: self.rounding_type,
+            float_decimals: self.float_decimals,
+            float_tolerance: self.float_tolerance,
+            percentage_scan: self.percentage_scan,
+            percentage_value: self.percentage_value,
+            percentage_value2: self.percentage_value2,
+            case_sensitive: self.case_sensitive,
+            string_encoding: self.string_encoding.clone(),
+            value_size: self.value_size,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,19 +479,9 @@ impl Engine {
         self.inner.attached_pid()
     }
 
-    pub fn start_first_scan_i32(
-        &mut self,
-        value: i32,
-        start_address: u64,
-        stop_address: u64,
-        alignment: u32,
-    ) -> Result<(), AttachError> {
-        let result = self.inner.pin_mut().start_first_scan_i32(
-            value,
-            start_address,
-            stop_address,
-            alignment,
-        );
+    pub fn start_first_scan(&mut self, request: &ScanRequest) -> Result<(), AttachError> {
+        let request = request.to_ffi();
+        let result = self.inner.pin_mut().start_first_scan(&request);
         if result.accepted {
             Ok(())
         } else {
@@ -273,8 +510,9 @@ impl Engine {
         }
     }
 
-    pub fn start_next_scan_i32(&mut self, value: i32) -> Result<(), AttachError> {
-        let result = self.inner.pin_mut().start_next_scan_i32(value);
+    pub fn start_next_scan(&mut self, request: &ScanRequest) -> Result<(), AttachError> {
+        let request = request.to_ffi();
+        let result = self.inner.pin_mut().start_next_scan(&request);
         if result.accepted {
             Ok(())
         } else {
@@ -336,7 +574,27 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::Engine;
+    use super::{Engine, ScanComparison, ScanRequest, ScanStatus, ScanValueType};
+
+    fn wait_for_scan(engine: &Engine) -> ScanStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = engine.scan_status();
+            if !status.running {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "scan timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn attached_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .attach(std::process::id() as i32, "scan fixture")
+            .expect("attach to self");
+        engine
+    }
 
     #[test]
     fn reads_version_from_libcecore() {
@@ -413,19 +671,18 @@ mod tests {
             .attach(std::process::id() as i32, "scan fixture")
             .expect("attach to self");
 
+        let request = ScanRequest {
+            value: sentinel.to_string(),
+            start_address: address,
+            stop_address: address + byte_len,
+            alignment: 4,
+            ..ScanRequest::default()
+        };
         engine
-            .start_first_scan_i32(sentinel, address, address + byte_len, 4)
+            .start_first_scan(&request)
             .expect("start bounded first scan");
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            let status = engine.scan_status();
-            if !status.running {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "scan timed out");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let status = wait_for_scan(&engine);
         assert!(status.completed, "scan failed: {}", status.error_message);
         assert_eq!(status.result_count, 300);
 
@@ -444,17 +701,9 @@ mod tests {
         }
         let first_generation = status.generation;
         engine
-            .start_next_scan_i32(sentinel)
+            .start_next_scan(&request)
             .expect("start exact next scan");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let next_status = loop {
-            let status = engine.scan_status();
-            if !status.running {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "next scan timed out");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let next_status = wait_for_scan(&engine);
         assert!(next_status.completed);
         assert_eq!(next_status.result_count, 200);
         assert!(next_status.undo_available);
@@ -474,10 +723,222 @@ mod tests {
     }
 
     #[test]
+    fn scans_float_ranges_through_generic_request() {
+        let values = vec![2.0_f32, 2.5, 3.0, 3.5, 4.0].into_boxed_slice();
+        let address = values.as_ptr() as u64;
+        let mut engine = attached_engine();
+        let request = ScanRequest {
+            value_type: ScanValueType::Float,
+            comparison: ScanComparison::Between,
+            value: "2.5".to_owned(),
+            value2: "3.5".to_owned(),
+            start_address: address,
+            stop_address: address + std::mem::size_of_val(&*values) as u64,
+            alignment: 4,
+            ..ScanRequest::default()
+        };
+
+        engine.start_first_scan(&request).expect("start float scan");
+        let status = wait_for_scan(&engine);
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 3);
+        let page = engine.scan_rows(status.generation, 0, 10);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>(),
+            ["2.5", "3", "3.5"]
+        );
+        std::hint::black_box(&values);
+    }
+
+    #[test]
+    fn scans_case_insensitive_text_and_narrows_exact_matches() {
+        let mut bytes = b"RustBridge--RUSTBRIDGE".to_vec().into_boxed_slice();
+        let address = bytes.as_ptr() as u64;
+        let mut engine = attached_engine();
+        let request = ScanRequest {
+            value_type: ScanValueType::String,
+            value: "rustbridge".to_owned(),
+            case_sensitive: false,
+            start_address: address,
+            stop_address: address + bytes.len() as u64,
+            alignment: 1,
+            ..ScanRequest::default()
+        };
+
+        engine.start_first_scan(&request).expect("start text scan");
+        let first = wait_for_scan(&engine);
+        assert!(first.completed, "scan failed: {}", first.error_message);
+        assert_eq!(first.result_count, 2);
+
+        bytes[0] = b'X';
+        engine
+            .start_next_scan(&request)
+            .expect("start text next scan");
+        let next = wait_for_scan(&engine);
+        assert!(next.completed, "scan failed: {}", next.error_message);
+        assert_eq!(next.result_count, 1);
+        let page = engine.scan_rows(next.generation, 0, 10);
+        assert_eq!(page.rows[0].address, address + 12);
+        assert_eq!(page.rows[0].value, "RUSTBRIDGE");
+        std::hint::black_box(&bytes);
+    }
+
+    #[test]
+    fn scans_aob_wildcards_and_unknown_width_changes() {
+        let pattern_bytes = [0x7f_u8, 0x45, 0x91, 0x46, 0, 0x7f, 0x45, 0xa2, 0x46];
+        let address = pattern_bytes.as_ptr() as u64;
+        let mut engine = attached_engine();
+        let request = ScanRequest {
+            value_type: ScanValueType::ByteArray,
+            value: "7F 45 ?? 46".to_owned(),
+            start_address: address,
+            stop_address: address + pattern_bytes.len() as u64,
+            alignment: 1,
+            ..ScanRequest::default()
+        };
+
+        engine.start_first_scan(&request).expect("start AOB scan");
+        let status = wait_for_scan(&engine);
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 2);
+        let page = engine.scan_rows(status.generation, 0, 10);
+        assert_eq!(page.rows[0].value, "7F 45 91 46");
+        assert_eq!(page.rows[1].value, "7F 45 A2 46");
+
+        let mut unknown_bytes = vec![0x11_u8; 12].into_boxed_slice();
+        let unknown_address = unknown_bytes.as_ptr() as u64;
+        let unknown = ScanRequest {
+            value_type: ScanValueType::ByteArray,
+            comparison: ScanComparison::Unknown,
+            value_size: 4,
+            start_address: unknown_address,
+            stop_address: unknown_address + unknown_bytes.len() as u64,
+            alignment: 1,
+            ..ScanRequest::default()
+        };
+        engine
+            .start_first_scan(&unknown)
+            .expect("start unknown AOB scan");
+        let first = wait_for_scan(&engine);
+        assert_eq!(first.result_count, 9);
+
+        unknown_bytes[5] = 0x22;
+        let changed = ScanRequest {
+            comparison: ScanComparison::Changed,
+            ..unknown
+        };
+        engine
+            .start_next_scan(&changed)
+            .expect("start changed AOB scan");
+        let next = wait_for_scan(&engine);
+        assert!(next.completed, "scan failed: {}", next.error_message);
+        assert_eq!(next.result_count, 4);
+        std::hint::black_box((&pattern_bytes, &unknown_bytes));
+    }
+
+    #[test]
+    fn all_type_between_uses_both_bounds_and_unknown_is_one_snapshot_per_address() {
+        let values = [10_i64, 20_i64];
+        let address = values.as_ptr() as u64;
+        let mut engine = attached_engine();
+        let between = ScanRequest {
+            value_type: ScanValueType::All,
+            comparison: ScanComparison::Between,
+            value: "09".to_owned(),
+            value2: "0B".to_owned(),
+            hexadecimal: true,
+            start_address: address,
+            stop_address: address + std::mem::size_of_val(&values) as u64,
+            alignment: 8,
+            ..ScanRequest::default()
+        };
+
+        engine.start_first_scan(&between).expect("start All scan");
+        let status = wait_for_scan(&engine);
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 4);
+        assert!(
+            engine
+                .scan_rows(status.generation, 0, 10)
+                .rows
+                .iter()
+                .all(|row| row.address == address)
+        );
+
+        let snapshots = ScanRequest {
+            comparison: ScanComparison::Unknown,
+            value: String::new(),
+            value2: String::new(),
+            ..between
+        };
+        engine
+            .start_first_scan(&snapshots)
+            .expect("start unknown All scan");
+        let status = wait_for_scan(&engine);
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 2);
+        std::hint::black_box(&values);
+    }
+
+    #[test]
+    fn rejects_non_finite_float_requests() {
+        let mut engine = attached_engine();
+        let value = 1.0_f32;
+        let address = (&value as *const f32) as u64;
+        let error = engine
+            .start_first_scan(&ScanRequest {
+                value_type: ScanValueType::Float,
+                value: "NaN".to_owned(),
+                start_address: address,
+                stop_address: address + 4,
+                ..ScanRequest::default()
+            })
+            .expect_err("non-finite values must be rejected");
+        assert_eq!(error.code, "invalid_float");
+        std::hint::black_box(value);
+    }
+
+    #[test]
+    fn unknown_text_rows_replace_invalid_utf8() {
+        let bytes = [0xff_u8, 0xfe];
+        let address = bytes.as_ptr() as u64;
+        let mut engine = attached_engine();
+        engine
+            .start_first_scan(&ScanRequest {
+                value_type: ScanValueType::String,
+                comparison: ScanComparison::Unknown,
+                value_size: 2,
+                start_address: address,
+                stop_address: address + bytes.len() as u64,
+                alignment: 1,
+                ..ScanRequest::default()
+            })
+            .expect("start unknown text scan");
+        let status = wait_for_scan(&engine);
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 1);
+        assert_eq!(
+            engine.scan_rows(status.generation, 0, 1).rows[0].value,
+            "\u{fffd}\u{fffd}"
+        );
+        std::hint::black_box(&bytes);
+    }
+
+    #[test]
     fn first_scan_requires_attached_session() {
         let mut engine = Engine::new();
+        let request = ScanRequest {
+            value: "42".to_owned(),
+            start_address: 0,
+            stop_address: 4,
+            alignment: 1,
+            ..ScanRequest::default()
+        };
         let error = engine
-            .start_first_scan_i32(42, 0, 4, 1)
+            .start_first_scan(&request)
             .expect_err("scan without session must fail");
         assert_eq!(error.code, "no_session");
     }
@@ -489,7 +950,10 @@ mod tests {
             .attach(std::process::id() as i32, "scan fixture")
             .expect("attach to self");
         let error = engine
-            .start_next_scan_i32(42)
+            .start_next_scan(&ScanRequest {
+                value: "42".to_owned(),
+                ..ScanRequest::default()
+            })
             .expect_err("next scan without first result must fail");
         assert_eq!(error.code, "no_scan_result");
     }
