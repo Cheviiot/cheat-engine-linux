@@ -275,6 +275,7 @@ ScanStartResult EngineFacade::start_first_scan_i32(std::int32_t value,
     {
         std::lock_guard lock(scan_mutex_);
         scan_result_.reset();
+        undo_scan_result_.reset();
         scan_error_.clear();
         scan_generation_.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -298,15 +299,18 @@ ScanStartResult EngineFacade::start_first_scan_i32(std::int32_t value,
         try {
             auto result = std::make_unique<ce::ScanResult>(scanner_->firstScan(*target, config));
             std::lock_guard lock(scan_mutex_);
-            scan_result_ = std::move(result);
+            if (!scan_cancel_requested_.load(std::memory_order_acquire))
+                scan_result_ = std::move(result);
+            scan_running_.store(false, std::memory_order_release);
         } catch (const std::exception& error) {
             std::lock_guard lock(scan_mutex_);
             scan_error_ = error.what();
+            scan_running_.store(false, std::memory_order_release);
         } catch (...) {
             std::lock_guard lock(scan_mutex_);
             scan_error_ = "Unknown scanner failure.";
+            scan_running_.store(false, std::memory_order_release);
         }
-        scan_running_.store(false, std::memory_order_release);
     });
 
     // firstScan() resets its reusable cancellation flag on entry. Do not return
@@ -315,6 +319,108 @@ ScanStartResult EngineFacade::start_first_scan_i32(std::int32_t value,
     while (scan_running_.load(std::memory_order_acquire) && !scanner_->running())
         std::this_thread::yield();
 
+    response.accepted = true;
+    return response;
+}
+
+ScanStartResult EngineFacade::start_next_scan_i32(std::int32_t value) {
+    ScanStartResult response;
+    response.accepted = false;
+    response.error_code = "";
+    response.error_message = "";
+
+    if (!process_) {
+        response.error_code = "no_session";
+        response.error_message = "Attach to a process before scanning.";
+        return response;
+    }
+    if (scan_running_.load(std::memory_order_acquire)) {
+        response.error_code = "scan_in_progress";
+        response.error_message = "A memory scan is already running.";
+        return response;
+    }
+    join_scan_worker();
+
+    ce::ScanResult* previous = nullptr;
+    {
+        std::lock_guard lock(scan_mutex_);
+        if (!scan_result_) {
+            response.error_code = "no_scan_result";
+            response.error_message = "Run a First Scan before a Next Scan.";
+            return response;
+        }
+        previous = scan_result_.get();
+        scan_error_.clear();
+        scan_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    scanner_ = std::make_unique<ce::MemoryScanner>();
+    scan_cancel_requested_.store(false, std::memory_order_release);
+    scan_started_.store(true, std::memory_order_release);
+    scan_running_.store(true, std::memory_order_release);
+
+    ce::ScanConfig config;
+    config.valueType = ce::ValueType::Int32;
+    config.compareType = ce::ScanCompare::Exact;
+    config.intValue = value;
+    config.alignment = 4;
+
+    auto* const target = process_.get();
+    scan_worker_ = std::thread([this, target, previous, config = std::move(config)] {
+        try {
+            auto result = std::make_unique<ce::ScanResult>(
+                scanner_->nextScan(*target, config, *previous));
+            std::lock_guard lock(scan_mutex_);
+            if (!scan_cancel_requested_.load(std::memory_order_acquire)) {
+                undo_scan_result_ = std::move(scan_result_);
+                scan_result_ = std::move(result);
+            }
+            scan_running_.store(false, std::memory_order_release);
+        } catch (const std::exception& error) {
+            std::lock_guard lock(scan_mutex_);
+            scan_error_ = error.what();
+            scan_running_.store(false, std::memory_order_release);
+        } catch (...) {
+            std::lock_guard lock(scan_mutex_);
+            scan_error_ = "Unknown scanner failure.";
+            scan_running_.store(false, std::memory_order_release);
+        }
+    });
+
+    while (scan_running_.load(std::memory_order_acquire) && !scanner_->running())
+        std::this_thread::yield();
+
+    response.accepted = true;
+    return response;
+}
+
+ScanActionResult EngineFacade::undo_scan() {
+    ScanActionResult response;
+    response.accepted = false;
+    response.generation = scan_generation_.load(std::memory_order_acquire);
+    response.result_count = 0;
+    response.undo_available = false;
+    response.error_code = "";
+    response.error_message = "";
+
+    if (scan_running_.load(std::memory_order_acquire)) {
+        response.error_code = "scan_in_progress";
+        response.error_message = "Cancel or finish the current scan before undoing it.";
+        return response;
+    }
+    join_scan_worker();
+
+    std::lock_guard lock(scan_mutex_);
+    if (!undo_scan_result_) {
+        response.error_code = "nothing_to_undo";
+        response.error_message = "There is no previous scan result to restore.";
+        return response;
+    }
+    std::swap(scan_result_, undo_scan_result_);
+    scan_error_.clear();
+    response.generation = scan_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    response.result_count = static_cast<std::uint64_t>(scan_result_->count());
+    response.undo_available = undo_scan_result_ != nullptr;
     response.accepted = true;
     return response;
 }
@@ -330,6 +436,8 @@ ScanStatus EngineFacade::scan_status() const {
     status.progress = scanner_ ? scanner_->progress() : 0.0f;
     status.result_count = 0;
     status.write_error = false;
+    status.result_available = false;
+    status.undo_available = false;
     status.error_message = "";
 
     std::lock_guard lock(scan_mutex_);
@@ -337,6 +445,8 @@ ScanStatus EngineFacade::scan_status() const {
     status.cancelled = status.started && !status.running && status.cancel_requested;
     status.completed = status.started && !status.running && !status.cancelled &&
                        scan_error_.empty() && scan_result_ != nullptr;
+    status.result_available = scan_result_ != nullptr;
+    status.undo_available = undo_scan_result_ != nullptr;
     if (scan_result_) {
         status.result_count = static_cast<std::uint64_t>(scan_result_->count());
         status.write_error = scan_result_->hasWriteError();
@@ -387,6 +497,7 @@ ScanPage EngineFacade::scan_rows(std::uint64_t generation, std::uint64_t start,
 }
 
 void EngineFacade::cancel_scan() noexcept {
+    std::lock_guard lock(scan_mutex_);
     if (!scan_running_.load(std::memory_order_acquire) || !scanner_) return;
     scan_cancel_requested_.store(true, std::memory_order_release);
     scanner_->cancel();
@@ -399,6 +510,7 @@ void EngineFacade::join_scan_worker() noexcept {
 void EngineFacade::clear_scan_state() noexcept {
     std::lock_guard lock(scan_mutex_);
     scan_result_.reset();
+    undo_scan_result_.reset();
     scanner_.reset();
     scan_error_.clear();
     scan_started_.store(false, std::memory_order_release);

@@ -30,6 +30,15 @@ mod ffi {
         error_message: String,
     }
 
+    struct ScanActionResult {
+        accepted: bool,
+        generation: u64,
+        result_count: u64,
+        undo_available: bool,
+        error_code: String,
+        error_message: String,
+    }
+
     struct ScanHit {
         address: u64,
         value: String,
@@ -45,6 +54,8 @@ mod ffi {
         progress: f32,
         result_count: u64,
         write_error: bool,
+        result_available: bool,
+        undo_available: bool,
         error_message: String,
     }
 
@@ -76,6 +87,8 @@ mod ffi {
             stop_address: u64,
             alignment: u32,
         ) -> ScanStartResult;
+        fn start_next_scan_i32(self: Pin<&mut EngineFacade>, value: i32) -> ScanStartResult;
+        fn undo_scan(self: Pin<&mut EngineFacade>) -> ScanActionResult;
         fn scan_status(self: &EngineFacade) -> ScanStatus;
         fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
@@ -128,7 +141,16 @@ pub struct ScanStatus {
     pub progress: f32,
     pub result_count: u64,
     pub write_error: bool,
+    pub result_available: bool,
+    pub undo_available: bool,
     pub error_message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanAction {
+    pub generation: u64,
+    pub result_count: u64,
+    pub undo_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,7 +267,37 @@ impl Engine {
             progress: status.progress,
             result_count: status.result_count,
             write_error: status.write_error,
+            result_available: status.result_available,
+            undo_available: status.undo_available,
             error_message: status.error_message,
+        }
+    }
+
+    pub fn start_next_scan_i32(&mut self, value: i32) -> Result<(), AttachError> {
+        let result = self.inner.pin_mut().start_next_scan_i32(value);
+        if result.accepted {
+            Ok(())
+        } else {
+            Err(AttachError {
+                code: result.error_code,
+                message: result.error_message,
+            })
+        }
+    }
+
+    pub fn undo_scan(&mut self) -> Result<ScanAction, AttachError> {
+        let result = self.inner.pin_mut().undo_scan();
+        if result.accepted {
+            Ok(ScanAction {
+                generation: result.generation,
+                result_count: result.result_count,
+                undo_available: result.undo_available,
+            })
+        } else {
+            Err(AttachError {
+                code: result.error_code,
+                message: result.error_message,
+            })
         }
     }
 
@@ -353,7 +405,7 @@ mod tests {
     #[test]
     fn first_scan_pages_known_values_and_rejects_stale_generation() {
         let sentinel = 0x0123_4567_i32;
-        let values = vec![sentinel; 300].into_boxed_slice();
+        let mut values = vec![sentinel; 300].into_boxed_slice();
         let address = values.as_ptr() as u64;
         let byte_len = std::mem::size_of_val(&*values) as u64;
         let mut engine = Engine::new();
@@ -387,8 +439,38 @@ mod tests {
         assert_eq!(second_page.rows.len(), 44);
         assert_eq!(second_page.total_count, 300);
 
+        for value in values.iter_mut().take(100) {
+            *value = -1;
+        }
+        let first_generation = status.generation;
+        engine
+            .start_next_scan_i32(sentinel)
+            .expect("start exact next scan");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let next_status = loop {
+            let status = engine.scan_status();
+            if !status.running {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "next scan timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(next_status.completed);
+        assert_eq!(next_status.result_count, 200);
+        assert!(next_status.undo_available);
+        assert_ne!(next_status.generation, first_generation);
+        assert!(engine.scan_rows(first_generation, 0, 1).stale);
+
+        let action = engine.undo_scan().expect("undo next scan");
+        assert_eq!(action.result_count, 300);
+        assert!(action.undo_available);
+        assert!(engine.scan_rows(next_status.generation, 0, 1).stale);
+        let restored = engine.scan_rows(action.generation, 0, 256);
+        assert_eq!(restored.total_count, 300);
+        assert_eq!(restored.rows.len(), 256);
+
         engine.detach();
-        assert!(engine.scan_rows(status.generation, 0, 1).stale);
+        assert!(engine.scan_rows(action.generation, 0, 1).stale);
     }
 
     #[test]
@@ -398,5 +480,17 @@ mod tests {
             .start_first_scan_i32(42, 0, 4, 1)
             .expect_err("scan without session must fail");
         assert_eq!(error.code, "no_session");
+    }
+
+    #[test]
+    fn next_scan_requires_previous_result() {
+        let mut engine = Engine::new();
+        engine
+            .attach(std::process::id() as i32, "scan fixture")
+            .expect("attach to self");
+        let error = engine
+            .start_next_scan_i32(42)
+            .expect_err("next scan without first result must fail");
+        assert_eq!(error.code, "no_scan_result");
     }
 }

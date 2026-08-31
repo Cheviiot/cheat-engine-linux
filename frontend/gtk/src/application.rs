@@ -31,6 +31,8 @@ struct SessionWidgets {
     session_button: gtk::Button,
     scan_value: gtk::Entry,
     first_scan_button: gtk::Button,
+    next_scan_button: gtk::Button,
+    undo_scan_button: gtk::Button,
     cancel_scan_button: gtk::Button,
     scan_progress: gtk::ProgressBar,
     scan_summary: gtk::Label,
@@ -38,6 +40,12 @@ struct SessionWidgets {
     previous_page_button: gtk::Button,
     next_page_button: gtk::Button,
     page_label: gtk::Label,
+}
+
+#[derive(Clone, Copy)]
+enum ScanKind {
+    First,
+    Next,
 }
 
 pub fn build_application() -> adw::Application {
@@ -131,6 +139,14 @@ fn build_window(application: &adw::Application) {
         .css_classes(["suggested-action"])
         .sensitive(false)
         .build();
+    let next_scan_button = gtk::Button::builder()
+        .label("Next Scan")
+        .sensitive(false)
+        .build();
+    let undo_scan_button = gtk::Button::builder()
+        .label("Undo")
+        .sensitive(false)
+        .build();
     let cancel_scan_button = gtk::Button::builder()
         .label("Cancel")
         .sensitive(false)
@@ -142,6 +158,8 @@ fn build_window(application: &adw::Application) {
         .build();
     scan_actions.append(&scan_value);
     scan_actions.append(&first_scan_button);
+    scan_actions.append(&next_scan_button);
+    scan_actions.append(&undo_scan_button);
     scan_actions.append(&cancel_scan_button);
 
     let scan_progress = gtk::ProgressBar::builder().show_text(true).build();
@@ -234,6 +252,8 @@ fn build_window(application: &adw::Application) {
         session_button,
         scan_value,
         first_scan_button,
+        next_scan_button,
+        undo_scan_button,
         cancel_scan_button,
         scan_progress,
         scan_summary,
@@ -282,7 +302,21 @@ fn build_window(application: &adw::Application) {
         let window = window.clone();
         let state = state.clone();
         let widgets = widgets.clone();
-        move |_| start_first_scan(&window, &state, &widgets)
+        move |_| start_scan(&window, &state, &widgets, ScanKind::First)
+    });
+
+    widgets.next_scan_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| start_scan(&window, &state, &widgets, ScanKind::Next)
+    });
+
+    widgets.undo_scan_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| undo_scan(&window, &state, &widgets)
     });
 
     widgets.cancel_scan_button.connect_clicked({
@@ -339,6 +373,8 @@ fn start_attach(window: &adw::ApplicationWindow, state: &SessionState, widgets: 
     widgets.session_button.set_sensitive(false);
     widgets.session_button.set_label("Attaching…");
     widgets.first_scan_button.set_sensitive(false);
+    widgets.next_scan_button.set_sensitive(false);
+    widgets.undo_scan_button.set_sensitive(false);
     widgets
         .session_details
         .set_label("Checking target architecture and memory access…");
@@ -400,6 +436,8 @@ fn show_attached(state: &SessionState, widgets: &SessionWidgets, session: &Sessi
     widgets.session_button.set_label("Detach");
     widgets.session_button.set_sensitive(true);
     widgets.first_scan_button.set_sensitive(true);
+    widgets.next_scan_button.set_sensitive(false);
+    widgets.undo_scan_button.set_sensitive(false);
     widgets
         .scan_summary
         .set_label("Enter a signed 32-bit value for an exact scan.");
@@ -419,6 +457,8 @@ fn show_attach_error(
         .session_button
         .set_sensitive(state.selected.borrow().is_some());
     widgets.first_scan_button.set_sensitive(false);
+    widgets.next_scan_button.set_sensitive(false);
+    widgets.undo_scan_button.set_sensitive(false);
 
     let dialog = adw::AlertDialog::builder()
         .heading("Could not attach to process")
@@ -454,10 +494,11 @@ fn session_description(session: &Session) -> String {
     lines.join("\n")
 }
 
-fn start_first_scan(
+fn start_scan(
     window: &adw::ApplicationWindow,
     state: &SessionState,
     widgets: &SessionWidgets,
+    kind: ScanKind,
 ) {
     let value_text = widgets.scan_value.text();
     let Some(value) = parse_i32(&value_text) else {
@@ -469,12 +510,16 @@ fn start_first_scan(
         return;
     };
 
-    let start_result = state
-        .engine
-        .borrow_mut()
-        .as_mut()
-        .expect("engine is present outside attach worker")
-        .start_first_scan_i32(value, 0, 0x0000_7fff_ffff_ffff, 4);
+    let start_result = {
+        let mut engine_slot = state.engine.borrow_mut();
+        let engine = engine_slot
+            .as_mut()
+            .expect("engine is present outside attach worker");
+        match kind {
+            ScanKind::First => engine.start_first_scan_i32(value, 0, 0x0000_7fff_ffff_ffff, 4),
+            ScanKind::Next => engine.start_next_scan_i32(value),
+        }
+    };
     if let Err(error) = start_result {
         show_message(window, "Could not start scan", &error.message);
         return;
@@ -485,10 +530,15 @@ fn start_first_scan(
     widgets.session_button.set_sensitive(false);
     widgets.scan_value.set_sensitive(false);
     widgets.first_scan_button.set_sensitive(false);
+    widgets.next_scan_button.set_sensitive(false);
+    widgets.undo_scan_button.set_sensitive(false);
     widgets.cancel_scan_button.set_sensitive(true);
     widgets.scan_progress.set_fraction(0.0);
     widgets.scan_progress.set_text(Some("Scanning… 0%"));
-    widgets.scan_summary.set_label("Reading target memory…");
+    widgets.scan_summary.set_label(match kind {
+        ScanKind::First => "Reading target memory…",
+        ScanKind::Next => "Narrowing the current result set…",
+    });
     reset_scan_pages(state, widgets);
 
     let window = window.clone();
@@ -524,14 +574,26 @@ fn start_first_scan(
         widgets.session_button.set_sensitive(true);
         widgets.scan_value.set_sensitive(true);
         widgets.first_scan_button.set_sensitive(true);
+        widgets
+            .next_scan_button
+            .set_sensitive(status.result_available);
+        widgets
+            .undo_scan_button
+            .set_sensitive(status.undo_available);
         widgets.cancel_scan_button.set_sensitive(false);
 
         if status.cancelled {
             widgets.scan_progress.set_text(Some("Cancelled"));
-            widgets.scan_summary.set_label("The scan was cancelled.");
+            widgets.scan_summary.set_label(if status.result_available {
+                "The scan was cancelled; the previous results were preserved."
+            } else {
+                "The scan was cancelled."
+            });
+            restore_available_result(&state, &widgets, &status);
         } else if !status.error_message.is_empty() {
             widgets.scan_progress.set_text(Some("Failed"));
             widgets.scan_summary.set_label(&status.error_message);
+            restore_available_result(&state, &widgets, &status);
             show_message(&window, "Scan failed", &status.error_message);
         } else if status.completed {
             widgets.scan_progress.set_fraction(1.0);
@@ -550,6 +612,41 @@ fn start_first_scan(
         }
         adw::glib::ControlFlow::Break
     });
+}
+
+fn restore_available_result(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    status: &crate::bridge::ScanStatus,
+) {
+    if status.result_available {
+        state.scan_generation.set(status.generation);
+        load_scan_page(state, widgets, 0);
+    }
+}
+
+fn undo_scan(window: &adw::ApplicationWindow, state: &SessionState, widgets: &SessionWidgets) {
+    let result = state
+        .engine
+        .borrow_mut()
+        .as_mut()
+        .expect("engine is present outside attach worker")
+        .undo_scan();
+    match result {
+        Ok(action) => {
+            state.scan_generation.set(action.generation);
+            widgets.scan_summary.set_label(&format!(
+                "Restored the previous scan with {} addresses.",
+                action.result_count
+            ));
+            widgets.next_scan_button.set_sensitive(true);
+            widgets
+                .undo_scan_button
+                .set_sensitive(action.undo_available);
+            load_scan_page(state, widgets, 0);
+        }
+        Err(error) => show_message(window, "Could not undo scan", &error.message),
+    }
 }
 
 fn parse_i32(text: &str) -> Option<i32> {
@@ -637,6 +734,8 @@ fn reset_scan_ui(state: &SessionState, widgets: &SessionWidgets) {
     state.scanning.set(false);
     widgets.scan_value.set_sensitive(true);
     widgets.first_scan_button.set_sensitive(false);
+    widgets.next_scan_button.set_sensitive(false);
+    widgets.undo_scan_button.set_sensitive(false);
     widgets.cancel_scan_button.set_sensitive(false);
     widgets.scan_progress.set_fraction(0.0);
     widgets.scan_progress.set_text(Some("Ready"));

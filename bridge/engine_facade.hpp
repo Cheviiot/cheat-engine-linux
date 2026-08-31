@@ -20,6 +20,7 @@ namespace ce::bridge {
 struct ProcessRow;
 struct AttachResult;
 struct ScanStartResult;
+struct ScanActionResult;
 struct ScanStatus;
 struct ScanPage;
 
@@ -40,6 +41,8 @@ public:
     std::int32_t attached_pid() const noexcept;
     ScanStartResult start_first_scan_i32(std::int32_t value, std::uint64_t start_address,
                                          std::uint64_t stop_address, std::uint32_t alignment);
+    ScanStartResult start_next_scan_i32(std::int32_t value);
+    ScanActionResult undo_scan();
     ScanStatus scan_status() const;
     ScanPage scan_rows(std::uint64_t generation, std::uint64_t start,
                        std::uint32_t limit) const;
@@ -52,6 +55,7 @@ private:
     std::unique_ptr<ce::ProcessHandle> process_;
     std::unique_ptr<ce::MemoryScanner> scanner_;
     std::unique_ptr<ce::ScanResult> scan_result_;
+    std::unique_ptr<ce::ScanResult> undo_scan_result_;
     std::thread scan_worker_;
     mutable std::mutex scan_mutex_;
     std::string scan_error_;
