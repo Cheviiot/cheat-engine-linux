@@ -1455,6 +1455,38 @@ static void test_lua_timers() {
     printf("  object_destroy stops + frees the timer: %s\n", afterDestroy == after ? "OK" : "FAILED");
 }
 
+static void test_lua_bounded_execution_and_callback_lifetime() {
+    printf("\n── Test: bounded Lua execution + address-list callback lifetime ──\n");
+    LuaEngine bounded;
+    const bool normal = bounded.executeBounded("bounded_value = 7", 1000).empty();
+    const auto loopError = bounded.executeBounded(
+        "if debug and debug.sethook then debug.sethook() end; while true do end",
+        20000);
+    const bool loopStopped = loopError.find("instruction limit") != std::string::npos;
+
+    SimpleAddressList list;
+    const int record = list.createEntry(0x1000, ValueType::Int32, "Callback owner");
+    int callbackOutput = 0;
+    {
+        LuaEngine owner;
+        owner.setAddressList(&list);
+        owner.setOutputCallback([&callbackOutput](const std::string&) {
+            ++callbackOutput;
+        });
+        const auto registered = owner.execute(R"(
+            local mr = getAddressList():getMemoryRecord(0)
+            mr.OnActivate = function(_) print('activation') end
+        )");
+        list.setActive(record, true);
+        if (!registered.empty()) callbackOutput = -100;
+    }
+    list.setActive(record, false);
+    const bool callbackDetached = callbackOutput == 1;
+    printf("  normal=%d infinite-loop-stopped=%d callback-detached=%d: %s\n",
+           normal, loopStopped, callbackDetached,
+           normal && loopStopped && callbackDetached ? "OK" : "FAILED");
+}
+
 // The diagnostic logging facility: level parsing, per-category gating, Off.
 static void test_logging() {
     printf("\n── Test: diagnostic logging (ce::log) ──\n");
@@ -11124,6 +11156,7 @@ int main(int argc, char* argv[]) {
     test_simple_hook();
     test_lua_stringlist();
     test_lua_timers();
+    test_lua_bounded_execution_and_callback_lifetime();
     test_logging();
     test_ce_table_import();
     test_pointer_path_expression();

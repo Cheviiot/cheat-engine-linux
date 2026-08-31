@@ -74,20 +74,28 @@ Completed in the foundation and first vertical slices:
   stable record IDs and byte counts, and opened through explicit summary/text
   pages (256-item core/bridge cap, 64-item GTK page, 64 KiB text cap); review
   text is UTF-8-sanitized and viewing it neither executes code nor grants trust;
+- an independent, table-scoped Lua consent path: Lua never runs on import,
+  review, or trust alone; each selected table/record payload needs a destructive
+  Run confirmation, is reconstructed only up to a 1 MiB execution cap, runs
+  with a 2-million VM-instruction ceiling, and returns at most 64 KiB of
+  UTF-8-sanitized print output; revocation recreates the Lua state and detaches
+  its address-list callbacks, while the UI explicitly warns that completed
+  native/target/system side effects cannot be rolled back;
 - runtime Auto Assembler disable state stays behind the CXX facade and is used
   to restore original target bytes before trust revocation, record/subtree
   deletion, target replacement, detach, or normal facade destruction; failed
   cleanup prevents an interactive detach or target change instead of silently
   losing the restoration state;
-- table-level and per-record Lua remain visibly preserved but non-executable,
-  and password-protected CETRAINER input returns an explicit unsupported error
-  until reviewed Lua and password workflows exist;
+- table-level and per-record Lua are visibly preserved and executable only by
+  the reviewed, separately trusted, per-payload GTK workflow; password-protected
+  CETRAINER input still returns an explicit unsupported error;
 - bridge tests that exercise real self-process writes, normal and directional
   freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
   codecs, plus group/subtree semantics, `.CT` hierarchy round trips, atomic
   failure behavior, protected-table rejection, script non-execution before
   trust, complete script enumeration/paging, hard payload limits with lossless
-  multi-page reconstruction, review without execution/trust, real trusted AA
+  multi-page reconstruction, review without execution/trust, separately gated
+  Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
@@ -99,12 +107,14 @@ contract.  The address-list controller is now the GTK source of truth and the
 Qt model delegates hierarchy plus the safe `IAddressList` surface through a
 lossless adapter.  Qt still owns its periodic refresh and freeze timers, inline
 value-editor verification, and its legacy Auto Assembler adapter.  GTK now has
-a bounded read-only review UI and the separately explicit-trust Auto Assembler
-path; completing the periodic timer extraction and designing a constrained Lua
-execution policy are the remaining Phase 2 work.  The GTK frontend does not yet
-open password-protected CETRAINER files, expose a loss report, or virtualize
-address rows beyond its bounded first page.  No product identifier should be
-published before the branding decision.
+a bounded read-only review UI plus separately explicit-trust Auto Assembler and
+Lua paths.  Lua is intentionally per-payload rather than automatic, and its VM
+instruction ceiling does not interrupt a blocking native binding. Completing
+the periodic timer extraction and the broader Lua console/timer/form parity are
+the remaining Phase 2/advanced work.  The GTK frontend does not yet open
+password-protected CETRAINER files, expose a loss report, or virtualize address
+rows beyond its bounded first page. No product identifier should be published
+before the branding decision.
 
 ## Goal
 
@@ -209,6 +219,7 @@ EngineFacade
   load_table(path, execution_policy) -> TableLoadReport
   table_scripts(start, count) -> TableScriptPage
   table_script_text(record_id, kind, offset, count) -> TableScriptTextPage
+  set_table_lua_trusted(bool) / execute_table_lua(record_id, kind)
   save_table(path) -> TableSaveReport
 ```
 
@@ -428,7 +439,7 @@ recorded in a short decision note before public release.
    (controller, GTK ownership, hierarchy, and the safe live `IAddressList`
    surface complete; Qt's periodic refresh/freeze timers remain).
 10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
-11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, the
-    GTK trust prompt, bounded read-only script review, and trusted Auto
-    Assembler activation/cleanup.~~ Next design a separately constrained Lua
-    execution path.
+11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
+    trust/review, trusted Auto Assembler activation/cleanup, and separately
+    consented per-payload Lua execution with bounded input/VM/output.~~ Next
+    extract periodic scheduling and add Lua timer/console parity.

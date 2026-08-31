@@ -8,6 +8,7 @@
 #include "core/version.hpp"
 #include "platform/linux/linux_process.hpp"
 #include "scanner/memory_scanner.hpp"
+#include "scripting/lua_engine.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -49,6 +50,9 @@ constexpr std::size_t kMaxTablePathSize = 4096;
 constexpr std::uint32_t kMaxTableScriptPageSize = 256;
 constexpr std::uint32_t kMaxTableScriptTextSize = 64u << 10;
 constexpr std::size_t kMaxTableScriptDescriptionSize = 1024;
+constexpr std::size_t kMaxLuaScriptSize = 1u << 20;
+constexpr std::size_t kMaxLuaOutputSize = 64u << 10;
+constexpr int kLuaInstructionLimit = 2'000'000;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -615,7 +619,10 @@ std::string sanitize_utf8(const std::string& input) {
         std::uint32_t codepoint = 0;
         std::uint32_t minimum = 0;
         if (lead < 0x80) {
-            output.push_back(static_cast<char>(lead));
+            if (lead == 0)
+                append_utf8(output, 0xfffd);
+            else
+                output.push_back(static_cast<char>(lead));
             ++index;
             continue;
         } else if ((lead & 0xe0) == 0xc0) {
@@ -649,6 +656,18 @@ std::string sanitize_utf8(const std::string& input) {
         }
     }
     return output;
+}
+
+std::string bounded_utf8(std::string value, std::size_t limit,
+                         bool* truncated = nullptr) {
+    if (value.size() <= limit) return value;
+    std::size_t prefix = limit;
+    while (prefix > 0 && prefix < value.size() &&
+           (static_cast<unsigned char>(value[prefix]) & 0xc0) == 0x80)
+        --prefix;
+    value.resize(prefix);
+    if (truncated) *truncated = true;
+    return value;
 }
 
 std::string format_utf16le(const std::uint8_t* bytes, std::size_t size) {
@@ -733,12 +752,24 @@ struct EngineFacade::ScriptRuntime {
     ce::AutoAssembler assembler;
     std::unordered_map<int, ce::DisableInfo> disableInfoById;
     std::vector<int> activationOrder;
-    bool trusted = false;
+    std::unique_ptr<ce::LuaEngine> lua;
+    bool autoAssemblerTrusted = false;
+    bool luaTrusted = false;
+
+    void resetLua(ce::ProcessHandle* process,
+                  ce::AddressListController* addressList) {
+        lua.reset();
+        lua = std::make_unique<ce::LuaEngine>();
+        lua->setProcess(process);
+        lua->setAddressList(addressList);
+    }
 };
 
 EngineFacade::EngineFacade()
     : address_list_(std::make_unique<ce::AddressListController>()),
-      script_runtime_(std::make_unique<ScriptRuntime>()) {}
+      script_runtime_(std::make_unique<ScriptRuntime>()) {
+    script_runtime_->resetLua(nullptr, address_list_.get());
+}
 
 EngineFacade::~EngineFacade() {
     cancel_scan();
@@ -822,9 +853,11 @@ AttachResult EngineFacade::attach(std::int32_t pid, rust::Str display_name) {
                 result.error_message = scriptErrorMessage;
                 return result;
             }
+            script_runtime_->resetLua(nullptr, address_list_.get());
             clear_scan_state();
             process_ = std::move(candidate);
             address_list_->setProcess(process_.get());
+            script_runtime_->lua->setProcess(process_.get());
             result.success = true;
             return result;
         }
@@ -858,6 +891,7 @@ AddressActionResult EngineFacade::detach() {
             .error_message = scriptErrorMessage,
         };
     }
+    script_runtime_->resetLua(nullptr, address_list_.get());
     address_list_->setProcess(nullptr);
     process_.reset();
     script_runtime_->disableInfoById.clear();
@@ -1370,7 +1404,7 @@ bool EngineFacade::deactivate_scripts(const std::vector<int>& ids,
             const auto committed = address_list_->commitExecutedScriptState(
                 id, false, record->luaScript.empty()
                                ? "(Auto Assembler script disabled)"
-                               : "(Auto Assembler disabled; record Lua remains blocked)");
+                               : "(Auto Assembler disabled; record Lua requires separate Run)");
             script_runtime_->disableInfoById.erase(id);
             std::erase(script_runtime_->activationOrder, id);
             if (!committed.success) {
@@ -1435,9 +1469,9 @@ AddressActionResult EngineFacade::set_address_active(std::int32_t id, bool activ
         return AddressActionResult{
             .accepted = false,
             .id = id,
-            .error_code = "lua_execution_unavailable",
+            .error_code = "lua_requires_explicit_run",
             .error_message =
-                "Lua records are preserved but cannot be executed by the GTK frontend yet.",
+                "Run reviewed Lua from the script-review window; address-list toggles never execute it.",
         };
     }
     if (found->active == active) {
@@ -1455,7 +1489,7 @@ AddressActionResult EngineFacade::set_address_active(std::int32_t id, bool activ
             .error_message = errorMessage,
         };
     }
-    if (!script_runtime_->trusted) {
+    if (!script_runtime_->autoAssemblerTrusted) {
         return AddressActionResult{
             .accepted = false,
             .id = id,
@@ -1497,7 +1531,7 @@ AddressActionResult EngineFacade::set_address_active(std::int32_t id, bool activ
     const auto committed = address_list_->commitExecutedScriptState(
         id, true, found->luaScript.empty()
                       ? "(Auto Assembler script enabled)"
-                      : "(Auto Assembler enabled; record Lua remains blocked)");
+                      : "(Auto Assembler enabled; record Lua requires separate Run)");
     if (!committed.success) {
         try {
             script_runtime_->assembler.disable(*process_, found->script,
@@ -1656,7 +1690,9 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
     }
     const auto result = address_list_->loadTable(file);
     if (result.success) {
-        script_runtime_->trusted = false;
+        script_runtime_->autoAssemblerTrusted = false;
+        script_runtime_->luaTrusted = false;
+        script_runtime_->resetLua(process_.get(), address_list_.get());
         script_runtime_->disableInfoById.clear();
         script_runtime_->activationOrder.clear();
     }
@@ -1795,13 +1831,142 @@ AddressActionResult EngineFacade::set_table_scripts_trusted(bool trusted) {
             };
         }
     }
-    script_runtime_->trusted = trusted;
+    script_runtime_->autoAssemblerTrusted = trusted;
     return AddressActionResult{
         .accepted = true, .id = 0, .error_code = {}, .error_message = {}};
 }
 
 bool EngineFacade::table_scripts_trusted() const noexcept {
-    return script_runtime_->trusted;
+    return script_runtime_->autoAssemblerTrusted;
+}
+
+AddressActionResult EngineFacade::set_table_lua_trusted(bool trusted) {
+    if (!trusted) {
+        try {
+            script_runtime_->resetLua(process_.get(), address_list_.get());
+        } catch (const std::exception& error) {
+            return AddressActionResult{
+                .accepted = false,
+                .id = 0,
+                .error_code = "lua_state_reset_failed",
+                .error_message = error.what(),
+            };
+        } catch (...) {
+            return AddressActionResult{
+                .accepted = false,
+                .id = 0,
+                .error_code = "lua_state_reset_failed",
+                .error_message = "The Lua runtime could not be reset safely.",
+            };
+        }
+    }
+    script_runtime_->luaTrusted = trusted;
+    return AddressActionResult{
+        .accepted = true, .id = 0, .error_code = {}, .error_message = {}};
+}
+
+bool EngineFacade::table_lua_trusted() const noexcept {
+    return script_runtime_->luaTrusted;
+}
+
+LuaExecutionResult EngineFacade::execute_table_lua(std::int32_t record_id,
+                                                    std::uint8_t kind) {
+    const auto failure = [record_id, kind](std::string code,
+                                           std::string message) {
+        return LuaExecutionResult{
+            .accepted = false,
+            .record_id = record_id,
+            .kind = kind,
+            .output = {},
+            .output_truncated = false,
+            .runtime_error = {},
+            .error_code = std::move(code),
+            .error_message = bounded_utf8(sanitize_utf8(message),
+                                          kMaxLuaOutputSize),
+        };
+    };
+    if (kind != static_cast<std::uint8_t>(ce::TableScriptKind::TableLua) &&
+        kind != static_cast<std::uint8_t>(ce::TableScriptKind::RecordLua)) {
+        return failure("invalid_lua_script_kind",
+                       "Only table-level or record Lua payloads can be run here.");
+    }
+    if (!script_runtime_->luaTrusted) {
+        return failure("table_lua_not_trusted",
+                       "Review and trust Lua for this loaded table before running it.");
+    }
+
+    const auto scriptKind = static_cast<ce::TableScriptKind>(kind);
+    auto page = address_list_->scriptPayloadText(
+        record_id, scriptKind, 0, kMaxTableScriptTextSize);
+    if (!page)
+        return failure("script_not_found",
+                       "The requested Lua payload no longer exists.");
+    if (page->totalBytes > kMaxLuaScriptSize)
+        return failure("lua_script_too_large",
+                       "Lua payloads larger than 1 MiB are not executed.");
+
+    std::string source;
+    source.reserve(page->totalBytes);
+    for (;;) {
+        source += page->text;
+        if (!page->truncated) break;
+        if (page->nextOffset <= page->offset)
+            return failure("lua_script_paging_failed",
+                           "The Lua payload could not be reconstructed safely.");
+        page = address_list_->scriptPayloadText(
+            record_id, scriptKind, page->nextOffset, kMaxTableScriptTextSize);
+        if (!page)
+            return failure("script_not_found",
+                           "The Lua payload changed while it was being prepared.");
+    }
+    if (source.find('\0') != std::string::npos)
+        return failure("lua_script_contains_nul",
+                       "Lua payloads containing NUL bytes are not executed.");
+    if (sanitize_utf8(source) != source)
+        return failure("lua_script_invalid_utf8",
+                       "Lua payloads must be valid UTF-8 before they can be reviewed and run.");
+
+    std::string output;
+    bool outputTruncated = false;
+    const auto appendOutput = [&output, &outputTruncated](const std::string& line) {
+        if (outputTruncated) return;
+        std::string safe = sanitize_utf8(line);
+        if (!output.empty()) safe.insert(safe.begin(), '\n');
+        const auto available = kMaxLuaOutputSize - output.size();
+        if (safe.size() <= available) {
+            output += safe;
+            return;
+        }
+        output += bounded_utf8(std::move(safe), available);
+        outputTruncated = true;
+    };
+
+    std::string runtimeError;
+    try {
+        script_runtime_->lua->setOutputCallback(appendOutput);
+        runtimeError = script_runtime_->lua->executeBounded(
+            source, kLuaInstructionLimit);
+        script_runtime_->lua->setOutputCallback({});
+    } catch (const std::exception& error) {
+        script_runtime_->lua->setOutputCallback({});
+        return failure("lua_execution_failed", error.what());
+    } catch (...) {
+        script_runtime_->lua->setOutputCallback({});
+        return failure("lua_execution_failed",
+                       "The Lua runtime raised an unknown native error.");
+    }
+
+    return LuaExecutionResult{
+        .accepted = true,
+        .record_id = record_id,
+        .kind = kind,
+        .output = std::move(output),
+        .output_truncated = outputTruncated,
+        .runtime_error = bounded_utf8(sanitize_utf8(runtimeError),
+                                      kMaxLuaOutputSize),
+        .error_code = {},
+        .error_message = {},
+    };
 }
 
 void EngineFacade::freeze_addresses() noexcept {

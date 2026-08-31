@@ -168,6 +168,17 @@ mod ffi {
         error_message: String,
     }
 
+    struct LuaExecutionResult {
+        accepted: bool,
+        record_id: i32,
+        kind: u8,
+        output: String,
+        output_truncated: bool,
+        runtime_error: String,
+        error_code: String,
+        error_message: String,
+    }
+
     unsafe extern "C++" {
         include!("bridge/engine_facade.hpp");
 
@@ -257,6 +268,16 @@ mod ffi {
             trusted: bool,
         ) -> AddressActionResult;
         fn table_scripts_trusted(self: &EngineFacade) -> bool;
+        fn set_table_lua_trusted(
+            self: Pin<&mut EngineFacade>,
+            trusted: bool,
+        ) -> AddressActionResult;
+        fn table_lua_trusted(self: &EngineFacade) -> bool;
+        fn execute_table_lua(
+            self: Pin<&mut EngineFacade>,
+            record_id: i32,
+            kind: u8,
+        ) -> LuaExecutionResult;
         fn freeze_addresses(self: Pin<&mut EngineFacade>);
     }
 }
@@ -689,6 +710,15 @@ pub struct TableScriptTextPage {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LuaExecution {
+    pub record_id: i32,
+    pub kind: TableScriptKind,
+    pub output: String,
+    pub output_truncated: bool,
+    pub runtime_error: String,
+}
+
 pub struct Engine {
     inner: cxx::UniquePtr<ffi::EngineFacade>,
 }
@@ -1009,6 +1039,39 @@ impl Engine {
 
     pub fn table_scripts_trusted(&self) -> bool {
         self.inner.table_scripts_trusted()
+    }
+
+    pub fn set_table_lua_trusted(&mut self, trusted: bool) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_table_lua_trusted(trusted)).map(|_| ())
+    }
+
+    pub fn table_lua_trusted(&self) -> bool {
+        self.inner.table_lua_trusted()
+    }
+
+    pub fn execute_table_lua(
+        &mut self,
+        record_id: i32,
+        kind: TableScriptKind,
+    ) -> Result<LuaExecution, AddressError> {
+        let result = self
+            .inner
+            .pin_mut()
+            .execute_table_lua(record_id, kind.bridge_value());
+        if result.accepted {
+            Ok(LuaExecution {
+                record_id: result.record_id,
+                kind: TableScriptKind::from_bridge(result.kind),
+                output: result.output,
+                output_truncated: result.output_truncated,
+                runtime_error: result.runtime_error,
+            })
+        } else {
+            Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            })
+        }
     }
 
     pub fn freeze_addresses(&mut self) {
@@ -1739,6 +1802,14 @@ dealloc(newmem)</AssemblerScript>
         assert!(action.contains_auto_assembler);
         assert!(action.contains_lua);
         assert!(!engine.table_scripts_trusted());
+        assert!(!engine.table_lua_trusted());
+        assert_eq!(
+            engine
+                .execute_table_lua(0, TableScriptKind::TableLua)
+                .expect_err("Lua execution must remain default-deny")
+                .code,
+            "table_lua_not_trusted"
+        );
         let first_scripts = engine.table_scripts(0, 2);
         assert_eq!(first_scripts.start, 0);
         assert_eq!(first_scripts.next_start, 2);
@@ -1795,6 +1866,7 @@ dealloc(newmem)</AssemblerScript>
             !engine.table_scripts_trusted(),
             "review must never grant trust"
         );
+        assert!(!engine.table_lua_trusted(), "review must never trust Lua");
         assert_eq!(
             engine
                 .table_script_text(7, TableScriptKind::Unknown(255), 0, 16)
@@ -1825,9 +1897,9 @@ dealloc(newmem)</AssemblerScript>
         assert_eq!(
             engine
                 .set_address_active(lua_row.id, true)
-                .expect_err("record Lua is not executable yet")
+                .expect_err("record toggles must never execute Lua")
                 .code,
-            "lua_execution_unavailable"
+            "lua_requires_explicit_run"
         );
         assert_eq!(
             engine
@@ -1836,6 +1908,26 @@ dealloc(newmem)</AssemblerScript>
                 .code,
             "no_session"
         );
+        engine
+            .set_table_lua_trusted(true)
+            .expect("Lua trust is a separate explicit state change");
+        assert!(engine.table_lua_trusted());
+        let table_lua = engine
+            .execute_table_lua(0, TableScriptKind::TableLua)
+            .expect("trusted table Lua is attempted explicitly");
+        assert!(table_lua.runtime_error.contains("must not execute"));
+        let record_lua = engine
+            .execute_table_lua(8, TableScriptKind::RecordLua)
+            .expect("trusted record Lua is attempted explicitly");
+        assert!(
+            record_lua
+                .runtime_error
+                .contains("record lua must remain blocked")
+        );
+        engine
+            .set_table_lua_trusted(false)
+            .expect("Lua trust revocation resets its runtime");
+        assert!(!engine.table_lua_trusted());
 
         engine
             .save_table(saved.to_str().expect("UTF-8 temp path"), false)
@@ -1883,6 +1975,114 @@ dealloc(newmem)</AssemblerScript>
         assert!(!engine.table_scripts_trusted());
 
         std::fs::remove_file(source).expect("remove large script table fixture");
+    }
+
+    #[test]
+    fn lua_execution_is_explicit_bounded_and_reset_on_revoke() {
+        let source = temporary_table_path("lua-runtime.CT");
+        std::fs::write(
+            &source,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable>
+  <CheatEntries>
+    <CheatEntry>
+      <ID>55</ID><Description>Read state</Description>
+      <VariableType>4 Bytes</VariableType><Address>0</Address>
+      <LuaScript>print('marker=' .. tostring(TABLE_MARK))</LuaScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>56</ID><Description>Bounded output and loop</Description>
+      <VariableType>4 Bytes</VariableType><Address>0</Address>
+      <LuaScript>print(string.rep('x', 70000)); while true do end</LuaScript>
+    </CheatEntry>
+  </CheatEntries>
+  <LuaScript>TABLE_MARK = 73; print('table-ready')</LuaScript>
+</CheatTable>
+"#,
+        )
+        .expect("write Lua runtime table fixture");
+
+        let mut engine = Engine::new();
+        engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("load Lua runtime table");
+        assert_eq!(
+            engine
+                .execute_table_lua(55, TableScriptKind::RecordLua)
+                .expect_err("untrusted record Lua must be blocked")
+                .code,
+            "table_lua_not_trusted"
+        );
+        engine
+            .set_table_lua_trusted(true)
+            .expect("trust reviewed Lua payloads");
+        let before_table = engine
+            .execute_table_lua(55, TableScriptKind::RecordLua)
+            .expect("run record Lua before table initializer");
+        assert_eq!(before_table.output, "marker=nil");
+        assert!(before_table.runtime_error.is_empty());
+        let table = engine
+            .execute_table_lua(0, TableScriptKind::TableLua)
+            .expect("run table Lua explicitly");
+        assert_eq!(table.output, "table-ready");
+        let after_table = engine
+            .execute_table_lua(55, TableScriptKind::RecordLua)
+            .expect("run record Lua after table initializer");
+        assert_eq!(after_table.output, "marker=73");
+
+        let bounded = engine
+            .execute_table_lua(56, TableScriptKind::RecordLua)
+            .expect("bounded Lua run returns its runtime outcome");
+        assert_eq!(bounded.output.len(), 64 << 10);
+        assert!(bounded.output_truncated);
+        assert!(bounded.runtime_error.contains("instruction limit"));
+
+        engine
+            .set_table_lua_trusted(false)
+            .expect("revoke Lua trust");
+        assert!(!engine.table_lua_trusted());
+        engine
+            .set_table_lua_trusted(true)
+            .expect("re-trust starts with a clean Lua state");
+        let after_reset = engine
+            .execute_table_lua(55, TableScriptKind::RecordLua)
+            .expect("run record Lua after state reset");
+        assert_eq!(after_reset.output, "marker=nil");
+
+        engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("reloading a table resets Lua trust");
+        assert!(!engine.table_lua_trusted());
+        std::fs::remove_file(source).expect("remove Lua runtime table fixture");
+
+        let oversized_source = temporary_table_path("oversized-lua.CT");
+        let oversized_payload = format!("--{}", "x".repeat((1 << 20) + 1));
+        std::fs::write(
+            &oversized_source,
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable><CheatEntries><CheatEntry>
+<ID>57</ID><Description>Oversized Lua</Description>
+<VariableType>4 Bytes</VariableType><Address>0</Address>
+<LuaScript>{oversized_payload}</LuaScript>
+</CheatEntry></CheatEntries></CheatTable>"#
+            ),
+        )
+        .expect("write oversized Lua fixture");
+        engine
+            .load_table(oversized_source.to_str().expect("UTF-8 temp path"))
+            .expect("load oversized Lua table without execution");
+        engine
+            .set_table_lua_trusted(true)
+            .expect("trust does not itself execute oversized Lua");
+        assert_eq!(
+            engine
+                .execute_table_lua(57, TableScriptKind::RecordLua)
+                .expect_err("oversized Lua must be rejected")
+                .code,
+            "lua_script_too_large"
+        );
+        std::fs::remove_file(oversized_source).expect("remove oversized Lua fixture");
     }
 
     #[test]

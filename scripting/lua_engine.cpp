@@ -80,6 +80,8 @@ bool LuaEngine::nextDebugHit(DebugHit& out, int timeoutMs) {
 }
 
 void LuaEngine::setAddressList(IAddressList* list) {
+    if (addressList_ && addressList_ != list)
+        addressList_->setActivationCallback({});
     addressList_ = list;
     if (!L_) return;
 
@@ -259,6 +261,7 @@ LuaEngine::~LuaEngine() {
     // whose callback touches debugMutex_/debugQueue_/debugCv_, which must still be
     // alive here (and before lua_close, since a hit could reference this state).
     debugSession_.reset();
+    setAddressList(nullptr);
     if (L_) lua_close(L_);
 }
 
@@ -324,6 +327,42 @@ std::string LuaEngine::execute(const std::string& code) {
         lua_pop(L_, 1);
         return err;
     }
+    return {};
+}
+
+std::string LuaEngine::executeBounded(const std::string& code,
+                                      int instructionLimit) {
+    if (!L_) return "lua state not initialised";
+    if (instructionLimit <= 0) return "Lua instruction limit must be positive";
+
+    // Lua's debug.sethook can otherwise replace a host-installed count hook.
+    // Remove only that mutator; the remaining debug helpers stay compatible.
+    lua_getglobal(L_, "debug");
+    if (lua_istable(L_, -1)) {
+        lua_pushnil(L_);
+        lua_setfield(L_, -2, "sethook");
+    }
+    lua_pop(L_, 1);
+
+    lua_pushlightuserdata(L_, proc_);
+    lua_setfield(L_, LUA_REGISTRYINDEX, "ce_proc");
+    lua_pushlightuserdata(L_, resolver_);
+    lua_setfield(L_, LUA_REGISTRYINDEX, "ce_resolver");
+
+    const int top = lua_gettop(L_);
+    lua_sethook(L_, [](lua_State* state, lua_Debug*) {
+        luaL_error(state, "Lua payload exceeded its instruction limit");
+    }, LUA_MASKCOUNT, instructionLimit);
+    const int result = luaL_dostring(L_, code.c_str());
+    lua_sethook(L_, nullptr, 0, 0);
+    if (result != LUA_OK) {
+        const char* message = lua_tostring(L_, -1);
+        std::string error = message ? message : "lua error";
+        lua_pop(L_, 1);
+        lua_settop(L_, top);
+        return error;
+    }
+    lua_settop(L_, top);
     return {};
 }
 

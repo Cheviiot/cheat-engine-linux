@@ -132,7 +132,7 @@ scripting/ Lua engine and bindings                               symbols/   ELF/
 
 ## Security
 
-- **Untrusted input.** ELF/DWARF parsers, table loaders, the auto-assembler, and Lua breakpoint conditions treat input as untrusted: reads are bounds-checked, `.CETRAINER` loads are size-capped, and conditions run in a sandboxed, execution-bounded Lua state. Only execute scripts from `.CT`/`.CETRAINER` files you trust: Qt asks before table Lua, while GTK imports scripts inactive, provides a bounded read-only review of every table/record payload, and requires table-scoped trust before AA activation; reviewing never executes or trusts a script, and GTK Lua remains blocked. `shellExecute` and the unsafe file-write functions are default-denied.
+- **Untrusted input.** ELF/DWARF parsers, table loaders, the auto-assembler, and Lua breakpoint conditions treat input as untrusted: reads are bounds-checked, `.CETRAINER` loads are size-capped, and conditions run in a sandboxed, execution-bounded Lua state. Only execute scripts from `.CT`/`.CETRAINER` files you trust: Qt asks before table Lua, while GTK imports scripts inactive, provides bounded read-only review, and keeps separate table-scoped consent for AA and Lua. GTK never auto-runs Lua: every reviewed payload needs an additional Run confirmation, is capped at 1 MiB/2 million VM instructions/64 KiB output, and revocation discards Lua runtime state. Native Lua calls can still block and completed side effects cannot be undone. `shellExecute` and the unsafe local-memory write functions are default-denied.
 - **Kernel helper.** `kernel/cecore_kmod.c` is optional and exposes only explicit `CAP_SYS_ADMIN`-gated ioctls through `/dev/cecore`. It does not hide modules, files, or sockets.
 
 ## License

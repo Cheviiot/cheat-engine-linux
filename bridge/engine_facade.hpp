@@ -34,6 +34,7 @@ struct TableActionResult;
 struct TableScriptRow;
 struct TableScriptPage;
 struct TableScriptTextPage;
+struct LuaExecutionResult;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -84,6 +85,10 @@ public:
                                           std::uint32_t limit) const;
     AddressActionResult set_table_scripts_trusted(bool trusted);
     bool table_scripts_trusted() const noexcept;
+    AddressActionResult set_table_lua_trusted(bool trusted);
+    bool table_lua_trusted() const noexcept;
+    LuaExecutionResult execute_table_lua(std::int32_t record_id,
+                                         std::uint8_t kind);
     void freeze_addresses() noexcept;
 
 private:

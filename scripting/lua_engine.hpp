@@ -41,15 +41,22 @@ public:
     void setOwnedCeserverClient(std::unique_ptr<os::CEServerClient> client);
     void setResolver(SymbolResolver* resolver) { resolver_ = resolver; }
 
-    /// Set the live cheat-table address list. The MemoryRecord/AddressList Lua API
+    /// Set the borrowed live cheat-table address list. It must outlive this engine
+    /// or be detached with nullptr first. The MemoryRecord/AddressList Lua API
     /// becomes usable once a non-null pointer is set. Subscribes a single activation
     /// dispatcher that fans out to per-record OnActivate callbacks stored in the Lua
-    /// registry.
+    /// registry; changing/destroying the engine removes that dispatcher.
     void setAddressList(IAddressList* list);
     IAddressList* addressList() const { return addressList_; }
 
     /// Execute a Lua string. Returns error message or empty on success.
     std::string execute(const std::string& code);
+
+    /// Execute a Lua string with a VM-instruction ceiling. This bounds pure Lua
+    /// loops, but native bindings may still block for their own duration. The
+    /// debug.sethook override is removed from this state before execution so a
+    /// payload cannot disable the ceiling from Lua code.
+    std::string executeBounded(const std::string& code, int instructionLimit);
 
     /// Execute a Lua string and return its first return value coerced to a
     /// string. Used by AutoAssembler {$lua} blocks: the Lua chunk's return

@@ -201,12 +201,14 @@ These are cheap and they underpin trust in everything else.
 
 ### P1 — Security (this tool runs as root and loads shared tables)
 
-6. **Ungated untrusted-Lua RCE.** `l_shellExecute` → `system()`
-   (`scripting/lua_bindings.cpp:1754`) and the `*Local` raw-pointer R/W family
-   are ungated; loading a shared `.CT`/`.CETRAINER` with embedded Lua = arbitrary
-   code + host-memory access, usually as root. Add an opt-in trust/consent gate,
-   and route every `lua_register` through one exception-translating trampoline
-   (today each binding must remember its own try/catch). **[M]**
+6. **Untrusted-Lua RCE — mitigated, not sandboxed.** `shellExecute` and the
+   `write*Local` raw-pointer family are default-denied behind the out-of-band
+   `CECORE_LUA_ALLOW_UNSAFE=1` opt-in, and native bindings use the central
+   exception firewall. Qt asks before table Lua; GTK never auto-runs it and now
+   requires separate table trust plus a per-payload confirmation with bounded
+   input/VM/output. Standard Lua `os`/`io` and target-writing APIs remain part of
+   explicitly trusted execution, so the security boundary is informed consent,
+   not a sandbox. **[RESOLVED for current frontends; keep auditing new loaders]**
 7. **No fuzzing / negative-input tests** on any untrusted parser (ELF, DWARF,
    `.CT`/`.CETRAINER`, Mono net protocol, `ExpressionParser`). README claims
    these treat input as untrusted; that's untested. Add libFuzzer harnesses +

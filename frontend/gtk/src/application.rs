@@ -8,8 +8,8 @@ use adw::prelude::*;
 use gtk::{Align, Orientation};
 
 use crate::bridge::{
-    AddressRecord, AttachError, Engine, FreezeMode, Process, ProtectionMatch, ScanComparison,
-    ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
+    AddressRecord, AttachError, Engine, FreezeMode, LuaExecution, Process, ProtectionMatch,
+    ScanComparison, ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
 };
 use crate::process_dialog;
 
@@ -33,6 +33,7 @@ struct SessionState {
     address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
     selected_address_ids: Rc<RefCell<HashSet<i32>>>,
     table_scripts_trusted: Rc<Cell<bool>>,
+    table_lua_trusted: Rc<Cell<bool>>,
     table_contains_auto_assembler: Rc<Cell<bool>>,
     table_contains_lua: Rc<Cell<bool>>,
 }
@@ -108,6 +109,7 @@ fn build_window(application: &adw::Application) {
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
         selected_address_ids: Rc::new(RefCell::new(HashSet::new())),
         table_scripts_trusted: Rc::new(Cell::new(false)),
+        table_lua_trusted: Rc::new(Cell::new(false)),
         table_contains_auto_assembler: Rc::new(Cell::new(false)),
         table_contains_lua: Rc::new(Cell::new(false)),
     };
@@ -673,17 +675,13 @@ fn build_window(application: &adw::Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         move |_| {
-            if state.table_scripts_trusted.get() {
-                change_table_script_trust(&state, &widgets, false);
-            } else {
-                let action = crate::bridge::TableAction {
-                    record_count: 0,
-                    contains_scripts: true,
-                    contains_auto_assembler: state.table_contains_auto_assembler.get(),
-                    contains_lua: state.table_contains_lua.get(),
-                };
-                present_script_trust_dialog(&window, &state, &widgets, &action);
-            }
+            let action = crate::bridge::TableAction {
+                record_count: 0,
+                contains_scripts: true,
+                contains_auto_assembler: state.table_contains_auto_assembler.get(),
+                contains_lua: state.table_contains_lua.get(),
+            };
+            present_script_trust_dialog(&window, &state, &widgets, &action);
         }
     });
 
@@ -1504,6 +1502,7 @@ fn present_open_table_dialog(
             match result {
                 Ok(action) => {
                     state.table_scripts_trusted.set(false);
+                    state.table_lua_trusted.set(false);
                     state
                         .table_contains_auto_assembler
                         .set(action.contains_auto_assembler);
@@ -1543,21 +1542,22 @@ fn update_script_trust_button(state: &SessionState, widgets: &SessionWidgets) {
     if !has_scripts {
         return;
     }
-    if state.table_scripts_trusted.get() {
-        widgets.script_trust_button.set_label("Revoke script trust");
+    let auto_assembler_trusted = state.table_scripts_trusted.get();
+    let lua_trusted = state.table_lua_trusted.get();
+    if auto_assembler_trusted || lua_trusted {
+        widgets.script_trust_button.set_label("Manage script trust");
         widgets.script_trust_button.set_tooltip_text(Some(
-            "Disable active Auto Assembler records and block this table again",
-        ));
-    } else if has_auto_assembler {
-        widgets.script_trust_button.set_label("Review script trust");
-        widgets.script_trust_button.set_tooltip_text(Some(
-            "Review the warning before unlocking Auto Assembler records",
+            "Review payloads or independently revoke Auto Assembler and Lua trust",
         ));
     } else {
-        widgets.script_trust_button.set_label("Lua blocked");
-        widgets.script_trust_button.set_tooltip_text(Some(
-            "Lua is preserved but unavailable in this migration build",
-        ));
+        widgets.script_trust_button.set_label("Review script trust");
+        widgets
+            .script_trust_button
+            .set_tooltip_text(Some(if has_auto_assembler {
+                "Review payloads before unlocking Auto Assembler or Lua"
+            } else {
+                "Review Lua payloads before granting explicit execution trust"
+            }));
     }
 }
 
@@ -1577,13 +1577,9 @@ fn change_table_script_trust(
             state.table_scripts_trusted.set(trusted);
             reload_address_list(state, widgets, state.attached.get());
             widgets.address_summary.set_label(if trusted {
-                if state.table_contains_lua.get() {
-                    "Auto Assembler is trusted for this loaded table; Lua remains blocked."
-                } else {
-                    "Auto Assembler is trusted for this loaded table and runs only when enabled."
-                }
+                "Auto Assembler is trusted for this table and runs only when a record is enabled."
             } else {
-                "Script trust was revoked and active Auto Assembler records were disabled."
+                "Auto Assembler trust was revoked and active records were disabled."
             });
             true
         }
@@ -1591,6 +1587,36 @@ fn change_table_script_trust(
             reload_address_list(state, widgets, false);
             widgets.address_summary.set_label(&format!(
                 "Could not {} script trust safely: {} ({})",
+                if trusted { "grant" } else { "revoke" },
+                error.message,
+                error.code
+            ));
+            false
+        }
+    }
+}
+
+fn change_table_lua_trust(state: &SessionState, widgets: &SessionWidgets, trusted: bool) -> bool {
+    let result = state
+        .engine
+        .borrow_mut()
+        .as_mut()
+        .expect("engine remains present while changing Lua trust")
+        .set_table_lua_trusted(trusted);
+    match result {
+        Ok(()) => {
+            state.table_lua_trusted.set(trusted);
+            reload_address_list(state, widgets, state.attached.get());
+            widgets.address_summary.set_label(if trusted {
+                "Lua is trusted for this table, but each payload still requires an explicit Run confirmation."
+            } else {
+                "Lua trust was revoked and its runtime state was discarded. Effects already made by a script cannot be undone automatically."
+            });
+            true
+        }
+        Err(error) => {
+            widgets.address_summary.set_label(&format!(
+                "Could not {} Lua trust safely: {} ({})",
                 if trusted { "grant" } else { "revoke" },
                 error.message,
                 error.code
@@ -1620,7 +1646,7 @@ fn present_script_review_dialog(
 
     let explanation = gtk::Label::builder()
         .label(
-            "Reviewing is read-only: it never executes a payload or grants trust. Lua remains blocked in this build.",
+            "Reviewing is read-only: it never executes a payload or grants trust. Lua has separate consent and every run requires confirmation.",
         )
         .wrap(true)
         .xalign(0.0)
@@ -1668,23 +1694,73 @@ fn present_script_review_dialog(
     content.append(&scrolled);
     content.append(&navigation);
 
-    if state.table_contains_auto_assembler.get() && !state.table_scripts_trusted.get() {
+    let trust_actions = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .halign(Align::End)
+        .build();
+    if state.table_contains_auto_assembler.get() {
+        let trusted = state.table_scripts_trusted.get();
         let trust_button = gtk::Button::builder()
-            .label("Trust Auto Assembler after review")
-            .halign(Align::End)
-            .css_classes(["destructive-action"])
+            .label(if trusted {
+                "Revoke Auto Assembler trust"
+            } else {
+                "Trust Auto Assembler"
+            })
             .build();
+        if !trusted {
+            trust_button.add_css_class("destructive-action");
+        }
         trust_button.connect_clicked({
             let state = state.clone();
             let widgets = widgets.clone();
             move |button| {
-                if change_table_script_trust(&state, &widgets, true) {
-                    button.set_label("Auto Assembler trusted");
-                    button.set_sensitive(false);
+                let next = !state.table_scripts_trusted.get();
+                if change_table_script_trust(&state, &widgets, next) {
+                    if next {
+                        button.set_label("Revoke Auto Assembler trust");
+                        button.remove_css_class("destructive-action");
+                    } else {
+                        button.set_label("Trust Auto Assembler");
+                        button.add_css_class("destructive-action");
+                    }
                 }
             }
         });
-        content.append(&trust_button);
+        trust_actions.append(&trust_button);
+    }
+    if state.table_contains_lua.get() {
+        let trusted = state.table_lua_trusted.get();
+        let trust_button = gtk::Button::builder()
+            .label(if trusted {
+                "Revoke Lua trust"
+            } else {
+                "Trust Lua execution"
+            })
+            .build();
+        if !trusted {
+            trust_button.add_css_class("destructive-action");
+        }
+        trust_button.connect_clicked({
+            let state = state.clone();
+            let widgets = widgets.clone();
+            move |button| {
+                let next = !state.table_lua_trusted.get();
+                if change_table_lua_trust(&state, &widgets, next) {
+                    if next {
+                        button.set_label("Revoke Lua trust");
+                        button.remove_css_class("destructive-action");
+                    } else {
+                        button.set_label("Trust Lua execution");
+                        button.add_css_class("destructive-action");
+                    }
+                }
+            }
+        });
+        trust_actions.append(&trust_button);
+    }
+    if state.table_contains_auto_assembler.get() || state.table_contains_lua.get() {
+        content.append(&trust_actions);
     }
 
     toolbar.set_content(Some(&content));
@@ -1872,6 +1948,25 @@ fn present_script_payload_dialog(parent: &adw::Dialog, state: &SessionState, scr
         .margin_end(18)
         .build();
     content.append(&notice);
+    let run_button = matches!(
+        script.kind,
+        TableScriptKind::TableLua | TableScriptKind::RecordLua
+    )
+    .then(|| {
+        gtk::Button::builder()
+            .label(if state.table_lua_trusted.get() {
+                "Run this Lua payload…"
+            } else {
+                "Lua blocked — grant trust in the review window"
+            })
+            .sensitive(state.table_lua_trusted.get())
+            .halign(Align::End)
+            .css_classes(["destructive-action"])
+            .build()
+    });
+    if let Some(button) = &run_button {
+        content.append(button);
+    }
     content.append(&scrolled);
     content.append(&navigation);
     toolbar.set_content(Some(&content));
@@ -1885,6 +1980,14 @@ fn present_script_payload_dialog(parent: &adw::Dialog, state: &SessionState, scr
         .content_height(640)
         .child(&toolbar)
         .build();
+    if let Some(button) = run_button {
+        button.connect_clicked({
+            let dialog = dialog.clone();
+            let state = state.clone();
+            let script = script.clone();
+            move |_| present_lua_execution_confirmation(&dialog, &state, &script)
+        });
+    }
     let current_offset = Rc::new(Cell::new(0_u64));
     let next_offset = Rc::new(Cell::new(0_u64));
     previous.connect_clicked({
@@ -1950,6 +2053,126 @@ fn present_script_payload_dialog(parent: &adw::Dialog, state: &SessionState, scr
     dialog.present(Some(parent));
 }
 
+fn present_lua_execution_confirmation(
+    parent: &adw::Dialog,
+    state: &SessionState,
+    script: &TableScript,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Run this reviewed Lua payload?")
+        .body(format!(
+            "{} can modify the target and access your system with this application's privileges. Pure Lua bytecode is instruction-limited, but native functions may block and completed side effects cannot be undone by revoking trust.",
+            table_script_kind_label(script.kind)
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("run", "Run Lua");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("run", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(Some("run"), {
+        let parent = parent.clone();
+        let state = state.clone();
+        let script = script.clone();
+        move |_, _| {
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while running reviewed Lua")
+                .execute_table_lua(script.record_id, script.kind);
+            match result {
+                Ok(execution) => present_lua_execution_result(&parent, execution),
+                Err(error) => {
+                    let failure = adw::AlertDialog::builder()
+                        .heading("Lua was not run")
+                        .body(format!("{} ({})", error.message, error.code))
+                        .build();
+                    failure.add_response("close", "Close");
+                    failure.set_close_response("close");
+                    failure.present(Some(&parent));
+                }
+            }
+        }
+    });
+    dialog.present(Some(parent));
+}
+
+fn present_lua_execution_result(parent: &adw::Dialog, execution: LuaExecution) {
+    let succeeded = execution.runtime_error.is_empty();
+    let status = gtk::Label::builder()
+        .label(if succeeded {
+            "Lua payload completed."
+        } else {
+            "Lua payload stopped with a runtime error."
+        })
+        .xalign(0.0)
+        .css_classes([if succeeded { "success" } else { "error" }])
+        .build();
+    let mut report = String::new();
+    report.push_str("Payload: ");
+    report.push_str(table_script_kind_label(execution.kind));
+    if execution.record_id != 0 {
+        report.push_str(&format!(" · record #{}", execution.record_id));
+    }
+    report.push_str("\n\n");
+    if !execution.runtime_error.is_empty() {
+        report.push_str("Runtime error:\n");
+        report.push_str(&execution.runtime_error);
+        report.push_str("\n\n");
+    }
+    report.push_str("Print output:\n");
+    if execution.output.is_empty() {
+        report.push_str("(No output)");
+    } else {
+        report.push_str(&execution.output);
+    }
+    if execution.output_truncated {
+        report.push_str("\n\n(Output truncated at 64 KiB.)");
+    }
+    let text = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    text.buffer().set_text(&report);
+    let scrolled = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .child(&text)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(&status);
+    content.append(&scrolled);
+    let header = adw::HeaderBar::new();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    let dialog = adw::Dialog::builder()
+        .title(if succeeded {
+            "Lua execution output"
+        } else {
+            "Lua execution error"
+        })
+        .content_width(720)
+        .content_height(480)
+        .child(&toolbar)
+        .build();
+    dialog.present(Some(parent));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_script_payload_page(
     state: &SessionState,
@@ -2012,7 +2235,7 @@ fn present_script_trust_dialog(
         ""
     };
     let lua_notice = if action.contains_lua {
-        "Lua is preserved but remains unavailable in this migration build."
+        "Lua has separate table-scoped trust and still runs only after confirming a specific reviewed payload. Revoking trust discards runtime state but cannot undo effects of code that already ran."
     } else {
         "Scripts run only when you explicitly enable their record."
     };
@@ -2033,13 +2256,46 @@ fn present_script_trust_dialog(
         move |_, _| present_script_review_dialog(&window, &state, &widgets)
     });
     if action.contains_auto_assembler {
-        dialog.add_response("trust", "Trust Auto Assembler");
-        dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
-        dialog.connect_response(Some("trust"), {
+        let trusted = state.table_scripts_trusted.get();
+        let response = if trusted { "revoke-aa" } else { "trust-aa" };
+        dialog.add_response(
+            response,
+            if trusted {
+                "Revoke Auto Assembler"
+            } else {
+                "Trust Auto Assembler"
+            },
+        );
+        if !trusted {
+            dialog.set_response_appearance(response, adw::ResponseAppearance::Destructive);
+        }
+        dialog.connect_response(Some(response), {
             let state = state.clone();
             let widgets = widgets.clone();
             move |_, _| {
-                change_table_script_trust(&state, &widgets, true);
+                change_table_script_trust(&state, &widgets, !trusted);
+            }
+        });
+    }
+    if action.contains_lua {
+        let trusted = state.table_lua_trusted.get();
+        let response = if trusted { "revoke-lua" } else { "trust-lua" };
+        dialog.add_response(
+            response,
+            if trusted {
+                "Revoke Lua trust"
+            } else {
+                "Trust Lua execution"
+            },
+        );
+        if !trusted {
+            dialog.set_response_appearance(response, adw::ResponseAppearance::Destructive);
+        }
+        dialog.connect_response(Some(response), {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            move |_, _| {
+                change_table_lua_trust(&state, &widgets, !trusted);
             }
         });
     }
@@ -2127,7 +2383,7 @@ fn install_address_refresh_timer(state: &SessionState, widgets: &SessionWidgets)
 }
 
 fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_values: bool) {
-    let (page, scripts_trusted) = {
+    let (page, scripts_trusted, lua_trusted) = {
         let mut engine_slot = state.engine.borrow_mut();
         let Some(engine) = engine_slot.as_mut() else {
             return;
@@ -2135,9 +2391,11 @@ fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_v
         (
             engine.address_rows(0, ADDRESS_PAGE_SIZE, refresh_values),
             engine.table_scripts_trusted(),
+            engine.table_lua_trusted(),
         )
     };
     state.table_scripts_trusted.set(scripts_trusted);
+    state.table_lua_trusted.set(lua_trusted);
     update_script_trust_button(state, widgets);
     render_address_records(state, widgets, page);
 }
@@ -2198,13 +2456,15 @@ fn render_address_records(
 fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record: &AddressRecord) {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
     let scripts_trusted = state.table_scripts_trusted.get();
+    let lua_trusted = state.table_lua_trusted.get();
     let address = if record.is_group {
         "Group".to_owned()
     } else if record.has_auto_assembler && record.has_lua {
-        if scripts_trusted {
-            "Auto Assembler trusted; record Lua blocked".to_owned()
-        } else {
-            "Auto Assembler and Lua preserved; execution blocked".to_owned()
+        match (scripts_trusted, lua_trusted) {
+            (true, true) => "Auto Assembler trusted; Lua runnable from review".to_owned(),
+            (true, false) => "Auto Assembler trusted; Lua blocked".to_owned(),
+            (false, true) => "Auto Assembler blocked; Lua runnable from review".to_owned(),
+            (false, false) => "Auto Assembler and Lua preserved; execution blocked".to_owned(),
         }
     } else if record.has_auto_assembler {
         if scripts_trusted {
@@ -2213,7 +2473,11 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
             "Auto Assembler preserved; execution blocked".to_owned()
         }
     } else if record.has_lua {
-        "Lua preserved; execution unavailable".to_owned()
+        if lua_trusted {
+            "Lua trusted; run explicitly from script review".to_owned()
+        } else {
+            "Lua preserved; execution blocked".to_owned()
+        }
     } else if record.address_expression.is_empty() {
         format!("0x{:016X}", record.address)
     } else {
