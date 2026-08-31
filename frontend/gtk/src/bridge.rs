@@ -135,6 +135,15 @@ mod ffi {
         error_message: String,
     }
 
+    struct AssembleResult {
+        accepted: bool,
+        arch: String,
+        statements: u32,
+        bytes: Vec<u8>,
+        error_code: String,
+        error_message: String,
+    }
+
     struct AddressRow {
         id: i32,
         description: String,
@@ -291,6 +300,7 @@ mod ffi {
             bytes: &[u8],
             allow_protection_change: bool,
         ) -> MemoryWriteResult;
+        fn assemble_preview(self: &EngineFacade, address: u64, source: &str) -> AssembleResult;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
         fn visible_address_rows(
             self: Pin<&mut EngineFacade>,
@@ -717,6 +727,13 @@ pub struct MemoryWrite {
     pub protection_changed: bool,
     pub protection_restored: bool,
     pub warning: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssemblyPreview {
+    pub arch: String,
+    pub statements: u32,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1161,6 +1178,25 @@ impl Engine {
             protection_changed: result.protection_changed,
             protection_restored: result.protection_restored,
             warning: result.warning,
+        })
+    }
+
+    pub fn assemble_preview(
+        &self,
+        address: u64,
+        source: &str,
+    ) -> Result<AssemblyPreview, AddressError> {
+        let result = self.inner.assemble_preview(address, source);
+        if !result.accepted {
+            return Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            });
+        }
+        Ok(AssemblyPreview {
+            arch: result.arch,
+            statements: result.statements,
+            bytes: result.bytes,
         })
     }
 
@@ -1688,6 +1724,46 @@ mod tests {
             engine
                 .memory_write(0x1000, &[0x90], false)
                 .expect_err("write without a process must fail")
+                .code,
+            "no_session"
+        );
+    }
+
+    #[test]
+    fn assembler_preview_uses_target_bitness_and_never_writes_memory() {
+        let mut fixture = Box::new([0xCC_u8; 8]);
+        let address = fixture.as_mut_ptr() as u64;
+        let engine = attached_engine();
+
+        let preview = engine
+            .assemble_preview(address, "nop")
+            .expect("assemble NOP preview");
+        assert!(preview.arch == "x86-64" || preview.arch == "x86-32");
+        assert_eq!(preview.statements, 1);
+        assert_eq!(preview.bytes, [0x90]);
+        assert_eq!(*fixture, [0xCC; 8], "preview must not modify target memory");
+
+        let error = engine
+            .assemble_preview(address, "this is not an instruction")
+            .expect_err("invalid assembly must fail");
+        assert_eq!(error.code, "assembly_failed");
+        let oversized = "x".repeat(4097);
+        assert_eq!(
+            engine
+                .assemble_preview(address, &oversized)
+                .expect_err("oversized assembly input must fail")
+                .code,
+            "assembly_source_too_large"
+        );
+        std::hint::black_box(&mut fixture);
+    }
+
+    #[test]
+    fn assembler_preview_requires_an_attached_process() {
+        assert_eq!(
+            Engine::new()
+                .assemble_preview(0x1000, "nop")
+                .expect_err("assembly without a process must fail")
                 .code,
             "no_session"
         );

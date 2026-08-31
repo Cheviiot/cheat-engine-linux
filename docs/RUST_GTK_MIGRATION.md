@@ -40,7 +40,11 @@ Completed in the foundation and first vertical slices:
   cancellable 4 MiB UI steps over a bridge capped at 8 MiB per request, and
   supports Find Next/Previous; destructive byte edits are capped at 4 KiB,
   region-checked, read-back verified, and temporarily restore read-only page
-  protection after an explicitly confirmed write;
+  protection after an explicitly confirmed write; selected instructions now
+  support bounded Keystone previews and explicit NOP replacement: preview never
+  writes, a second destructive confirmation compares old/new bytes, shorter
+  encodings receive NOP padding, and longer encodings warn that following bytes
+  will be overwritten before using the same verified write path;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -501,5 +505,8 @@ recorded in a short decision note before public release.
     a hex-cursor scalar inspector.~~
 14. ~~Add incremental forward/backward GTK memory search with AOB wildcards and
     quoted text, plus confirmed, bounded, verified byte editing with temporary
-    page-protection restoration.~~ Next add assembler/debugger integration,
+    page-protection restoration.~~
+15. ~~Add target-bitness-aware GTK assembler preview, old/new byte confirmation,
+    instruction-boundary NOP padding, explicit longer-instruction warnings, and
+    confirmed NOP replacement.~~ Next integrate breakpoints and debugger state,
     continue Lua GUI/form parity, and complete the branding review.

@@ -22,6 +22,13 @@ struct SearchPattern {
     mask: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstructionPatch {
+    bytes: Vec<u8>,
+    overwrites_following: bool,
+    padded_with_nops: bool,
+}
+
 #[derive(Clone)]
 struct Viewer {
     window: adw::Window,
@@ -37,6 +44,8 @@ struct Viewer {
     instruction_status: gtk::Label,
     data_inspector: gtk::Label,
     follow_button: gtk::Button,
+    assemble_button: gtk::Button,
+    nop_button: gtk::Button,
     copy_button: gtk::Button,
     add_button: gtk::Button,
     edit_button: gtk::Button,
@@ -156,6 +165,8 @@ impl Viewer {
         self.instruction_status
             .set_label("Select an instruction; activate it to follow its operand.");
         self.follow_button.set_sensitive(false);
+        self.assemble_button.set_sensitive(false);
+        self.nop_button.set_sensitive(false);
         self.copy_button.set_sensitive(false);
         self.add_button.set_sensitive(false);
         if let Some(row) = self.disassembly.row_at_index(0) {
@@ -175,6 +186,8 @@ impl Viewer {
             && !self.bytes.borrow().is_empty()
             && !self.instructions.borrow().is_empty()
             && self.selected_instruction.get().is_some()
+            && self.assemble_button.is_sensitive()
+            && self.nop_button.is_sensitive()
             && self.copy_button.is_sensitive()
             && self.edit_button.is_sensitive()
             && self.data_inspector.label().contains("byte=0x")
@@ -197,6 +210,8 @@ impl Viewer {
             self.instruction_status
                 .set_label("Select an instruction; activate it to follow its operand.");
             self.follow_button.set_sensitive(false);
+            self.assemble_button.set_sensitive(false);
+            self.nop_button.set_sensitive(false);
             self.copy_button.set_sensitive(false);
             self.add_button.set_sensitive(false);
             return;
@@ -215,6 +230,8 @@ impl Viewer {
         ));
         self.follow_button
             .set_sensitive(instruction.follow_target != 0);
+        self.assemble_button.set_sensitive(true);
+        self.nop_button.set_sensitive(instruction.size > 0);
         self.copy_button.set_sensitive(true);
         self.add_button.set_sensitive(true);
     }
@@ -285,6 +302,236 @@ impl Viewer {
                 "Could not add the address: {} ({})",
                 error.message, error.code
             )),
+        }
+    }
+
+    fn selected_instruction_row(&self) -> Option<DisassemblyRow> {
+        self.selected_instruction
+            .get()
+            .and_then(|index| self.instructions.borrow().get(index).cloned())
+    }
+
+    fn present_assembler_dialog(&self) {
+        let Some(instruction) = self.selected_instruction_row() else {
+            return;
+        };
+        let current = instruction_text(&instruction);
+        let entry = gtk::Entry::builder()
+            .text(&current)
+            .placeholder_text("Instruction in Intel/NASM syntax")
+            .hexpand(true)
+            .activates_default(true)
+            .css_classes(["monospace"])
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Assemble at 0x{:016X}", instruction.address))
+            .body(format!(
+                "Original instruction: {} byte{}. Previewing does not modify the target process.",
+                instruction.size,
+                if instruction.size == 1 { "" } else { "s" }
+            ))
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("preview", "Preview");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("preview"));
+        dialog.set_response_appearance("preview", adw::ResponseAppearance::Suggested);
+        dialog.connect_response(Some("preview"), {
+            let viewer = self.clone();
+            let entry = entry.clone();
+            let instruction = instruction.clone();
+            move |_, _| {
+                let source = entry.text().trim().to_owned();
+                let preview = {
+                    let engine_slot = viewer.engine.borrow();
+                    let Some(engine) = engine_slot.as_ref() else {
+                        viewer.status.add_css_class("error");
+                        viewer
+                            .status
+                            .set_label("The memory engine is temporarily busy.");
+                        return;
+                    };
+                    engine.assemble_preview(instruction.address, &source)
+                };
+                match preview {
+                    Ok(preview) => viewer.present_assembly_confirmation(
+                        instruction.clone(),
+                        source,
+                        preview.arch,
+                        preview.statements,
+                        preview.bytes,
+                    ),
+                    Err(error) => {
+                        viewer.status.add_css_class("error");
+                        viewer.status.set_label(&format!(
+                            "Could not assemble the instruction: {} ({})",
+                            error.message, error.code
+                        ));
+                    }
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+        entry.select_region(0, -1);
+        entry.grab_focus();
+    }
+
+    fn present_assembly_confirmation(
+        &self,
+        instruction: DisassemblyRow,
+        source: String,
+        arch: String,
+        statements: u32,
+        encoded: Vec<u8>,
+    ) {
+        let patch = prepare_instruction_patch(&encoded, instruction.size);
+        let size_warning = if patch.overwrites_following {
+            format!(
+                "The new code is {} bytes, but the selected instruction is only {} bytes. Writing it will overwrite following instruction bytes.",
+                patch.bytes.len(),
+                instruction.size
+            )
+        } else if patch.padded_with_nops {
+            format!(
+                "The new code is shorter than the selected instruction and will be padded to {} bytes with NOPs.",
+                instruction.size
+            )
+        } else {
+            "The replacement has the same size as the selected instruction.".to_owned()
+        };
+        let comparison = gtk::Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .build();
+        comparison.append(
+            &gtk::Label::builder()
+                .label(format!("Source: {source}"))
+                .xalign(0.0)
+                .selectable(true)
+                .wrap(true)
+                .css_classes(["monospace"])
+                .build(),
+        );
+        comparison.append(
+            &gtk::Label::builder()
+                .label(format!("Original: {}", instruction.bytes))
+                .xalign(0.0)
+                .selectable(true)
+                .css_classes(["monospace", "dim-label"])
+                .build(),
+        );
+        comparison.append(
+            &gtk::Label::builder()
+                .label(format!("New:      {}", format_bytes(&patch.bytes)))
+                .xalign(0.0)
+                .selectable(true)
+                .wrap(true)
+                .css_classes(["monospace"])
+                .build(),
+        );
+        let dialog = adw::AlertDialog::builder()
+            .heading("Write assembled instruction?")
+            .body(format!(
+                "{arch} · {statements} statement{}\n{size_warning}\n\nThis directly modifies the attached process.",
+                if statements == 1 { "" } else { "s" }
+            ))
+            .extra_child(&comparison)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("write", "Write instruction");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_response_appearance("write", adw::ResponseAppearance::Destructive);
+        dialog.connect_response(Some("write"), {
+            let viewer = self.clone();
+            move |_, _| viewer.write_instruction_patch(&instruction, &patch.bytes, "instruction")
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn present_nop_confirmation(&self) {
+        let Some(instruction) = self.selected_instruction_row() else {
+            return;
+        };
+        let nops = vec![0x90; instruction.size as usize];
+        let comparison = gtk::Label::builder()
+            .label(format!(
+                "Original: {}\nNOPs:     {}",
+                instruction.bytes,
+                format_bytes(&nops)
+            ))
+            .xalign(0.0)
+            .selectable(true)
+            .css_classes(["monospace"])
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Replace instruction at 0x{:016X} with NOPs?", instruction.address))
+            .body("This directly modifies executable memory in the attached process. The replacement keeps the original instruction size.")
+            .extra_child(&comparison)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("write", "Write NOPs");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_response_appearance("write", adw::ResponseAppearance::Destructive);
+        dialog.connect_response(Some("write"), {
+            let viewer = self.clone();
+            move |_, _| viewer.write_instruction_patch(&instruction, &nops, "NOP replacement")
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn write_instruction_patch(&self, instruction: &DisassemblyRow, bytes: &[u8], operation: &str) {
+        let result = {
+            let mut engine_slot = self.engine.borrow_mut();
+            let Some(engine) = engine_slot.as_mut() else {
+                self.status.add_css_class("error");
+                self.status
+                    .set_label("The memory engine is temporarily busy.");
+                return;
+            };
+            engine.memory_write(instruction.address, bytes, true)
+        };
+        match result {
+            Ok(write) => {
+                self.status.remove_css_class("error");
+                let page_address = self.current_address.get();
+                self.load(page_address);
+                let selected_index = self
+                    .instructions
+                    .borrow()
+                    .iter()
+                    .position(|row| row.address == instruction.address);
+                if let Some(row) =
+                    selected_index.and_then(|index| self.disassembly.row_at_index(index as i32))
+                {
+                    self.disassembly.select_row(Some(&row));
+                }
+                let protection = if write.protection_changed && write.protection_restored {
+                    " Original page protection restored."
+                } else {
+                    ""
+                };
+                self.status.set_label(&format!(
+                    "Wrote and verified {} byte{} for the {operation}.{}{}",
+                    write.written,
+                    if write.written == 1 { "" } else { "s" },
+                    protection,
+                    if write.warning.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", write.warning)
+                    }
+                ));
+            }
+            Err(error) => {
+                self.status.add_css_class("error");
+                self.status.set_label(&format!(
+                    "Could not write the {operation}: {} ({})",
+                    error.message, error.code
+                ));
+            }
         }
     }
 
@@ -623,6 +870,8 @@ impl Viewer {
         self.hex_buffer.set_text("");
         self.selected_instruction.set(None);
         self.follow_button.set_sensitive(false);
+        self.assemble_button.set_sensitive(false);
+        self.nop_button.set_sensitive(false);
         self.copy_button.set_sensitive(false);
         self.add_button.set_sensitive(false);
         self.edit_button.set_sensitive(false);
@@ -776,6 +1025,18 @@ pub fn present(
         .sensitive(false)
         .css_classes(["flat"])
         .build();
+    let assemble_button = gtk::Button::builder()
+        .label("Assemble")
+        .tooltip_text("Assemble a replacement instruction")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let nop_button = gtk::Button::builder()
+        .label("NOP")
+        .tooltip_text("Replace the selected instruction with NOPs")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
     let copy_button = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
         .tooltip_text("Copy selected instruction (Ctrl+C)")
@@ -798,6 +1059,8 @@ pub fn present(
         .build();
     instruction_actions.append(&instruction_status);
     instruction_actions.append(&follow_button);
+    instruction_actions.append(&assemble_button);
+    instruction_actions.append(&nop_button);
     instruction_actions.append(&copy_button);
     instruction_actions.append(&add_button);
     let disassembly_panel = gtk::Box::builder()
@@ -926,6 +1189,8 @@ pub fn present(
         instruction_status,
         data_inspector,
         follow_button: follow_button.clone(),
+        assemble_button: assemble_button.clone(),
+        nop_button: nop_button.clone(),
         copy_button: copy_button.clone(),
         add_button: add_button.clone(),
         edit_button: edit_button.clone(),
@@ -1001,12 +1266,27 @@ pub fn present(
         let viewer = viewer.clone();
         move |_, row| {
             viewer.select_instruction(Some(row.index() as usize));
-            viewer.follow_selected();
+            if viewer
+                .selected_instruction_row()
+                .is_some_and(|instruction| instruction.follow_target != 0)
+            {
+                viewer.follow_selected();
+            } else {
+                viewer.present_assembler_dialog();
+            }
         }
     });
     follow_button.connect_clicked({
         let viewer = viewer.clone();
         move |_| viewer.follow_selected()
+    });
+    assemble_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.present_assembler_dialog()
+    });
+    nop_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.present_nop_confirmation()
     });
     copy_button.connect_clicked({
         let viewer = viewer.clone();
@@ -1274,6 +1554,29 @@ fn instruction_text(instruction: &DisassemblyRow) -> String {
     }
 }
 
+fn prepare_instruction_patch(encoded: &[u8], original_size: u8) -> InstructionPatch {
+    let original_size = original_size as usize;
+    let mut bytes = encoded.to_vec();
+    let overwrites_following = bytes.len() > original_size;
+    let padded_with_nops = !bytes.is_empty() && bytes.len() < original_size;
+    if padded_with_nops {
+        bytes.resize(original_size, 0x90);
+    }
+    InstructionPatch {
+        bytes,
+        overwrites_following,
+        padded_with_nops,
+    }
+}
+
+fn format_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn byte_offset_for_text_position(line: usize, column: usize, byte_len: usize) -> Option<usize> {
     let byte_in_line = if (18..=66).contains(&column) {
         if column == 42 {
@@ -1438,5 +1741,24 @@ mod tests {
         assert!(inspector.contains("byte=0x78"));
         assert!(inspector.contains("u16=22136"));
         assert!(inspector.contains("i32=305419896"));
+    }
+
+    #[test]
+    fn instruction_patch_preserves_or_explicitly_exceeds_original_boundary() {
+        let shorter = prepare_instruction_patch(&[0xC3], 3);
+        assert_eq!(shorter.bytes, [0xC3, 0x90, 0x90]);
+        assert!(shorter.padded_with_nops);
+        assert!(!shorter.overwrites_following);
+
+        let same = prepare_instruction_patch(&[0x90, 0x90], 2);
+        assert_eq!(same.bytes, [0x90, 0x90]);
+        assert!(!same.padded_with_nops);
+        assert!(!same.overwrites_following);
+
+        let longer = prepare_instruction_patch(&[0x48, 0x31, 0xC0], 2);
+        assert_eq!(longer.bytes, [0x48, 0x31, 0xC0]);
+        assert!(!longer.padded_with_nops);
+        assert!(longer.overwrites_following);
+        assert_eq!(format_bytes(&longer.bytes), "48 31 C0");
     }
 }

@@ -1,6 +1,7 @@
 #include "bridge/engine_facade.hpp"
 
 #include "ce-gtk/src/bridge.rs.h"
+#include "arch/assembler.hpp"
 #include "arch/disassembler.hpp"
 #include "core/address_list_controller.hpp"
 #include "core/autoasm.hpp"
@@ -51,6 +52,8 @@ constexpr std::size_t kMaxMemoryPatternSize = 4096;
 constexpr std::uint32_t kDefaultMemorySearchPageBytes = 1u << 20;
 constexpr std::uint32_t kMaxMemorySearchPageBytes = 8u << 20;
 constexpr std::size_t kMaxMemoryWriteSize = 4096;
+constexpr std::size_t kMaxAssemblySourceSize = 4096;
+constexpr std::size_t kMaxAssemblyOutputSize = 4096;
 constexpr std::uint32_t kMaxAddressPageSize = 256;
 constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
@@ -1707,6 +1710,72 @@ MemoryWriteResult EngineFacade::memory_write(
 
     result.accepted = true;
     return result;
+}
+
+AssembleResult EngineFacade::assemble_preview(std::uint64_t address, rust::Str source) const {
+    AssembleResult result;
+    result.accepted = false;
+    result.arch = "unknown";
+    result.statements = 0;
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!process_) {
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before assembling instructions.";
+        return result;
+    }
+    if (source.empty()) {
+        result.error_code = "empty_assembly";
+        result.error_message = "Enter an instruction to assemble.";
+        return result;
+    }
+    if (source.size() > kMaxAssemblySourceSize) {
+        result.error_code = "assembly_source_too_large";
+        result.error_message = "Assembly input is limited to 4096 bytes.";
+        return result;
+    }
+    if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+        if (address > std::numeric_limits<std::uintptr_t>::max()) {
+            result.error_code = "address_out_of_range";
+            result.error_message = "The assembly address does not fit this host architecture.";
+            return result;
+        }
+    }
+
+    const bool code32 = process_->runs32BitCode();
+    result.arch = code32 ? "x86-32" : "x86-64";
+    try {
+        ce::Assembler assembler(code32 ? ce::AsmArch::X86_32 : ce::AsmArch::X86_64);
+        std::size_t statements = 0;
+        const auto assembled = assembler.assembleEx(
+            std::string(source), static_cast<std::uintptr_t>(address), statements);
+        if (!assembled) {
+            result.error_code = "assembly_failed";
+            result.error_message = sanitize_utf8(assembled.error());
+            return result;
+        }
+        if (assembled->empty()) {
+            result.error_code = "assembly_empty_output";
+            result.error_message = "The instruction assembled to no bytes.";
+            return result;
+        }
+        if (assembled->size() > kMaxAssemblyOutputSize) {
+            result.error_code = "assembly_output_too_large";
+            result.error_message = "Assembled output is limited to 4096 bytes.";
+            return result;
+        }
+        for (const auto byte : *assembled) result.bytes.push_back(byte);
+        result.statements = static_cast<std::uint32_t>(std::min<std::size_t>(
+            statements, std::numeric_limits<std::uint32_t>::max()));
+        result.accepted = true;
+        return result;
+    } catch (const std::exception& error) {
+        result.error_code = "assembler_initialization_failed";
+        result.error_message = "Could not initialize the assembler: " +
+            std::string(error.what());
+        return result;
+    }
 }
 
 void EngineFacade::cancel_scan() noexcept {

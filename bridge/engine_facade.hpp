@@ -30,6 +30,7 @@ struct ScanPage;
 struct MemoryViewResult;
 struct MemorySearchResult;
 struct MemoryWriteResult;
+struct AssembleResult;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
@@ -72,6 +73,7 @@ public:
     MemoryWriteResult memory_write(std::uint64_t address,
                                    rust::Slice<const std::uint8_t> bytes,
                                    bool allow_protection_change);
+    AssembleResult assemble_preview(std::uint64_t address, rust::Str source) const;
     void cancel_scan() noexcept;
     AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
                              bool refresh_values);
