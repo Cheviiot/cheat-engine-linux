@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -29,6 +29,7 @@ struct SessionState {
     scan_generation: Rc<Cell<u64>>,
     scan_page_start: Rc<Cell<u64>>,
     address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
+    selected_address_ids: Rc<RefCell<HashSet<i32>>>,
 }
 
 #[derive(Clone)]
@@ -70,6 +71,7 @@ struct SessionWidgets {
     page_label: gtk::Label,
     address_list: gtk::ListBox,
     address_summary: gtk::Label,
+    group_selected_button: gtk::Button,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +100,7 @@ fn build_window(application: &adw::Application) {
         scan_generation: Rc::new(Cell::new(0)),
         scan_page_start: Rc::new(Cell::new(0)),
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
+        selected_address_ids: Rc::new(RefCell::new(HashSet::new())),
     };
 
     let header = adw::HeaderBar::builder().show_title(false).build();
@@ -358,12 +361,40 @@ fn build_window(application: &adw::Application) {
         .icon_name("list-add-symbolic")
         .css_classes(["flat"])
         .build();
+    let open_table_button = gtk::Button::builder()
+        .label("Open")
+        .icon_name("document-open-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text("Open a cheat table")
+        .build();
+    let save_table_button = gtk::Button::builder()
+        .label("Save")
+        .icon_name("document-save-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text("Save the current cheat table")
+        .build();
     let address_header = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(12)
         .build();
     address_header.append(&address_title);
+    address_header.append(&open_table_button);
+    address_header.append(&save_table_button);
     address_header.append(&add_address_button);
+    let add_group_button = gtk::Button::builder()
+        .label("New group")
+        .icon_name("folder-new-symbolic")
+        .build();
+    let group_selected_button = gtk::Button::builder()
+        .label("Group selected")
+        .sensitive(false)
+        .build();
+    let address_structure_actions = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    address_structure_actions.append(&add_group_button);
+    address_structure_actions.append(&group_selected_button);
     let address_summary = gtk::Label::builder()
         .label("Add scan results here to edit or freeze their live values.")
         .wrap(true)
@@ -406,6 +437,7 @@ fn build_window(application: &adw::Application) {
     content.append(&page_actions);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&address_header);
+    content.append(&address_structure_actions);
     content.append(&address_summary);
     content.append(&address_list_scrolled);
 
@@ -469,6 +501,7 @@ fn build_window(application: &adw::Application) {
         page_label,
         address_list,
         address_summary,
+        group_selected_button,
     };
 
     update_scan_option_visibility(&widgets);
@@ -589,6 +622,34 @@ fn build_window(application: &adw::Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         move |_| present_add_address_dialog(&window, &state, &widgets)
+    });
+
+    add_group_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| present_group_dialog(&window, &state, &widgets, false)
+    });
+
+    widgets.group_selected_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| present_group_dialog(&window, &state, &widgets, true)
+    });
+
+    open_table_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| present_open_table_dialog(&window, &state, &widgets)
+    });
+
+    save_table_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| present_save_table_dialog(&window, &state, &widgets)
     });
 
     install_address_refresh_timer(&state, &widgets);
@@ -1287,6 +1348,186 @@ fn present_add_address_dialog(
     dialog.present(Some(window));
 }
 
+fn present_group_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    selected_only: bool,
+) {
+    let description = gtk::Entry::builder()
+        .text(if selected_only {
+            "Selected records"
+        } else {
+            "New group"
+        })
+        .hexpand(true)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading(if selected_only {
+            "Group selected records"
+        } else {
+            "Create a group"
+        })
+        .body(if selected_only {
+            "The selected records and complete child groups will be placed under a new heading."
+        } else {
+            "Add an empty heading to organize this cheat table."
+        })
+        .extra_child(&description)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_default_response(Some("create"));
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.connect_response(Some("create"), {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, _| {
+            let label = description.text();
+            let result = {
+                let mut engine_slot = state.engine.borrow_mut();
+                let engine = engine_slot
+                    .as_mut()
+                    .expect("engine remains present while creating a group");
+                if selected_only {
+                    let mut ids: Vec<_> = state
+                        .selected_address_ids
+                        .borrow()
+                        .iter()
+                        .copied()
+                        .collect();
+                    ids.sort_unstable();
+                    engine.group_addresses(&ids, label.trim())
+                } else {
+                    engine.add_address_group(label.trim())
+                }
+            };
+            match result {
+                Ok(_) => {
+                    state.selected_address_ids.borrow_mut().clear();
+                    reload_address_list(&state, &widgets, state.attached.get());
+                }
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not create the group: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+    dialog.present(Some(window));
+}
+
+fn present_open_table_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Open Cheat Table")
+        .modal(true)
+        .build();
+    dialog.open(Some(window), gtk::gio::Cancellable::NONE, {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |result| {
+            let Ok(file) = result else {
+                return;
+            };
+            let Some(path) = file.path() else {
+                widgets
+                    .address_summary
+                    .set_label("Only local cheat-table files can be opened.");
+                return;
+            };
+            let Some(path_text) = path.to_str() else {
+                widgets
+                    .address_summary
+                    .set_label("This file path is not valid UTF-8 and cannot be opened yet.");
+                return;
+            };
+            let result = state
+                .engine
+                .borrow_mut()
+                .as_mut()
+                .expect("engine remains present while opening a table")
+                .load_table(path_text);
+            match result {
+                Ok(action) => {
+                    state.selected_address_ids.borrow_mut().clear();
+                    reload_address_list(&state, &widgets, state.attached.get());
+                    let script_notice = if action.contains_scripts {
+                        " Scripts were preserved but not executed."
+                    } else {
+                        ""
+                    };
+                    widgets.address_summary.set_label(&format!(
+                        "Opened {} record{}.{}",
+                        action.record_count,
+                        if action.record_count == 1 { "" } else { "s" },
+                        script_notice
+                    ));
+                }
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not open the cheat table: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+}
+
+fn present_save_table_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Save Cheat Table")
+        .modal(true)
+        .initial_name("table.CT")
+        .build();
+    dialog.save(Some(window), gtk::gio::Cancellable::NONE, {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |result| {
+            let Ok(file) = result else {
+                return;
+            };
+            let Some(path) = file.path() else {
+                widgets
+                    .address_summary
+                    .set_label("Only local cheat-table files can be saved.");
+                return;
+            };
+            let Some(path_text) = path.to_str() else {
+                widgets
+                    .address_summary
+                    .set_label("This destination path is not valid UTF-8.");
+                return;
+            };
+            let json = path_text.to_ascii_lowercase().ends_with(".json");
+            let result = state
+                .engine
+                .borrow()
+                .as_ref()
+                .expect("engine remains present while saving a table")
+                .save_table(path_text, json);
+            match result {
+                Ok(action) => widgets.address_summary.set_label(&format!(
+                    "Saved {} record{} to {}.",
+                    action.record_count,
+                    if action.record_count == 1 { "" } else { "s" },
+                    path.display()
+                )),
+                Err(error) => widgets.address_summary.set_label(&format!(
+                    "Could not save the cheat table: {} ({})",
+                    error.message, error.code
+                )),
+            }
+        }
+    });
+}
+
 fn install_address_refresh_timer(state: &SessionState, widgets: &SessionWidgets) {
     let state = state.clone();
     let widgets = widgets.clone();
@@ -1341,13 +1582,27 @@ fn render_address_records(
         return;
     }
     if page.total_count == 0 {
+        state.selected_address_ids.borrow_mut().clear();
+        widgets.group_selected_button.set_sensitive(false);
         widgets
             .address_summary
             .set_label("Add a scan result to edit or freeze its live value.");
         return;
     }
 
-    for record in &page.rows {
+    let available_ids: HashSet<_> = page.rows.iter().map(|record| record.id).collect();
+    state
+        .selected_address_ids
+        .borrow_mut()
+        .retain(|id| available_ids.contains(id));
+    widgets
+        .group_selected_button
+        .set_sensitive(!state.selected_address_ids.borrow().is_empty());
+    let hidden = hidden_address_rows(&page.rows);
+    for (index, record) in page.rows.iter().enumerate() {
+        if hidden[index] {
+            continue;
+        }
         append_address_record(state, widgets, record);
     }
     let truncated = (page.rows.len() as u64) < page.total_count;
@@ -1367,7 +1622,11 @@ fn render_address_records(
 
 fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record: &AddressRecord) {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
-    let address = if record.address_expression.is_empty() {
+    let address = if record.is_group {
+        "Group".to_owned()
+    } else if record.has_script {
+        "Script preserved; execution disabled".to_owned()
+    } else if record.address_expression.is_empty() {
         format!("0x{:016X}", record.address)
     } else {
         format!("{} → 0x{:016X}", record.address_expression, record.address)
@@ -1385,13 +1644,74 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
         .subtitle(subtitle)
         .build();
 
+    let selected = gtk::CheckButton::builder()
+        .active(state.selected_address_ids.borrow().contains(&record.id))
+        .tooltip_text("Select for grouping")
+        .valign(Align::Center)
+        .build();
+    selected.connect_toggled({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |button| {
+            if button.is_active() {
+                state.selected_address_ids.borrow_mut().insert(id);
+            } else {
+                state.selected_address_ids.borrow_mut().remove(&id);
+            }
+            widgets
+                .group_selected_button
+                .set_sensitive(!state.selected_address_ids.borrow().is_empty());
+        }
+    });
+    row.add_prefix(&selected);
+
+    if record.is_group {
+        let collapse = gtk::Button::builder()
+            .icon_name(if record.collapsed {
+                "pan-end-symbolic"
+            } else {
+                "pan-down-symbolic"
+            })
+            .tooltip_text(if record.collapsed {
+                "Expand group"
+            } else {
+                "Collapse group"
+            })
+            .valign(Align::Center)
+            .css_classes(["flat"])
+            .build();
+        collapse.connect_clicked({
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let id = record.id;
+            let collapsed = record.collapsed;
+            move |_| {
+                let result = state
+                    .engine
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("engine remains present while collapsing a group")
+                    .set_address_collapsed(id, !collapsed);
+                match result {
+                    Ok(()) => reload_address_list(&state, &widgets, false),
+                    Err(error) => widgets.address_summary.set_label(&format!(
+                        "Could not change the group: {} ({})",
+                        error.message, error.code
+                    )),
+                }
+            }
+        });
+        row.add_prefix(&collapse);
+    }
+
     let value_entry = gtk::Entry::builder()
         .text(&record.value)
         .placeholder_text("Value")
         .width_chars(12)
         .max_width_chars(22)
         .valign(Align::Center)
-        .sensitive(state.attached.get() && !record.is_group)
+        .sensitive(state.attached.get() && !record.is_group && !record.has_script)
         .css_classes(["monospace"])
         .build();
     if !record.readable {
@@ -1429,7 +1749,7 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
     freeze_mode.set_selected(record.freeze_mode as u32);
     freeze_mode.set_tooltip_text(Some("Freeze mode"));
     freeze_mode.set_valign(Align::Center);
-    freeze_mode.set_sensitive(state.attached.get() && !record.is_group);
+    freeze_mode.set_sensitive(state.attached.get() && !record.is_group && !record.has_script);
     freeze_mode.connect_selected_notify({
         let state = state.clone();
         let widgets = widgets.clone();
@@ -1457,7 +1777,7 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
         .active(record.active)
         .tooltip_text("Freeze this value")
         .valign(Align::Center)
-        .sensitive(state.attached.get() && !record.is_group)
+        .sensitive(state.attached.get() && !record.is_group && !record.has_script)
         .build();
     freeze.connect_toggled({
         let state = state.clone();
@@ -1507,6 +1827,38 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
         }
     });
 
+    let move_up = gtk::Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text("Move up")
+        .valign(Align::Center)
+        .css_classes(["flat"])
+        .build();
+    move_up.connect_clicked({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |_| move_address_record(&state, &widgets, id, -1)
+    });
+    let move_down = gtk::Button::builder()
+        .icon_name("go-down-symbolic")
+        .tooltip_text("Move down")
+        .valign(Align::Center)
+        .css_classes(["flat"])
+        .build();
+    move_down.connect_clicked({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let id = record.id;
+        move |_| move_address_record(&state, &widgets, id, 1)
+    });
+    let move_actions = gtk::Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .valign(Align::Center)
+        .build();
+    move_actions.append(&move_up);
+    move_actions.append(&move_down);
+
     if !record.is_group {
         row.add_suffix(&value_entry);
         row.add_suffix(&freeze_mode);
@@ -1516,8 +1868,46 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
             .borrow_mut()
             .insert(record.id, value_entry);
     }
+    row.add_suffix(&move_actions);
     row.add_suffix(&delete);
     widgets.address_list.append(&row);
+}
+
+fn move_address_record(state: &SessionState, widgets: &SessionWidgets, id: i32, direction: i32) {
+    let result = state
+        .engine
+        .borrow_mut()
+        .as_mut()
+        .expect("engine remains present while moving an address")
+        .move_address(id, direction);
+    match result {
+        Ok(()) => reload_address_list(state, widgets, state.attached.get()),
+        Err(error) if error.code == "move_boundary" => {
+            widgets.address_summary.set_label(&error.message);
+        }
+        Err(error) => widgets.address_summary.set_label(&format!(
+            "Could not move the record: {} ({})",
+            error.message, error.code
+        )),
+    }
+}
+
+fn hidden_address_rows(records: &[AddressRecord]) -> Vec<bool> {
+    let mut hidden = vec![false; records.len()];
+    let mut collapsed_indents = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        while collapsed_indents
+            .last()
+            .is_some_and(|indent| *indent >= record.indent)
+        {
+            collapsed_indents.pop();
+        }
+        hidden[index] = !collapsed_indents.is_empty();
+        if record.is_group && record.collapsed {
+            collapsed_indents.push(record.indent);
+        }
+    }
+    hidden
 }
 
 fn update_address_values(
@@ -1526,13 +1916,20 @@ fn update_address_values(
     page: crate::bridge::AddressPage,
 ) {
     let entries = state.address_value_entries.borrow();
-    if entries.len() != page.rows.iter().filter(|row| !row.is_group).count() {
+    let hidden = hidden_address_rows(&page.rows);
+    let visible_value_count = page
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| !hidden[*index] && !row.is_group)
+        .count();
+    if entries.len() != visible_value_count {
         drop(entries);
         render_address_records(state, widgets, page);
         return;
     }
-    for record in &page.rows {
-        if record.is_group {
+    for (index, record) in page.rows.iter().enumerate() {
+        if hidden[index] || record.is_group {
             continue;
         }
         let Some(entry) = entries.get(&record.id) else {

@@ -29,6 +29,7 @@ struct ScanPage;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
+struct TableActionResult;
 
 /// Stable, toolkit-neutral entry point exposed to the Rust frontend.
 ///
@@ -64,6 +65,13 @@ public:
     AddressActionResult set_address_active(std::int32_t id, bool active);
     AddressActionResult set_address_freeze_mode(std::int32_t id, std::uint8_t mode);
     AddressActionResult delete_address(std::int32_t id);
+    AddressActionResult add_address_group(rust::Str description);
+    AddressActionResult group_addresses(rust::Slice<const std::int32_t> ids,
+                                        rust::Str description);
+    AddressActionResult move_address(std::int32_t id, std::int32_t direction);
+    AddressActionResult set_address_collapsed(std::int32_t id, bool collapsed);
+    TableActionResult load_table(rust::Str path);
+    TableActionResult save_table(rust::Str path, bool json) const;
     void freeze_addresses() noexcept;
 
 private:

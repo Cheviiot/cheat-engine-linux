@@ -9,9 +9,12 @@
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace ce {
@@ -235,6 +238,19 @@ bool parsePointer(std::string text, bool hexadecimal, std::uint64_t& value) {
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
 }
 
+std::string hexadecimalAddress(uintptr_t address) {
+    std::ostringstream stream;
+    stream << "0x" << std::hex << address;
+    return stream.str();
+}
+
+bool tableContainsScripts(const CheatTable& table) {
+    if (!table.luaScript.empty()) return true;
+    return std::any_of(table.entries.begin(), table.entries.end(), [](const CheatEntry& entry) {
+        return !entry.autoAsmScript.empty() || !entry.luaScript.empty();
+    });
+}
+
 } // namespace
 
 void AddressListController::setProcess(ProcessHandle* process) noexcept {
@@ -242,6 +258,13 @@ void AddressListController::setProcess(ProcessHandle* process) noexcept {
     disableAllWithoutExecute();
     process_ = process;
     for (auto& record : records_) {
+        if (record.isGroup || !record.script.empty() || !record.luaScript.empty()) {
+            record.readable = true;
+            record.error.clear();
+            if (!record.isGroup)
+                record.currentValue = "(script preserved; not executed)";
+            continue;
+        }
         record.readable = false;
         record.error = process ? std::string{} : "No process is attached.";
         if (!process && !record.isGroup) record.currentValue = "??";
@@ -309,6 +332,12 @@ bool AddressListController::resolveAddress(Record& record) {
 
 bool AddressListController::refreshRecord(Record& record) {
     if (record.isGroup) {
+        record.readable = true;
+        record.error.clear();
+        return true;
+    }
+    if (!record.script.empty() || !record.luaScript.empty()) {
+        record.currentValue = "(script preserved; not executed)";
         record.readable = true;
         record.error.clear();
         return true;
@@ -565,6 +594,9 @@ AddressOperationResult AddressListController::writeRecordValue(int id,
     if (index < 0) return failure(id, "record_not_found", "The address-list record no longer exists.");
     auto& record = records_[static_cast<std::size_t>(index)];
     if (record.isGroup) return failure(id, "group_not_editable", "A group has no memory value.");
+    if (!record.script.empty() || !record.luaScript.empty())
+        return failure(id, "script_not_executable",
+                       "Scripts loaded from a table are preserved but cannot be executed yet.");
     if (!writeRecord(record, value)) return failure(id, "write_failed", record.error);
     if (record.active) record.frozenValue = record.currentValue;
     return success(id);
@@ -575,6 +607,9 @@ AddressOperationResult AddressListController::activateRecord(int id, bool active
     if (index < 0) return failure(id, "record_not_found", "The address-list record no longer exists.");
     auto& record = records_[static_cast<std::size_t>(index)];
     if (record.isGroup) return failure(id, "group_not_freezable", "A group cannot be frozen.");
+    if ((!record.script.empty() || !record.luaScript.empty()) && active)
+        return failure(id, "script_not_executable",
+                       "Scripts loaded from a table are preserved but cannot be executed yet.");
     if (record.active == active) return success(id);
     if (active) {
         if (!refreshRecord(record)) return failure(id, "read_failed", record.error);
@@ -607,11 +642,310 @@ AddressOperationResult AddressListController::removeRecord(int id) {
     return success(id);
 }
 
+AddressOperationResult AddressListController::groupRecords(
+    const std::vector<int>& ids, const std::string& description) {
+    std::vector<int> indents;
+    indents.reserve(records_.size());
+    for (const auto& record : records_) indents.push_back(record.indent);
+
+    std::vector<std::size_t> selected;
+    std::vector<char> included(records_.size(), 0);
+    for (const int id : ids) {
+        const int index = indexOf(id);
+        if (index < 0) continue;
+        const auto row = static_cast<std::size_t>(index);
+        included[row] = 1;
+        if (records_[row].isGroup) {
+            const auto descendants = descendantRange(indents, row);
+            for (auto child = descendants.first; child < descendants.second; ++child)
+                included[child] = 1;
+        }
+    }
+    for (std::size_t row = 0; row < included.size(); ++row)
+        if (included[row]) selected.push_back(row);
+
+    const auto plan = groupSelection(indents, std::move(selected));
+    if (!plan.ok)
+        return failure(0, "selection_empty", "Select at least one address-list record.");
+
+    Record group;
+    group.id = nextId_++;
+    group.description = description.empty() ? "-- Group --" : description;
+    group.isGroup = true;
+    group.readable = true;
+    const int groupId = group.id;
+
+    std::vector<Record> rebuilt;
+    rebuilt.reserve(plan.order.size());
+    for (std::size_t row = 0; row < plan.order.size(); ++row) {
+        if (plan.order[row] < 0) {
+            group.indent = plan.indent[row];
+            rebuilt.push_back(std::move(group));
+        } else {
+            auto record = std::move(records_[static_cast<std::size_t>(plan.order[row])]);
+            record.indent = plan.indent[row];
+            rebuilt.push_back(std::move(record));
+        }
+    }
+    records_ = std::move(rebuilt);
+    ++generation_;
+    return success(groupId);
+}
+
+AddressOperationResult AddressListController::moveRecord(int id, int direction) {
+    if (direction != -1 && direction != 1)
+        return failure(id, "invalid_direction", "Move direction must be -1 or 1.");
+    const int index = indexOf(id);
+    if (index < 0)
+        return failure(id, "record_not_found", "The address-list record no longer exists.");
+
+    std::vector<int> indents;
+    indents.reserve(records_.size());
+    for (const auto& record : records_) indents.push_back(record.indent);
+    const auto row = static_cast<std::size_t>(index);
+    const int rootIndent = records_[row].indent;
+    const auto descendants = descendantRange(indents, row);
+    const std::size_t blockEnd = records_[row].isGroup ? descendants.second : row + 1;
+    int destination = index;
+
+    if (direction < 0) {
+        if (row == 0) return failure(id, "move_boundary", "The record is already first here.");
+        std::size_t cursor = row;
+        bool found = false;
+        while (cursor > 0) {
+            --cursor;
+            if (indents[cursor] < rootIndent) break;
+            if (indents[cursor] == rootIndent) {
+                destination = static_cast<int>(cursor);
+                found = true;
+                break;
+            }
+        }
+        if (!found) return failure(id, "move_boundary", "The record is already first here.");
+    } else {
+        if (blockEnd >= records_.size() || indents[blockEnd] != rootIndent)
+            return failure(id, "move_boundary", "The record is already last here.");
+        const auto nextDescendants = descendantRange(indents, blockEnd);
+        destination = static_cast<int>(records_[blockEnd].isGroup
+                                           ? nextDescendants.second
+                                           : blockEnd + 1);
+    }
+
+    const int length = static_cast<int>(blockEnd - row);
+    const auto permutation = moveRangePermutation(static_cast<int>(records_.size()), index,
+                                                  length, destination);
+    std::vector<Record> reordered;
+    reordered.reserve(records_.size());
+    for (const int oldIndex : permutation)
+        reordered.push_back(std::move(records_[static_cast<std::size_t>(oldIndex)]));
+    records_ = std::move(reordered);
+    ++generation_;
+    return success(id);
+}
+
+AddressOperationResult AddressListController::setRecordCollapsed(int id, bool collapsed) {
+    const int index = indexOf(id);
+    if (index < 0)
+        return failure(id, "record_not_found", "The address-list record no longer exists.");
+    auto& record = records_[static_cast<std::size_t>(index)];
+    if (!record.isGroup)
+        return failure(id, "record_not_group", "Only a group can be collapsed.");
+    if (record.collapsed != collapsed) {
+        record.collapsed = collapsed;
+        ++generation_;
+    }
+    return success(id);
+}
+
+TableOperationResult AddressListController::loadTable(const std::string& path) {
+    if (path.empty())
+        return {.success = false, .errorCode = "path_empty",
+                .errorMessage = "Choose a cheat-table file."};
+    const auto format = detectTableFormat(path);
+    if (format == TableFormat::Protected)
+        return {.success = false, .errorCode = "protected_table",
+                .errorMessage = "Password-protected CETRAINER files are not supported yet."};
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        return {.success = false, .errorCode = "table_unreadable",
+                .errorMessage = "The cheat-table file could not be opened."};
+    input.close();
+
+    CheatTable parsed;
+    try {
+        if (!parsed.loadAuto(path))
+            return {.success = false, .errorCode = "invalid_table",
+                    .errorMessage = "The file is not a supported or valid cheat table."};
+    } catch (const std::exception& error) {
+        return {.success = false, .errorCode = "invalid_table",
+                .errorMessage = std::string("The cheat table could not be parsed: ") + error.what()};
+    } catch (...) {
+        return {.success = false, .errorCode = "invalid_table",
+                .errorMessage = "The cheat table could not be parsed."};
+    }
+
+    std::unordered_map<int, int> indentByExternalId;
+    std::unordered_set<int> runtimeIds;
+    std::vector<Record> loaded;
+    loaded.reserve(parsed.entries.size());
+    int nextId = 1;
+    for (const auto& entry : parsed.entries) {
+        Record record;
+        int indent = 0;
+        if (entry.parentId != -1) {
+            const auto parent = indentByExternalId.find(entry.parentId);
+            if (parent != indentByExternalId.end()) indent = parent->second + 1;
+        }
+        indentByExternalId[entry.id] = indent;
+
+        if (entry.id > 0 && entry.id < std::numeric_limits<int>::max() &&
+            runtimeIds.insert(entry.id).second) {
+            record.id = entry.id;
+            nextId = std::max(nextId, entry.id + 1);
+        } else {
+            while (runtimeIds.contains(nextId)) ++nextId;
+            record.id = nextId++;
+            runtimeIds.insert(record.id);
+        }
+        record.description = entry.description.empty() ? "No description" : entry.description;
+        record.address = entry.address;
+        record.addressString = entry.addressString;
+        record.offsets = entry.offsets;
+        if (!entry.addressString.empty() || !entry.offsets.empty()) {
+            const auto base = entry.addressString.empty()
+                                  ? hexadecimalAddress(entry.address)
+                                  : entry.addressString;
+            record.addressExpression = buildPointerExpression(base, entry.offsets);
+        }
+        record.type = entry.type;
+        record.byteCount = entry.length > 0 ? static_cast<std::size_t>(entry.length) : 0;
+        record.currentValue = entry.value;
+        record.active = false;
+        record.freezeMode = entry.freezeMode;
+        record.showAsHex = entry.showAsHex;
+        record.showAsSigned = entry.showAsSigned;
+        record.isGroup = entry.isGroup;
+        record.collapsed = entry.collapsed;
+        record.activateChildren = entry.activateChildren;
+        record.deactivateChildren = entry.deactivateChildren;
+        record.indent = indent;
+        record.color = entry.color;
+        record.script = entry.autoAsmScript;
+        record.luaScript = entry.luaScript;
+        record.dropdownList = entry.dropdownList;
+        record.hotkeyKeys = entry.hotkeyKeys;
+        record.increaseHotkeyKeys = entry.increaseHotkeyKeys;
+        record.decreaseHotkeyKeys = entry.decreaseHotkeyKeys;
+        record.setValueHotkeyKeys = entry.setValueHotkeyKeys;
+        record.setValueHotkeyValue = entry.setValueHotkeyValue;
+        record.hotkeyStep = entry.hotkeyStep;
+        record.optionsXml = entry.optionsXml;
+        if (record.isGroup || !record.script.empty() || !record.luaScript.empty()) {
+            record.readable = true;
+            if (!record.isGroup) record.currentValue = "(script preserved; not executed)";
+        }
+        loaded.push_back(std::move(record));
+    }
+
+    const bool containsScripts = tableContainsScripts(parsed);
+    disableAllWithoutExecute();
+    records_ = std::move(loaded);
+    tableMetadata_ = std::move(parsed);
+    nextId_ = nextId;
+    ++generation_;
+    return {.success = true, .recordCount = records_.size(),
+            .containsScripts = containsScripts, .errorCode = {}, .errorMessage = {}};
+}
+
+TableOperationResult AddressListController::saveTable(const std::string& path,
+                                                       bool json) const {
+    if (path.empty())
+        return {.success = false, .errorCode = "path_empty",
+                .errorMessage = "Choose a destination for the cheat table."};
+    CheatTable table = tableMetadata_;
+    table.entries.clear();
+    table.entries.reserve(records_.size());
+    std::vector<int> lastIdAtIndent;
+    for (const auto& record : records_) {
+        CheatEntry entry;
+        entry.id = record.id;
+        entry.description = record.description;
+        entry.address = record.address;
+        entry.addressString = record.addressString;
+        entry.offsets = record.offsets;
+        if (!record.addressExpression.empty()) {
+            if (const auto pointer = parsePointerExpression(record.addressExpression)) {
+                entry.addressString = pointer->base;
+                entry.offsets = pointer->offsets;
+            } else {
+                entry.addressString = record.addressExpression;
+                entry.offsets.clear();
+            }
+        }
+        entry.type = record.type;
+        entry.length = static_cast<int>(std::min<std::size_t>(
+            record.byteCount, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        entry.value = record.currentValue;
+        entry.active = record.active;
+        entry.showAsHex = record.showAsHex;
+        entry.showAsSigned = record.showAsSigned;
+        entry.freezeMode = record.freezeMode;
+        entry.autoAsmScript = record.script;
+        entry.luaScript = record.luaScript;
+        entry.isGroup = record.isGroup;
+        entry.collapsed = record.collapsed;
+        entry.activateChildren = record.activateChildren;
+        entry.deactivateChildren = record.deactivateChildren;
+        entry.color = record.color;
+        entry.dropdownList = record.dropdownList;
+        entry.hotkeyKeys = record.hotkeyKeys;
+        entry.increaseHotkeyKeys = record.increaseHotkeyKeys;
+        entry.decreaseHotkeyKeys = record.decreaseHotkeyKeys;
+        entry.setValueHotkeyKeys = record.setValueHotkeyKeys;
+        entry.setValueHotkeyValue = record.setValueHotkeyValue;
+        entry.hotkeyStep = record.hotkeyStep;
+        entry.optionsXml = record.optionsXml;
+
+        const int indent = std::max(0, record.indent);
+        if (indent > 0 && static_cast<std::size_t>(indent - 1) < lastIdAtIndent.size())
+            entry.parentId = lastIdAtIndent[static_cast<std::size_t>(indent - 1)];
+        if (static_cast<std::size_t>(indent) >= lastIdAtIndent.size())
+            lastIdAtIndent.resize(static_cast<std::size_t>(indent) + 1, -1);
+        lastIdAtIndent[static_cast<std::size_t>(indent)] = record.id;
+        lastIdAtIndent.resize(static_cast<std::size_t>(indent) + 1);
+        table.entries.push_back(std::move(entry));
+    }
+
+    bool saved = false;
+    try {
+        saved = json ? table.saveJson(path) : table.save(path);
+    } catch (const std::exception& error) {
+        return {.success = false, .recordCount = records_.size(),
+                .containsScripts = tableContainsScripts(table),
+                .errorCode = "table_write_failed",
+                .errorMessage = std::string("The cheat table could not be saved: ") + error.what()};
+    } catch (...) {
+        return {.success = false, .recordCount = records_.size(),
+                .containsScripts = tableContainsScripts(table),
+                .errorCode = "table_write_failed",
+                .errorMessage = "The cheat table could not be saved."};
+    }
+    if (!saved)
+        return {.success = false, .recordCount = records_.size(),
+                .containsScripts = tableContainsScripts(table),
+                .errorCode = "table_write_failed",
+                .errorMessage = "The cheat-table file could not be written."};
+    return {.success = true, .recordCount = records_.size(),
+            .containsScripts = tableContainsScripts(table),
+            .errorCode = {}, .errorMessage = {}};
+}
+
 void AddressListController::freezeTick() noexcept {
     try {
         if (!process_) return;
         for (auto& record : records_) {
-            if (!record.active || record.isGroup || record.frozenValue.empty()) continue;
+            if (!record.active || record.isGroup || !record.script.empty() ||
+                !record.luaScript.empty() || record.frozenValue.empty()) continue;
             if (!resolveAddress(record)) continue;
             bool shouldWrite = true;
             if (record.freezeMode != FreezeMode::Normal) {
@@ -644,6 +978,8 @@ AddressRecordSnapshot AddressListController::snapshot(const Record& record) cons
             .bigEndian = record.bigEndian,
             .byteCount = record.byteCount,
             .isGroup = record.isGroup,
+            .collapsed = record.collapsed,
+            .hasScript = !record.script.empty() || !record.luaScript.empty(),
             .indent = record.indent};
 }
 
@@ -792,7 +1128,13 @@ bool AddressListController::setColor(int id, const std::string& color) {
 bool AddressListController::setScript(int id, const std::string& script) {
     const int index = indexOf(id);
     if (index < 0) return false;
-    records_[static_cast<std::size_t>(index)].script = script;
+    auto& record = records_[static_cast<std::size_t>(index)];
+    if (record.active) {
+        record.active = false;
+        record.frozenValue.clear();
+        if (activationCallback_) activationCallback_(id, false);
+    }
+    record.script = script;
     return true;
 }
 

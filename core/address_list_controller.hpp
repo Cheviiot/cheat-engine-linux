@@ -8,6 +8,7 @@
 /// engine, while presentation and transient selection stay in the frontend.
 
 #include "core/address_list.hpp"
+#include "core/ct_file.hpp"
 #include "core/value_codec.hpp"
 
 #include <cstddef>
@@ -37,12 +38,22 @@ struct AddressRecordSnapshot {
     bool bigEndian = false;
     std::size_t byteCount = 0;
     bool isGroup = false;
+    bool collapsed = false;
+    bool hasScript = false;
     int indent = 0;
 };
 
 struct AddressOperationResult {
     bool success = false;
     int id = 0;
+    std::string errorCode;
+    std::string errorMessage;
+};
+
+struct TableOperationResult {
+    bool success = false;
+    std::size_t recordCount = 0;
+    bool containsScripts = false;
     std::string errorCode;
     std::string errorMessage;
 };
@@ -68,6 +79,12 @@ public:
     AddressOperationResult activateRecord(int id, bool active);
     AddressOperationResult removeRecord(int id);
     AddressOperationResult changeFreezeMode(int id, FreezeMode mode);
+    AddressOperationResult groupRecords(const std::vector<int>& ids,
+                                        const std::string& description);
+    AddressOperationResult moveRecord(int id, int direction);
+    AddressOperationResult setRecordCollapsed(int id, bool collapsed);
+    TableOperationResult loadTable(const std::string& path);
+    TableOperationResult saveTable(const std::string& path, bool json) const;
     void freezeTick() noexcept;
 
     // IAddressList
@@ -117,10 +134,23 @@ private:
         bool showAsSigned = true;
         bool bigEndian = false;
         bool isGroup = false;
+        bool collapsed = false;
+        bool activateChildren = true;
+        bool deactivateChildren = true;
         int indent = 0;
         std::string color;
         std::string script;
+        std::string luaScript;
+        std::string addressString;
+        std::vector<std::int64_t> offsets;
+        std::string dropdownList;
         std::string hotkeyKeys;
+        std::string increaseHotkeyKeys;
+        std::string decreaseHotkeyKeys;
+        std::string setValueHotkeyKeys;
+        std::string setValueHotkeyValue;
+        std::string hotkeyStep;
+        std::string optionsXml;
         ValueCodec codec;
     };
 
@@ -138,6 +168,7 @@ private:
     AddressOperationResult success(int id) const;
 
     std::vector<Record> records_;
+    CheatTable tableMetadata_;
     ProcessHandle* process_ = nullptr;
     SymbolResolver* symbolResolver_ = nullptr;
     ActivationCallback activationCallback_;

@@ -108,6 +108,8 @@ mod ffi {
         show_as_hex: bool,
         byte_count: u32,
         is_group: bool,
+        collapsed: bool,
+        has_script: bool,
         indent: i32,
     }
 
@@ -122,6 +124,14 @@ mod ffi {
     struct AddressActionResult {
         accepted: bool,
         id: i32,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct TableActionResult {
+        accepted: bool,
+        record_count: u64,
+        contains_scripts: bool,
         error_code: String,
         error_message: String,
     }
@@ -181,6 +191,27 @@ mod ffi {
             mode: u8,
         ) -> AddressActionResult;
         fn delete_address(self: Pin<&mut EngineFacade>, id: i32) -> AddressActionResult;
+        fn add_address_group(
+            self: Pin<&mut EngineFacade>,
+            description: &str,
+        ) -> AddressActionResult;
+        fn group_addresses(
+            self: Pin<&mut EngineFacade>,
+            ids: &[i32],
+            description: &str,
+        ) -> AddressActionResult;
+        fn move_address(
+            self: Pin<&mut EngineFacade>,
+            id: i32,
+            direction: i32,
+        ) -> AddressActionResult;
+        fn set_address_collapsed(
+            self: Pin<&mut EngineFacade>,
+            id: i32,
+            collapsed: bool,
+        ) -> AddressActionResult;
+        fn load_table(self: Pin<&mut EngineFacade>, path: &str) -> TableActionResult;
+        fn save_table(self: &EngineFacade, path: &str, json: bool) -> TableActionResult;
         fn freeze_addresses(self: Pin<&mut EngineFacade>);
     }
 }
@@ -527,6 +558,8 @@ pub struct AddressRecord {
     pub show_as_hex: bool,
     pub byte_count: u32,
     pub is_group: bool,
+    pub collapsed: bool,
+    pub has_script: bool,
     pub indent: i32,
 }
 
@@ -543,6 +576,12 @@ pub struct AddressPage {
 pub struct AddressError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableAction {
+    pub record_count: u64,
+    pub contains_scripts: bool,
 }
 
 pub struct Engine {
@@ -726,6 +765,8 @@ impl Engine {
                         show_as_hex: row.show_as_hex,
                         byte_count: row.byte_count,
                         is_group: row.is_group,
+                        collapsed: row.collapsed,
+                        has_script: row.has_script,
                         indent: row.indent,
                     })
                 })
@@ -783,6 +824,30 @@ impl Engine {
         address_action(self.inner.pin_mut().delete_address(id)).map(|_| ())
     }
 
+    pub fn add_address_group(&mut self, description: &str) -> Result<i32, AddressError> {
+        address_action(self.inner.pin_mut().add_address_group(description))
+    }
+
+    pub fn group_addresses(&mut self, ids: &[i32], description: &str) -> Result<i32, AddressError> {
+        address_action(self.inner.pin_mut().group_addresses(ids, description))
+    }
+
+    pub fn move_address(&mut self, id: i32, direction: i32) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().move_address(id, direction)).map(|_| ())
+    }
+
+    pub fn set_address_collapsed(&mut self, id: i32, collapsed: bool) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_address_collapsed(id, collapsed)).map(|_| ())
+    }
+
+    pub fn load_table(&mut self, path: &str) -> Result<TableAction, AddressError> {
+        table_action(self.inner.pin_mut().load_table(path))
+    }
+
+    pub fn save_table(&self, path: &str, json: bool) -> Result<TableAction, AddressError> {
+        table_action(self.inner.save_table(path, json))
+    }
+
     pub fn freeze_addresses(&mut self) {
         self.inner.pin_mut().freeze_addresses();
     }
@@ -791,6 +856,20 @@ impl Engine {
 fn address_action(result: ffi::AddressActionResult) -> Result<i32, AddressError> {
     if result.accepted {
         Ok(result.id)
+    } else {
+        Err(AddressError {
+            code: result.error_code,
+            message: result.error_message,
+        })
+    }
+}
+
+fn table_action(result: ffi::TableActionResult) -> Result<TableAction, AddressError> {
+    if result.accepted {
+        Ok(TableAction {
+            record_count: result.record_count,
+            contains_scripts: result.contains_scripts,
+        })
     } else {
         Err(AddressError {
             code: result.error_code,
@@ -808,10 +887,19 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use std::cell::UnsafeCell;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType};
+
+    fn temporary_table_path(extension: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ce-gtk-{}-{nonce}.{extension}", std::process::id()))
+    }
 
     fn wait_for_scan(engine: &Engine) -> ScanStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1368,5 +1456,160 @@ mod tests {
             })
             .expect_err("next scan without first result must fail");
         assert_eq!(error.code, "no_scan_result");
+    }
+
+    #[test]
+    fn address_groups_move_as_subtrees_and_round_trip_through_ct() {
+        let mut engine = Engine::new();
+        let health = engine
+            .add_address(0x1000, ScanValueType::Int32, "Health", 0, false)
+            .expect("add health");
+        let armor = engine
+            .add_address(0x2000, ScanValueType::Int32, "Armor", 0, false)
+            .expect("add armor");
+        let score = engine
+            .add_address(0x3000, ScanValueType::Int64, "Score", 0, true)
+            .expect("add score");
+        let group = engine
+            .group_addresses(&[health, armor], "Player")
+            .expect("group records");
+
+        let grouped = engine.address_rows(0, 20, false);
+        assert_eq!(
+            grouped.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [group, health, armor, score]
+        );
+        assert_eq!(
+            grouped
+                .rows
+                .iter()
+                .map(|row| row.indent)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 0]
+        );
+
+        engine
+            .move_address(group, 1)
+            .expect("move complete group subtree down");
+        engine
+            .set_address_collapsed(group, true)
+            .expect("collapse group");
+        let moved = engine.address_rows(0, 20, false);
+        assert_eq!(
+            moved.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [score, group, health, armor]
+        );
+
+        let path = temporary_table_path("CT");
+        let action = engine
+            .save_table(path.to_str().expect("UTF-8 temp path"), false)
+            .expect("save CT");
+        assert_eq!(action.record_count, 4);
+        assert!(!action.contains_scripts);
+
+        let mut loaded = Engine::new();
+        let action = loaded
+            .load_table(path.to_str().expect("UTF-8 temp path"))
+            .expect("load CT");
+        assert_eq!(action.record_count, 4);
+        let rows = loaded.address_rows(0, 20, false).rows;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.description.as_str())
+                .collect::<Vec<_>>(),
+            ["Score", "Player", "Health", "Armor"]
+        );
+        assert!(rows[1].is_group);
+        assert!(rows[1].collapsed);
+        assert_eq!(rows[2].indent, 1);
+        assert_eq!(rows[3].indent, 1);
+
+        loaded
+            .delete_address(rows[1].id)
+            .expect("delete group subtree");
+        assert_eq!(loaded.address_rows(0, 20, false).total_count, 1);
+        std::fs::remove_file(path).expect("remove temporary CT");
+    }
+
+    #[test]
+    fn table_scripts_are_preserved_but_never_activated_on_load() {
+        let source = temporary_table_path("CT");
+        let saved = temporary_table_path("roundtrip.CT");
+        std::fs::write(
+            &source,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable>
+  <CheatEntries>
+    <CheatEntry>
+      <ID>7</ID>
+      <Description>"Untrusted script"</Description>
+      <Activated>1</Activated>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+alloc(newmem,64)
+[DISABLE]
+dealloc(newmem)</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <LuaScript>error('must not execute')</LuaScript>
+</CheatTable>
+"#,
+        )
+        .expect("write script table fixture");
+
+        let mut engine = Engine::new();
+        let action = engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("load script table without execution");
+        assert!(action.contains_scripts);
+        let row = &engine.address_rows(0, 10, false).rows[0];
+        assert!(row.has_script);
+        assert!(!row.active, "loaded scripts must always remain inactive");
+        assert_eq!(
+            engine
+                .set_address_active(row.id, true)
+                .expect_err("script activation is intentionally unavailable")
+                .code,
+            "script_not_executable"
+        );
+
+        engine
+            .save_table(saved.to_str().expect("UTF-8 temp path"), false)
+            .expect("save script table");
+        let xml = std::fs::read_to_string(&saved).expect("read saved script table");
+        assert!(xml.contains("error('must not execute')"));
+        assert!(xml.contains("alloc(newmem,64)"));
+
+        std::fs::remove_file(source).expect("remove script table fixture");
+        std::fs::remove_file(saved).expect("remove script table round trip");
+    }
+
+    #[test]
+    fn failed_or_protected_table_load_keeps_the_current_records() {
+        let invalid = temporary_table_path("CT");
+        let protected = temporary_table_path("CETRAINER");
+        std::fs::write(&invalid, "this is not a cheat table").expect("write invalid table");
+        std::fs::write(&protected, "CETRAINER1\nopaque payload").expect("write protected table");
+
+        let mut engine = Engine::new();
+        let id = engine
+            .add_address(0x1234, ScanValueType::Int32, "Keep me", 0, false)
+            .expect("add existing record");
+        let invalid_error = engine
+            .load_table(invalid.to_str().expect("UTF-8 temp path"))
+            .expect_err("invalid table must be rejected");
+        assert_eq!(invalid_error.code, "invalid_table");
+        let protected_error = engine
+            .load_table(protected.to_str().expect("UTF-8 temp path"))
+            .expect_err("protected table needs an explicit password workflow");
+        assert_eq!(protected_error.code, "protected_table");
+
+        let rows = engine.address_rows(0, 10, false).rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].description, "Keep me");
+
+        std::fs::remove_file(invalid).expect("remove invalid table fixture");
+        std::fs::remove_file(protected).expect("remove protected table fixture");
     }
 }

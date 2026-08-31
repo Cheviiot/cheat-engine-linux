@@ -39,9 +39,25 @@ Completed in the foundation and first vertical slices:
   accepts scan results and manual addresses, refreshes live values, edits on
   Enter, freezes at 100 ms, selects directional freeze policy, and removes
   records;
+- shared hierarchy operations with stable IDs: multi-selection grouping,
+  subtree-aware deletion and up/down reordering, group collapse state, and
+  bounded GTK rendering of collapsed trees;
+- transactional `.CT`/native-JSON load and save through the existing
+  `CheatTable` parser, preserving pointer expressions, table metadata,
+  structures, disassembler comments, hotkeys, dropdowns, entry Lua, Auto
+  Assembler, and table-level Lua; XML `.CT` round trips also retain embedded
+  form definitions;
+- native GTK file dialogs and address-list actions for opening/saving tables,
+  adding empty groups, grouping selected records, moving complete subtrees, and
+  collapsing groups;
+- a conservative table trust boundary: imported records are always inactive,
+  Lua and Auto Assembler content is visibly marked and preserved but cannot be
+  executed, and password-protected CETRAINER input returns an explicit
+  unsupported error until a password workflow exists;
 - bridge tests that exercise real self-process writes, normal and directional
   freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
-  codecs;
+  codecs, plus group/subtree semantics, `.CT` hierarchy round trips, atomic
+  failure behavior, protected-table rejection, and script non-execution;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
@@ -49,9 +65,11 @@ The current pager deliberately keeps only one bounded page in GTK.  A later
 performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
 contract.  The address-list controller is now the GTK source of truth; the next
-slice moves the legacy Qt model onto that controller and adds grouping,
-reordering, and `.CT` persistence before script activation.  No product
-identifier should be published before the branding decision.
+slice moves the legacy Qt model onto that controller, then adds an explicit
+trust prompt and separately reviewed Lua/Auto Assembler activation path.  The
+GTK frontend does not yet open password-protected CETRAINER files, expose a
+loss report, or virtualize address rows beyond its bounded first page.  No
+product identifier should be published before the branding decision.
 
 ## Goal
 

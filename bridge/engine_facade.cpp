@@ -41,6 +41,8 @@ constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
 constexpr std::size_t kMaxAddressTextSize = 1u << 20;
 constexpr std::size_t kMaxAddressDescriptionSize = 1024;
+constexpr std::size_t kMaxAddressGroupSelection = 4096;
+constexpr std::size_t kMaxTablePathSize = 4096;
 
 std::string ascii_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -1134,6 +1136,8 @@ AddressPage EngineFacade::address_rows(std::uint64_t start, std::uint32_t limit,
             .byte_count = static_cast<std::uint32_t>(std::min<std::size_t>(
                 record.byteCount, std::numeric_limits<std::uint32_t>::max())),
             .is_group = record.isGroup,
+            .collapsed = record.collapsed,
+            .has_script = record.hasScript,
             .indent = record.indent,
         });
     }
@@ -1276,6 +1280,104 @@ AddressActionResult EngineFacade::delete_address(std::int32_t id) {
     return AddressActionResult{
         .accepted = result.success,
         .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+AddressActionResult EngineFacade::add_address_group(rust::Str description) {
+    std::string label(description);
+    if (label.size() > kMaxAddressDescriptionSize) label.resize(kMaxAddressDescriptionSize);
+    const int id = address_list_->createGroup(label);
+    return AddressActionResult{
+        .accepted = id > 0,
+        .id = id,
+        .error_code = id > 0 ? "" : "group_create_failed",
+        .error_message = id > 0 ? "" : "The address-list group could not be created.",
+    };
+}
+
+AddressActionResult EngineFacade::group_addresses(
+    rust::Slice<const std::int32_t> ids, rust::Str description) {
+    if (ids.size() > kMaxAddressGroupSelection) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = 0,
+            .error_code = "selection_too_large",
+            .error_message = "Too many address-list records were selected.",
+        };
+    }
+    std::string label(description);
+    if (label.size() > kMaxAddressDescriptionSize) label.resize(kMaxAddressDescriptionSize);
+    std::vector<int> selected(ids.begin(), ids.end());
+    const auto result = address_list_->groupRecords(selected, label);
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+AddressActionResult EngineFacade::move_address(std::int32_t id,
+                                                std::int32_t direction) {
+    const auto result = address_list_->moveRecord(id, direction);
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+AddressActionResult EngineFacade::set_address_collapsed(std::int32_t id,
+                                                         bool collapsed) {
+    const auto result = address_list_->setRecordCollapsed(id, collapsed);
+    return AddressActionResult{
+        .accepted = result.success,
+        .id = result.id,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+TableActionResult EngineFacade::load_table(rust::Str path) {
+    std::string file(path);
+    if (file.size() > kMaxTablePathSize || file.find('\0') != std::string::npos) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = 0,
+            .contains_scripts = false,
+            .error_code = "invalid_path",
+            .error_message = "The cheat-table path is invalid or too long.",
+        };
+    }
+    const auto result = address_list_->loadTable(file);
+    return TableActionResult{
+        .accepted = result.success,
+        .record_count = static_cast<std::uint64_t>(result.recordCount),
+        .contains_scripts = result.containsScripts,
+        .error_code = result.errorCode,
+        .error_message = result.errorMessage,
+    };
+}
+
+TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
+    std::string file(path);
+    if (file.size() > kMaxTablePathSize || file.find('\0') != std::string::npos) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = 0,
+            .contains_scripts = false,
+            .error_code = "invalid_path",
+            .error_message = "The cheat-table path is invalid or too long.",
+        };
+    }
+    const auto result = address_list_->saveTable(file, json);
+    return TableActionResult{
+        .accepted = result.success,
+        .record_count = static_cast<std::uint64_t>(result.recordCount),
+        .contains_scripts = result.containsScripts,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
     };
