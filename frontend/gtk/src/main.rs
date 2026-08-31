@@ -1,3 +1,4 @@
+mod address_list_model;
 mod application;
 mod bridge;
 mod process_dialog;
@@ -22,13 +23,17 @@ fn main() -> adw::glib::ExitCode {
     let lua_console_smoke = arguments
         .iter()
         .any(|argument| argument == "--lua-console-smoke");
-    if startup_smoke || lua_console_smoke {
+    let address_list_smoke = arguments
+        .iter()
+        .any(|argument| argument == "--address-list-smoke");
+    if startup_smoke || lua_console_smoke || address_list_smoke {
         application.connect_activate(move |application| {
             if startup_smoke && let Some(window) = application.active_window() {
                 process_dialog::present(&window, |_| {});
             }
             let application = application.clone();
-            adw::glib::timeout_add_local_once(Duration::from_millis(350), move || {
+            let timeout = if address_list_smoke { 1800 } else { 350 };
+            adw::glib::timeout_add_local_once(Duration::from_millis(timeout), move || {
                 application.quit();
             });
         });
@@ -36,5 +41,11 @@ fn main() -> adw::glib::ExitCode {
 
     // Custom diagnostic flags are handled above and must not reach GApplication's
     // own option parser, which correctly rejects unknown command-line options.
-    application.run_with_args(&["ce-gtk"])
+    let exit_code = application.run_with_args(&["ce-gtk"]);
+    if address_list_smoke && !application::address_list_smoke_ok() {
+        eprintln!("virtual address-list smoke did not load the second page");
+        adw::glib::ExitCode::FAILURE
+    } else {
+        exit_code
+    }
 }

@@ -119,6 +119,7 @@ mod ffi {
         generation: u64,
         start: u64,
         total_count: u64,
+        raw_total_count: u64,
         error_message: String,
         rows: Vec<AddressRow>,
     }
@@ -191,6 +192,7 @@ mod ffi {
 
     struct RuntimeTickResult {
         runtime_generation: u64,
+        address_generation: u64,
         address_refresh_due: bool,
         timer_count: u32,
         timers_fired: u32,
@@ -219,7 +221,7 @@ mod ffi {
         fn scan_status(self: &EngineFacade) -> ScanStatus;
         fn scan_rows(self: &EngineFacade, generation: u64, start: u64, limit: u32) -> ScanPage;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
-        fn address_rows(
+        fn visible_address_rows(
             self: Pin<&mut EngineFacade>,
             start: u64,
             limit: u32,
@@ -659,6 +661,7 @@ pub struct AddressPage {
     pub generation: u64,
     pub start: u64,
     pub total_count: u64,
+    pub raw_total_count: u64,
     pub error_message: String,
     pub rows: Vec<AddressRecord>,
 }
@@ -753,6 +756,7 @@ pub struct LuaConsoleExecution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTick {
     pub runtime_generation: u64,
+    pub address_generation: u64,
     pub address_refresh_due: bool,
     pub timer_count: u32,
     pub timers_fired: u32,
@@ -770,6 +774,43 @@ pub struct Engine {
 // thread affinity. Moving the whole owner to a worker thread is therefore safe;
 // callers never share or access it concurrently.
 unsafe impl Send for Engine {}
+
+fn address_page(page: ffi::AddressPage) -> AddressPage {
+    AddressPage {
+        generation: page.generation,
+        start: page.start,
+        total_count: page.total_count,
+        raw_total_count: page.raw_total_count,
+        error_message: page.error_message,
+        rows: page
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(AddressRecord {
+                    id: row.id,
+                    description: row.description,
+                    address: row.address,
+                    address_expression: row.address_expression,
+                    value_type: ScanValueType::from_index(u32::from(row.value_type))?,
+                    type_name: row.type_name,
+                    value: row.value,
+                    error_message: row.error_message,
+                    readable: row.readable,
+                    active: row.active,
+                    freeze_mode: FreezeMode::from_index(u32::from(row.freeze_mode))?,
+                    show_as_hex: row.show_as_hex,
+                    byte_count: row.byte_count,
+                    is_group: row.is_group,
+                    collapsed: row.collapsed,
+                    has_script: row.has_script,
+                    has_auto_assembler: row.has_auto_assembler,
+                    has_lua: row.has_lua,
+                    indent: row.indent,
+                })
+            })
+            .collect(),
+    }
+}
 
 impl Engine {
     pub fn new() -> Self {
@@ -914,44 +955,17 @@ impl Engine {
         self.inner.pin_mut().cancel_scan();
     }
 
-    pub fn address_rows(&mut self, start: u64, limit: u32, refresh_values: bool) -> AddressPage {
+    pub fn visible_address_rows(
+        &mut self,
+        start: u64,
+        limit: u32,
+        refresh_values: bool,
+    ) -> AddressPage {
         let page = self
             .inner
             .pin_mut()
-            .address_rows(start, limit, refresh_values);
-        AddressPage {
-            generation: page.generation,
-            start: page.start,
-            total_count: page.total_count,
-            error_message: page.error_message,
-            rows: page
-                .rows
-                .into_iter()
-                .filter_map(|row| {
-                    Some(AddressRecord {
-                        id: row.id,
-                        description: row.description,
-                        address: row.address,
-                        address_expression: row.address_expression,
-                        value_type: ScanValueType::from_index(u32::from(row.value_type))?,
-                        type_name: row.type_name,
-                        value: row.value,
-                        error_message: row.error_message,
-                        readable: row.readable,
-                        active: row.active,
-                        freeze_mode: FreezeMode::from_index(u32::from(row.freeze_mode))?,
-                        show_as_hex: row.show_as_hex,
-                        byte_count: row.byte_count,
-                        is_group: row.is_group,
-                        collapsed: row.collapsed,
-                        has_script: row.has_script,
-                        has_auto_assembler: row.has_auto_assembler,
-                        has_lua: row.has_lua,
-                        indent: row.indent,
-                    })
-                })
-                .collect(),
-        }
+            .visible_address_rows(start, limit, refresh_values);
+        address_page(page)
     }
 
     pub fn add_scan_result(
@@ -1145,6 +1159,7 @@ impl Engine {
         let result = self.inner.pin_mut().periodic_tick();
         RuntimeTick {
             runtime_generation: result.runtime_generation,
+            address_generation: result.address_generation,
             address_refresh_due: result.address_refresh_due,
             timer_count: result.timer_count,
             timers_fired: result.timers_fired,
@@ -1568,7 +1583,7 @@ mod tests {
             .add_address(address, ScanValueType::Int32, "Score", 0, false)
             .expect("add a manual address");
 
-        let page = engine.address_rows(0, 10_000, true);
+        let page = engine.visible_address_rows(0, 10_000, true);
         assert_eq!(page.total_count, 1);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, id);
@@ -1607,14 +1622,14 @@ mod tests {
         );
 
         engine.detach().expect("detach address-list target");
-        let detached = engine.address_rows(0, 10, false);
+        let detached = engine.visible_address_rows(0, 10, false);
         assert_eq!(detached.total_count, 1);
         assert!(!detached.rows[0].active);
         assert!(!detached.rows[0].readable);
         assert_eq!(detached.rows[0].value, "??");
 
         engine.delete_address(id).expect("remove the record");
-        assert_eq!(engine.address_rows(0, 10, false).total_count, 0);
+        assert_eq!(engine.visible_address_rows(0, 10, false).total_count, 0);
         std::hint::black_box(value);
     }
 
@@ -1640,7 +1655,7 @@ mod tests {
         let id = engine
             .add_scan_result(first.generation, 0, "Scanned value")
             .expect("add the scan result");
-        let records = engine.address_rows(0, 10, true);
+        let records = engine.visible_address_rows(0, 10, true);
         assert_eq!(records.rows[0].id, id);
         assert_eq!(records.rows[0].address, address + 4);
         assert_eq!(records.rows[0].value, "222");
@@ -1728,7 +1743,7 @@ mod tests {
         );
         assert_eq!(unsafe { *bytes_value.get() }, [0x90, 0x90, 0x48, 0x8b]);
 
-        let page = engine.address_rows(0, 10, true);
+        let page = engine.visible_address_rows(0, 10, true);
         assert_eq!(page.rows[0].value, "2.5");
         assert_eq!(page.rows[1].value, "Rust");
         assert_eq!(page.rows[2].value, "Ж");
@@ -1783,7 +1798,7 @@ mod tests {
             .group_addresses(&[health, armor], "Player")
             .expect("group records");
 
-        let grouped = engine.address_rows(0, 20, false);
+        let grouped = engine.visible_address_rows(0, 20, false);
         assert_eq!(
             grouped.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             [group, health, armor, score]
@@ -1803,11 +1818,16 @@ mod tests {
         engine
             .set_address_collapsed(group, true)
             .expect("collapse group");
-        let moved = engine.address_rows(0, 20, false);
+        let moved = engine.visible_address_rows(0, 20, false);
+        assert_eq!(moved.total_count, 2);
+        assert_eq!(moved.raw_total_count, 4);
         assert_eq!(
             moved.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            [score, group, health, armor]
+            [score, group]
         );
+        let second_visible = engine.visible_address_rows(1, 1, false);
+        assert_eq!(second_visible.total_count, 2);
+        assert_eq!(second_visible.rows[0].id, group);
 
         let path = temporary_table_path("CT");
         let action = engine
@@ -1821,23 +1841,63 @@ mod tests {
             .load_table(path.to_str().expect("UTF-8 temp path"))
             .expect("load CT");
         assert_eq!(action.record_count, 4);
-        let rows = loaded.address_rows(0, 20, false).rows;
+        let collapsed_rows = loaded.visible_address_rows(0, 20, false).rows;
+        assert_eq!(
+            collapsed_rows
+                .iter()
+                .map(|row| row.description.as_str())
+                .collect::<Vec<_>>(),
+            ["Score", "Player"]
+        );
+        assert!(collapsed_rows[1].is_group);
+        assert!(collapsed_rows[1].collapsed);
+        let loaded_group = collapsed_rows[1].id;
+        loaded
+            .set_address_collapsed(loaded_group, false)
+            .expect("expand the reloaded group");
+        let rows = loaded.visible_address_rows(0, 20, false).rows;
         assert_eq!(
             rows.iter()
                 .map(|row| row.description.as_str())
                 .collect::<Vec<_>>(),
             ["Score", "Player", "Health", "Armor"]
         );
-        assert!(rows[1].is_group);
-        assert!(rows[1].collapsed);
         assert_eq!(rows[2].indent, 1);
         assert_eq!(rows[3].indent, 1);
 
         loaded
-            .delete_address(rows[1].id)
+            .delete_address(loaded_group)
             .expect("delete group subtree");
-        assert_eq!(loaded.address_rows(0, 20, false).total_count, 1);
+        assert_eq!(loaded.visible_address_rows(0, 20, false).total_count, 1);
         std::fs::remove_file(path).expect("remove temporary CT");
+    }
+
+    #[test]
+    fn visible_address_pages_are_bounded_and_cover_large_tables() {
+        let mut engine = Engine::new();
+        for index in 0..600_u64 {
+            engine
+                .add_address(
+                    0x1000 + index * 4,
+                    ScanValueType::Int32,
+                    &format!("Record {index}"),
+                    0,
+                    false,
+                )
+                .expect("add large-table fixture record");
+        }
+
+        let first = engine.visible_address_rows(0, 10_000, false);
+        let second = engine.visible_address_rows(256, 10_000, false);
+        let third = engine.visible_address_rows(512, 10_000, false);
+        assert_eq!(first.total_count, 600);
+        assert_eq!(first.raw_total_count, 600);
+        assert_eq!(first.rows.len(), 256);
+        assert_eq!(second.rows.len(), 256);
+        assert_eq!(third.rows.len(), 88);
+        assert_eq!(first.rows[0].description, "Record 0");
+        assert_eq!(second.rows[0].description, "Record 256");
+        assert_eq!(third.rows[87].description, "Record 599");
     }
 
     #[test]
@@ -1953,7 +2013,7 @@ dealloc(newmem)</AssemblerScript>
                 .code,
             "invalid_script_kind"
         );
-        let rows = engine.address_rows(0, 10, false).rows;
+        let rows = engine.visible_address_rows(0, 10, false).rows;
         let row = rows.iter().find(|row| row.id == 7).expect("AA row");
         let lua_row = rows.iter().find(|row| row.id == 8).expect("Lua row");
         assert!(row.has_script && row.has_auto_assembler && !row.has_lua);
@@ -2329,7 +2389,7 @@ dd #99
             .load_table(source.to_str().expect("UTF-8 temp path"))
             .expect("load script without executing it");
         assert!(action.contains_auto_assembler);
-        let rows = engine.address_rows(0, 10, false).rows;
+        let rows = engine.visible_address_rows(0, 10, false).rows;
         let group_id = rows
             .iter()
             .find(|row| row.is_group)
@@ -2359,7 +2419,7 @@ dd #99
         assert_eq!(unsafe { *value.get() }, 99);
         assert!(
             engine
-                .address_rows(0, 10, false)
+                .visible_address_rows(0, 10, false)
                 .rows
                 .iter()
                 .find(|row| row.id == id)
@@ -2373,7 +2433,7 @@ dd #99
         assert_eq!(unsafe { *value.get() }, 41);
         assert!(
             !engine
-                .address_rows(0, 10, false)
+                .visible_address_rows(0, 10, false)
                 .rows
                 .iter()
                 .find(|row| row.id == id)
@@ -2395,7 +2455,7 @@ dd #99
         assert_eq!(unsafe { *value.get() }, 41);
         assert!(
             !engine
-                .address_rows(0, 10, false)
+                .visible_address_rows(0, 10, false)
                 .rows
                 .iter()
                 .find(|row| row.id == id)
@@ -2413,7 +2473,7 @@ dd #99
         assert_eq!(unsafe { *value.get() }, 41);
         assert!(
             !engine
-                .address_rows(0, 10, false)
+                .visible_address_rows(0, 10, false)
                 .rows
                 .iter()
                 .find(|row| row.id == id)
@@ -2432,7 +2492,7 @@ dd #99
             .delete_address(group_id)
             .expect("deleting an active script subtree disables it first");
         assert_eq!(unsafe { *value.get() }, 41);
-        assert_eq!(engine.address_rows(0, 10, false).total_count, 0);
+        assert_eq!(engine.visible_address_rows(0, 10, false).total_count, 0);
 
         std::fs::remove_file(source).expect("remove executable table fixture");
         std::hint::black_box(value);
@@ -2458,7 +2518,7 @@ dd #99
             .expect_err("protected table needs an explicit password workflow");
         assert_eq!(protected_error.code, "protected_table");
 
-        let rows = engine.address_rows(0, 10, false).rows;
+        let rows = engine.visible_address_rows(0, 10, false).rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id);
         assert_eq!(rows[0].description, "Keep me");

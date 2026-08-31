@@ -1,12 +1,18 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 
+use crate::address_list_model::{
+    AddressListModel, DEFAULT_ADDRESS_CACHE_PAGES, IssueHandler as AddressIssueHandler,
+    MAX_ADDRESS_PAGE_SIZE, ModelIssue as AddressModelIssue, PageLoader as AddressPageLoader,
+    VirtualAddressRow,
+};
 use crate::bridge::{
     AddressRecord, AttachError, Engine, FreezeMode, LuaExecution, Process, ProtectionMatch,
     ScanComparison, ScanRequest, ScanValueType, Session, TableScript, TableScriptKind,
@@ -18,8 +24,8 @@ use crate::scan_result_model::{
 };
 
 pub const DEVELOPMENT_APP_ID: &str = "io.github.cheviiot.CeGtk.Devel";
+static ADDRESS_LIST_SMOKE_OK: AtomicBool = AtomicBool::new(false);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const ADDRESS_PAGE_SIZE: u32 = 256;
 const SCRIPT_REVIEW_PAGE_SIZE: u32 = 64;
 const SCRIPT_TEXT_PAGE_SIZE: u32 = 64 << 10;
 const RUNTIME_TICK_INTERVAL: Duration = Duration::from_millis(30);
@@ -35,6 +41,7 @@ struct SessionState {
     scanning: Rc<Cell<bool>>,
     scan_generation: Rc<Cell<u64>>,
     address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
+    address_visible_pages: Rc<RefCell<HashMap<u64, usize>>>,
     selected_address_ids: Rc<RefCell<HashSet<i32>>>,
     table_scripts_trusted: Rc<Cell<bool>>,
     table_lua_trusted: Rc<Cell<bool>>,
@@ -83,7 +90,7 @@ struct SessionWidgets {
     scan_summary: gtk::Label,
     scan_result_model: ScanResultModel,
     page_label: gtk::Label,
-    address_list: gtk::ListBox,
+    address_list_model: AddressListModel,
     address_summary: gtk::Label,
     group_selected_button: gtk::Button,
     script_trust_button: gtk::Button,
@@ -104,8 +111,26 @@ pub fn build_application() -> adw::Application {
     application
 }
 
+pub fn address_list_smoke_ok() -> bool {
+    ADDRESS_LIST_SMOKE_OK.load(Ordering::SeqCst)
+}
+
 fn build_window(application: &adw::Application) {
-    let engine = Engine::new();
+    let mut engine = Engine::new();
+    let address_list_smoke = std::env::var_os("CE_GTK_ADDRESS_LIST_SMOKE").is_some();
+    if address_list_smoke {
+        for index in 0..600_u64 {
+            engine
+                .add_address(
+                    0x1000 + index * 4,
+                    ScanValueType::Int32,
+                    &format!("Virtual address {index}"),
+                    0,
+                    false,
+                )
+                .expect("populate the virtual address-list smoke fixture");
+        }
+    }
     let core_version = engine.version();
     let lua_runtime_generation = engine.lua_runtime_generation();
     let state = SessionState {
@@ -115,6 +140,7 @@ fn build_window(application: &adw::Application) {
         scanning: Rc::new(Cell::new(false)),
         scan_generation: Rc::new(Cell::new(0)),
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
+        address_visible_pages: Rc::new(RefCell::new(HashMap::new())),
         selected_address_ids: Rc::new(RefCell::new(HashSet::new())),
         table_scripts_trusted: Rc::new(Cell::new(false)),
         table_lua_trusted: Rc::new(Cell::new(false)),
@@ -428,13 +454,17 @@ fn build_window(application: &adw::Application) {
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    let address_list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
+    let address_list_model =
+        AddressListModel::new(MAX_ADDRESS_PAGE_SIZE, DEFAULT_ADDRESS_CACHE_PAGES);
+    let address_selection = gtk::NoSelection::new(Some(address_list_model.clone()));
+    let address_factory = gtk::SignalListItemFactory::new();
+    let address_list = gtk::ListView::new(Some(address_selection), Some(address_factory.clone()));
+    address_list.set_show_separators(true);
+    address_list.add_css_class("boxed-list");
     let address_list_scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .min_content_height(180)
+        .vexpand(true)
         .child(&address_list)
         .build();
 
@@ -524,13 +554,14 @@ fn build_window(application: &adw::Application) {
         scan_summary,
         scan_result_model,
         page_label,
-        address_list,
+        address_list_model,
         address_summary,
         group_selected_button,
         script_trust_button,
     };
 
     configure_scan_result_factory(&scan_result_factory, &state, &widgets);
+    configure_address_list_factory(&address_factory, &state, &widgets);
 
     update_scan_option_visibility(&widgets);
     widgets.value_type.connect_selected_notify({
@@ -676,6 +707,21 @@ fn build_window(application: &adw::Application) {
         let state = state.clone();
         move |_| present_lua_console_dialog(&window, &state)
     });
+
+    if address_list_smoke {
+        reload_address_list(&state, &widgets, false);
+        let address_list = address_list.clone();
+        let address_list_model = widgets.address_list_model.clone();
+        adw::glib::timeout_add_local(Duration::from_millis(50), move || {
+            address_list.scroll_to(300, gtk::ListScrollFlags::FOCUS, None);
+            if address_list_model.total_count() == 600 && address_list_model.is_loaded(300) {
+                ADDRESS_LIST_SMOKE_OK.store(true, Ordering::SeqCst);
+                adw::glib::ControlFlow::Break
+            } else {
+                adw::glib::ControlFlow::Continue
+            }
+        });
+    }
 
     install_runtime_tick(&state, &widgets);
 
@@ -2743,15 +2789,12 @@ fn install_runtime_tick(state: &SessionState, widgets: &SessionWidgets) {
     let state = state.clone();
     let widgets = widgets.clone();
     adw::glib::timeout_add_local(RUNTIME_TICK_INTERVAL, move || {
-        let (tick, page) = {
+        let tick = {
             let mut engine_slot = state.engine.borrow_mut();
             let Some(engine) = engine_slot.as_mut() else {
                 return adw::glib::ControlFlow::Continue;
             };
-            let tick = engine.periodic_tick();
-            let page = (state.attached.get() && tick.address_refresh_due)
-                .then(|| engine.address_rows(0, ADDRESS_PAGE_SIZE, true));
-            (tick, page)
+            engine.periodic_tick()
         };
 
         if tick.runtime_generation != state.lua_runtime_generation.get() {
@@ -2785,21 +2828,122 @@ fn install_runtime_tick(state: &SessionState, widgets: &SessionWidgets) {
             }
             status.set_label(&summary);
         }
-        if let Some(page) = page {
-            update_address_values(&state, &widgets, page);
+        if tick.address_generation != widgets.address_list_model.generation() {
+            reload_address_list(&state, &widgets, state.attached.get());
+        } else if state.attached.get() && tick.address_refresh_due {
+            let page_starts: Vec<_> = state
+                .address_visible_pages
+                .borrow()
+                .keys()
+                .copied()
+                .collect();
+            let refreshed = widgets.address_list_model.refresh_pages(&page_starts);
+            update_visible_address_values(&state, &refreshed);
         }
         adw::glib::ControlFlow::Continue
     });
 }
 
+fn configure_address_list_factory(
+    factory: &gtk::SignalListItemFactory,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+) {
+    factory.connect_setup(|_, object| {
+        let list_item = object
+            .downcast_ref::<gtk::ListItem>()
+            .expect("address factory receives list items");
+        let slot = gtk::Box::new(Orientation::Vertical, 0);
+        list_item.set_child(Some(&slot));
+    });
+    factory.connect_bind({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, object| {
+            let list_item = object
+                .downcast_ref::<gtk::ListItem>()
+                .expect("address factory receives list items");
+            let slot = list_item
+                .child()
+                .and_downcast::<gtk::Box>()
+                .expect("address row slot");
+            while let Some(child) = slot.first_child() {
+                slot.remove(&child);
+            }
+            let item = list_item
+                .item()
+                .and_downcast::<adw::glib::BoxedAnyObject>()
+                .expect("virtual address item");
+            let virtual_row = item.borrow::<VirtualAddressRow>().clone();
+            let row = match virtual_row {
+                VirtualAddressRow::Loading { index } => adw::ActionRow::builder()
+                    .title(format!("Loading address record #{}…", index + 1))
+                    .subtitle("Fetching this visible hierarchy page")
+                    .build(),
+                VirtualAddressRow::Loaded { record, .. } => {
+                    build_address_record_row(&state, &widgets, &record)
+                }
+                VirtualAddressRow::Error { index, message } => adw::ActionRow::builder()
+                    .title(format!("Address record #{} is unavailable", index + 1))
+                    .subtitle(message)
+                    .build(),
+            };
+            slot.append(&row);
+
+            let position = list_item.position();
+            if position != u32::MAX {
+                let page_start = widgets.address_list_model.page_start(position);
+                *state
+                    .address_visible_pages
+                    .borrow_mut()
+                    .entry(page_start)
+                    .or_default() += 1;
+            }
+        }
+    });
+    factory.connect_unbind({
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, object| {
+            let list_item = object
+                .downcast_ref::<gtk::ListItem>()
+                .expect("address factory receives list items");
+            if let Some(item) = list_item.item().and_downcast::<adw::glib::BoxedAnyObject>()
+                && let VirtualAddressRow::Loaded { record, .. } =
+                    &*item.borrow::<VirtualAddressRow>()
+            {
+                state.address_value_entries.borrow_mut().remove(&record.id);
+            }
+            let position = list_item.position();
+            if position != u32::MAX {
+                let page_start = widgets.address_list_model.page_start(position);
+                let mut pages = state.address_visible_pages.borrow_mut();
+                if let Some(count) = pages.get_mut(&page_start) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        pages.remove(&page_start);
+                    }
+                }
+            }
+            let slot = list_item
+                .child()
+                .and_downcast::<gtk::Box>()
+                .expect("address row slot");
+            while let Some(child) = slot.first_child() {
+                slot.remove(&child);
+            }
+        }
+    });
+}
+
 fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_values: bool) {
-    let (page, scripts_trusted, lua_trusted) = {
+    let (metadata, scripts_trusted, lua_trusted) = {
         let mut engine_slot = state.engine.borrow_mut();
         let Some(engine) = engine_slot.as_mut() else {
             return;
         };
         (
-            engine.address_rows(0, ADDRESS_PAGE_SIZE, refresh_values),
+            engine.visible_address_rows(0, 0, false),
             engine.table_scripts_trusted(),
             engine.table_lua_trusted(),
         )
@@ -2807,24 +2951,48 @@ fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_v
     state.table_scripts_trusted.set(scripts_trusted);
     state.table_lua_trusted.set(lua_trusted);
     update_script_trust_button(state, widgets);
-    render_address_records(state, widgets, page);
-}
-
-fn render_address_records(
-    state: &SessionState,
-    widgets: &SessionWidgets,
-    page: crate::bridge::AddressPage,
-) {
-    while let Some(child) = widgets.address_list.first_child() {
-        widgets.address_list.remove(&child);
-    }
     state.address_value_entries.borrow_mut().clear();
+    state.address_visible_pages.borrow_mut().clear();
 
-    if !page.error_message.is_empty() {
-        widgets.address_summary.set_label(&page.error_message);
+    if !metadata.error_message.is_empty() {
+        widgets.address_list_model.clear();
+        widgets.address_summary.set_label(&metadata.error_message);
         return;
     }
-    if page.total_count == 0 {
+    let engine = Rc::downgrade(&state.engine);
+    let load_live_values = refresh_values;
+    let loader: AddressPageLoader = Rc::new(move |generation, start, limit, refresh| {
+        let Some(engine) = engine.upgrade() else {
+            return Err("The address-list engine is no longer available.".to_owned());
+        };
+        let mut engine_slot = engine
+            .try_borrow_mut()
+            .map_err(|_| "The address-list engine is busy.".to_owned())?;
+        let Some(engine) = engine_slot.as_mut() else {
+            return Err("The address-list engine is temporarily unavailable.".to_owned());
+        };
+        let page = engine.visible_address_rows(start, limit, refresh || load_live_values);
+        if page.generation != generation {
+            return Ok(page);
+        }
+        Ok(page)
+    });
+    let address_summary = widgets.address_summary.clone();
+    let issue_handler: AddressIssueHandler = Rc::new(move |issue| match issue {
+        AddressModelIssue::Page(message) => address_summary.set_label(&message),
+        AddressModelIssue::Stale(message) => {
+            address_summary.set_label(&format!("{message} Refreshing the list…"));
+        }
+    });
+    widgets.address_list_model.configure(
+        metadata.generation,
+        metadata.total_count,
+        metadata.raw_total_count,
+        loader,
+        issue_handler,
+    );
+
+    if metadata.raw_total_count == 0 {
         state.selected_address_ids.borrow_mut().clear();
         widgets.group_selected_button.set_sensitive(false);
         widgets
@@ -2832,30 +3000,36 @@ fn render_address_records(
             .set_label("Add a scan result to edit or freeze its live value.");
         return;
     }
-
-    let available_ids: HashSet<_> = page.rows.iter().map(|record| record.id).collect();
-    state
-        .selected_address_ids
-        .borrow_mut()
-        .retain(|id| available_ids.contains(id));
     widgets
         .group_selected_button
         .set_sensitive(!state.selected_address_ids.borrow().is_empty());
-    let hidden = hidden_address_rows(&page.rows);
-    for (index, record) in page.rows.iter().enumerate() {
-        if hidden[index] {
-            continue;
-        }
-        append_address_record(state, widgets, record);
-    }
-    let truncated = (page.rows.len() as u64) < page.total_count;
+    let hidden_count = metadata
+        .raw_total_count
+        .saturating_sub(metadata.total_count);
+    let hierarchy = if hidden_count > 0 {
+        format!(" · {} hidden by collapsed groups", hidden_count)
+    } else {
+        String::new()
+    };
+    let displayed_count = u64::from(widgets.address_list_model.displayed_count());
+    let gtk_limit = if metadata.total_count > displayed_count {
+        format!(" · GTK exposes the first {displayed_count}")
+    } else {
+        String::new()
+    };
     widgets.address_summary.set_label(&format!(
-        "{} record{}{}",
-        page.total_count,
-        if page.total_count == 1 { "" } else { "s" },
-        if truncated {
-            " · showing the first 256"
-        } else if state.attached.get() {
+        "{} record{} · {} visible{}{} · cache up to {} rows{}",
+        metadata.raw_total_count,
+        if metadata.raw_total_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        widgets.address_list_model.total_count(),
+        hierarchy,
+        gtk_limit,
+        widgets.address_list_model.cached_row_capacity(),
+        if state.attached.get() {
             " · live values refresh automatically"
         } else {
             " · attach to refresh values"
@@ -2863,7 +3037,11 @@ fn render_address_records(
     ));
 }
 
-fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record: &AddressRecord) {
+fn build_address_record_row(
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    record: &AddressRecord,
+) -> adw::ActionRow {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
     let scripts_trusted = state.table_scripts_trusted.get();
     let lua_trusted = state.table_lua_trusted.get();
@@ -2994,7 +3172,11 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
                 .expect("engine remains present while editing an address")
                 .set_address_value(id, &entry.text());
             match result {
-                Ok(()) => reload_address_list(&state, &widgets, true),
+                Ok(()) => {
+                    state.selected_address_ids.borrow_mut().clear();
+                    widgets.group_selected_button.set_sensitive(false);
+                    reload_address_list(&state, &widgets, true);
+                }
                 Err(error) => {
                     widgets.address_summary.set_label(&format!(
                         "Could not write the value: {} ({})",
@@ -3161,7 +3343,7 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
     }
     row.add_suffix(&move_actions);
     row.add_suffix(&delete);
-    widgets.address_list.append(&row);
+    row
 }
 
 fn move_address_record(state: &SessionState, widgets: &SessionWidgets, id: i32, direction: i32) {
@@ -3183,50 +3365,14 @@ fn move_address_record(state: &SessionState, widgets: &SessionWidgets, id: i32, 
     }
 }
 
-fn hidden_address_rows(records: &[AddressRecord]) -> Vec<bool> {
-    let mut hidden = vec![false; records.len()];
-    let mut collapsed_indents = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        while collapsed_indents
-            .last()
-            .is_some_and(|indent| *indent >= record.indent)
-        {
-            collapsed_indents.pop();
-        }
-        hidden[index] = !collapsed_indents.is_empty();
-        if record.is_group && record.collapsed {
-            collapsed_indents.push(record.indent);
-        }
-    }
-    hidden
-}
-
-fn update_address_values(
-    state: &SessionState,
-    widgets: &SessionWidgets,
-    page: crate::bridge::AddressPage,
-) {
+fn update_visible_address_values(state: &SessionState, records: &[AddressRecord]) {
     let entries = state.address_value_entries.borrow();
-    let hidden = hidden_address_rows(&page.rows);
-    let visible_value_count = page
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(index, row)| !hidden[*index] && !row.is_group)
-        .count();
-    if entries.len() != visible_value_count {
-        drop(entries);
-        render_address_records(state, widgets, page);
-        return;
-    }
-    for (index, record) in page.rows.iter().enumerate() {
-        if hidden[index] || record.is_group {
+    for record in records {
+        if record.is_group {
             continue;
         }
         let Some(entry) = entries.get(&record.id) else {
-            drop(entries);
-            render_address_records(state, widgets, page);
-            return;
+            continue;
         };
         if !entry.has_focus() {
             entry.set_text(&record.value);

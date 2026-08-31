@@ -62,6 +62,8 @@ public:
     void cancel_scan() noexcept;
     AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
                              bool refresh_values);
+    AddressPage visible_address_rows(std::uint64_t start, std::uint32_t limit,
+                                     bool refresh_values);
     AddressActionResult add_scan_result(std::uint64_t scan_generation,
                                         std::uint64_t scan_index,
                                         rust::Str description);

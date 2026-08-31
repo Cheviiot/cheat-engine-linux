@@ -10547,6 +10547,12 @@ static void test_address_list_controller_adapter_state() {
                   directScriptActivation.errorCode == "script_not_executable";
     auto roundTrip = controller.exportRecords();
     const auto snapshots = controller.records(0, 10, false);
+    const auto visibleFirst = controller.visibleRecords(0, 1, false);
+    const auto visibleSecond = controller.visibleRecords(1, 1, false);
+    const bool visiblePagingOk = visibleFirst.totalCount == 2 &&
+        visibleFirst.rawTotalCount == 4 && visibleFirst.records.size() == 1 &&
+        visibleFirst.records[0].id == 10 && visibleSecond.totalCount == 2 &&
+        visibleSecond.records.size() == 1 && visibleSecond.records[0].id == 13;
     const auto scriptPageOne = controller.scriptPayloads(0, 2);
     const auto scriptPageTwo = controller.scriptPayloads(2, 2);
     const auto cappedScript = controller.scriptPayloadText(
@@ -10617,12 +10623,12 @@ static void test_address_list_controller_adapter_state() {
     auto removed = controller.removeRecord(10);
     bool deleteOk = removed.success && controller.ids() == std::vector<int>({13});
 
-    printf("  lossless state + trust gate + bounded script review + raw disable + "
-           "atomic import + subtree move/delete (%d%d%d%d%d%d%d): %s\n",
-           trustGateOk, stateOk, scriptReviewOk, rawDisableOk, atomicOk, moveOk,
-           deleteOk,
-           trustGateOk && stateOk && scriptReviewOk && rawDisableOk && atomicOk &&
-                   moveOk && deleteOk
+    printf("  lossless state + visible paging + trust gate + bounded script review + "
+           "raw disable + atomic import + subtree move/delete (%d%d%d%d%d%d%d%d): %s\n",
+           trustGateOk, stateOk, visiblePagingOk, scriptReviewOk, rawDisableOk,
+           atomicOk, moveOk, deleteOk,
+           trustGateOk && stateOk && visiblePagingOk && scriptReviewOk &&
+                   rawDisableOk && atomicOk && moveOk && deleteOk
                ? "OK" : "FAILED");
 }
 

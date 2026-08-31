@@ -1241,6 +1241,7 @@ AddressPage EngineFacade::address_rows(std::uint64_t start, std::uint32_t limit,
     page.generation = address_list_->generation();
     page.start = start;
     page.total_count = static_cast<std::uint64_t>(address_list_->count());
+    page.raw_total_count = page.total_count;
     page.error_message = "";
     page.start = std::min(page.start, page.total_count);
     const auto bounded_start = static_cast<std::size_t>(std::min<std::uint64_t>(
@@ -1249,6 +1250,48 @@ AddressPage EngineFacade::address_rows(std::uint64_t start, std::uint32_t limit,
         std::min(limit, kMaxAddressPageSize));
     for (const auto& record :
          address_list_->records(bounded_start, bounded_limit, refresh_values)) {
+        page.rows.push_back(AddressRow{
+            .id = record.id,
+            .description = sanitize_utf8(record.description),
+            .address = static_cast<std::uint64_t>(record.address),
+            .address_expression = sanitize_utf8(record.addressExpression),
+            .value_type = bridge_value_type(record.type),
+            .type_name = ce::valueTypeName(record.type),
+            .value = sanitize_utf8(record.value),
+            .error_message = sanitize_utf8(record.error),
+            .readable = record.readable,
+            .active = record.active,
+            .freeze_mode = static_cast<std::uint8_t>(record.freezeMode),
+            .show_as_hex = record.showAsHex,
+            .byte_count = static_cast<std::uint32_t>(std::min<std::size_t>(
+                record.byteCount, std::numeric_limits<std::uint32_t>::max())),
+            .is_group = record.isGroup,
+            .collapsed = record.collapsed,
+            .has_script = record.hasScript,
+            .has_auto_assembler = record.hasAutoAssembler,
+            .has_lua = record.hasLua,
+            .indent = record.indent,
+        });
+    }
+    return page;
+}
+
+AddressPage EngineFacade::visible_address_rows(std::uint64_t start, std::uint32_t limit,
+                                               bool refresh_values) {
+    AddressPage page;
+    page.generation = address_list_->generation();
+    page.start = start;
+    page.error_message = "";
+    const auto bounded_start = static_cast<std::size_t>(std::min<std::uint64_t>(
+        page.start, std::numeric_limits<std::size_t>::max()));
+    const auto bounded_limit = static_cast<std::size_t>(
+        std::min(limit, kMaxAddressPageSize));
+    auto visible =
+        address_list_->visibleRecords(bounded_start, bounded_limit, refresh_values);
+    page.total_count = visible.totalCount;
+    page.raw_total_count = visible.rawTotalCount;
+    page.start = std::min(page.start, page.total_count);
+    for (const auto& record : visible.records) {
         page.rows.push_back(AddressRow{
             .id = record.id,
             .description = sanitize_utf8(record.description),
@@ -2111,6 +2154,7 @@ RuntimeTickResult EngineFacade::periodic_tick() {
     };
     return RuntimeTickResult{
         .runtime_generation = script_runtime_->luaGeneration,
+        .address_generation = address_list_->generation(),
         .address_refresh_due = refreshDue,
         .timer_count = toU32(script_runtime_->lua->timerCount()),
         .timers_fired = toU32(timerResult.callbacksFired),

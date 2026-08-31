@@ -36,13 +36,13 @@ Completed in the foundation and first vertical slices:
   IDs, bounded snapshots, live scalar/text/AOB reads and writes, pointer-address
   expression resolution, safe session changes, five freeze modes, and group-aware
   deletion;
-- bounded address-list endpoints in the CXX facade plus a GTK address list that
-  accepts scan results and manual addresses, refreshes live values, edits on
-  Enter, freezes at 100 ms, selects directional freeze policy, and removes
-  records;
+- bounded raw and hierarchy-visible address-list endpoints in the CXX facade
+  plus a virtual GTK address list that accepts scan results and manual addresses,
+  lazily fetches 256-row pages, refreshes only bound pages, edits on Enter,
+  freezes at 100 ms, selects directional freeze policy, and removes records;
 - shared hierarchy operations with stable IDs: multi-selection grouping,
   subtree-aware deletion and up/down reordering, group collapse state, and
-  bounded GTK rendering of collapsed trees;
+  bounded virtual GTK rendering of collapsed trees;
 - a lossless `AddressRecordState` adapter covering pointer metadata, codecs,
   endianness, group policy, Lua/Auto Assembler content, hotkeys, dropdowns, and
   every display/freeze flag; imports are transactional and reject duplicate or
@@ -107,27 +107,29 @@ Completed in the foundation and first vertical slices:
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
-- CXX contract, Rust unit, GTK/Xvfb startup and Lua-console smokes, Qt smoke, and
-  core regression tests.
+- CXX contract, Rust unit, GTK/Xvfb startup, Lua-console, and 600-record virtual
+  address-list smokes, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
 The scan-result view now uses a custom virtual `gio::ListModel`: GTK sees the
 complete result count up to its `u32` position limit while only requested
 256-row pages are materialized, at most eight pages remain cached, and stale
 generation responses invalidate the model. The real `u64` result count remains
-visible even when GTK's position range is capped. The address-list controller
-is now the GTK source of truth and the Qt model delegates hierarchy plus the
-safe `IAddressList` surface through a
-lossless adapter.  Qt still owns its own periodic refresh/freeze/Lua pump,
+visible even when GTK's position range is capped. The address list now follows
+the same bounded eight-page design while paging the hierarchy-visible sequence
+computed by the core; collapsed descendants never become GTK rows, raw and
+visible counts remain distinct, and only currently bound pages receive live
+value refreshes. The address-list controller is the GTK source of truth and the
+Qt model delegates hierarchy plus the safe `IAddressList` surface through a
+lossless adapter. Qt still owns its own periodic refresh/freeze/Lua pump,
 inline value-editor verification, and its legacy Auto Assembler adapter. GTK now has
 a bounded read-only review UI plus separately explicit-trust Auto Assembler and
 Lua paths, an interactive bounded console, and toolkit-neutral periodic address/
 Lua timer scheduling. Imported Lua is intentionally per-payload rather than
 automatic, and VM instruction ceilings do not interrupt a blocking native
-binding. Broader Lua GUI/form parity remains advanced work. The GTK frontend does not yet open
-password-protected CETRAINER files, expose a loss report, or virtualize address
-rows beyond its bounded first page. No product identifier should be published
-before the branding decision.
+binding. Broader Lua GUI/form parity remains advanced work. The GTK frontend
+does not yet open password-protected CETRAINER files or expose a loss report. No
+product identifier should be published before the branding decision.
 
 ## Goal
 
@@ -260,18 +262,21 @@ The initial performance budgets are:
 - cancellation reaches a terminal state promptly and never leaves a detached
   worker touching a destroyed process handle.
 
-### Address-list extraction
+### Address-list extraction and virtualization
 
-Before implementing the GTK address table, extract the non-visual behavior from
-`AddressListModel` into a toolkit-neutral `AddressListController` in the core.
-It should implement `IAddressList` and own stable record IDs, hierarchy, address
-expressions, value codecs, live read/write, freeze modes, script activation, and
-CT conversion.
+The non-visual behavior now lives in the toolkit-neutral
+`AddressListController`. It implements `IAddressList` and owns stable record IDs,
+hierarchy, address expressions, value codecs, live read/write, freeze modes,
+script activation, and CT conversion. Its hierarchy-visible page operation
+walks collapse metadata in place, reports both raw and visible totals, and copies
+only the requested bounded page rather than full records or script bodies.
 
-The Qt model becomes an adapter over this controller.  This is the migration
-safety mechanism: existing Qt smoke tests exercise the new shared controller
-before the Rust UI depends on it.  `SimpleAddressList` remains the lightweight
-headless implementation for tests and CLI uses that do not need live behavior.
+The Qt model is an adapter over this controller, while GTK exposes visible rows
+through a custom `gio::ListModel` with stable placeholders and an eight-page
+LRU. Factory bind/unbind state identifies the pages currently on screen, so the
+500 ms live-value pass reads only those pages and preserves focused editors.
+`SimpleAddressList` remains the lightweight headless implementation for tests
+and CLI uses that do not need live behavior.
 
 ## Build integration
 
@@ -452,12 +457,12 @@ recorded in a short decision note before public release.
 6. ~~Add exact Int32 next scan and one-level undo.~~
 7. ~~Add the complete scan request/value-type/comparison surface.~~
 8. ~~Replace the explicit pager with a virtualized bounded-cache GTK model.~~
-9. Extract the toolkit-neutral address-list controller and adapt Qt to it
+9. ~~Extract the toolkit-neutral address-list controller and adapt Qt to it~~
    (controller, GTK ownership, hierarchy, and the safe live `IAddressList`
    surface complete; Qt's periodic refresh/freeze timers remain).
 10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
 11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
     trust/review, trusted Auto Assembler activation/cleanup, and separately
     consented per-payload Lua execution with bounded input/VM/output, periodic
-    scheduling, and Lua console/timer parity.~~ Next continue Lua GUI/form parity
-    and virtualize the address list beyond its bounded first page.
+    scheduling, and Lua console/timer parity.~~ Next continue Lua GUI/form parity,
+    add the GTK loss report/protected-table path, and complete branding review.

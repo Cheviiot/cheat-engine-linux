@@ -1220,6 +1220,32 @@ std::vector<AddressRecordSnapshot> AddressListController::records(
     return output;
 }
 
+VisibleAddressRecordPage AddressListController::visibleRecords(
+    std::size_t start, std::size_t limit, bool refreshValues) {
+    VisibleAddressRecordPage page;
+    page.rawTotalCount = records_.size();
+    page.records.reserve(std::min(limit, records_.size()));
+
+    std::vector<int> collapsedIndents;
+    collapsedIndents.reserve(8);
+    std::size_t visibleIndex = 0;
+    for (auto& record : records_) {
+        while (!collapsedIndents.empty() && collapsedIndents.back() >= record.indent)
+            collapsedIndents.pop_back();
+        const bool visible = collapsedIndents.empty();
+        if (visible) {
+            if (visibleIndex >= start && page.records.size() < limit) {
+                if (refreshValues && !record.active) refreshRecord(record);
+                page.records.push_back(snapshot(record));
+            }
+            ++visibleIndex;
+        }
+        if (record.isGroup && record.collapsed) collapsedIndents.push_back(record.indent);
+    }
+    page.totalCount = visibleIndex;
+    return page;
+}
+
 int AddressListController::count() const { return static_cast<int>(records_.size()); }
 
 std::optional<AddressEntrySnapshot> AddressListController::at(int index) const {

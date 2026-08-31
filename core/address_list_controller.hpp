@@ -90,6 +90,12 @@ struct AddressRecordSnapshot {
     int indent = 0;
 };
 
+struct VisibleAddressRecordPage {
+    std::uint64_t totalCount = 0;
+    std::uint64_t rawTotalCount = 0;
+    std::vector<AddressRecordSnapshot> records;
+};
+
 struct AddressOperationResult {
     bool success = false;
     int id = 0;
@@ -143,6 +149,12 @@ public:
     std::uint64_t generation() const noexcept { return generation_; }
     std::vector<AddressRecordSnapshot> records(std::size_t start, std::size_t limit,
                                                bool refreshValues);
+    /// Page the flattened rows that are currently visible after applying group
+    /// collapse state. The implementation scans hierarchy metadata in place and
+    /// materializes only the requested page; script bodies and off-page records
+    /// are never copied into the frontend bridge.
+    VisibleAddressRecordPage visibleRecords(std::size_t start, std::size_t limit,
+                                            bool refreshValues);
     AddressOperationResult addRecord(uintptr_t address, ValueType type,
                                      const std::string& description,
                                      std::size_t byteCount = 0,
