@@ -30,6 +30,9 @@ struct SessionState {
     scan_page_start: Rc<Cell<u64>>,
     address_value_entries: Rc<RefCell<HashMap<i32, gtk::Entry>>>,
     selected_address_ids: Rc<RefCell<HashSet<i32>>>,
+    table_scripts_trusted: Rc<Cell<bool>>,
+    table_contains_auto_assembler: Rc<Cell<bool>>,
+    table_contains_lua: Rc<Cell<bool>>,
 }
 
 #[derive(Clone)]
@@ -72,6 +75,7 @@ struct SessionWidgets {
     address_list: gtk::ListBox,
     address_summary: gtk::Label,
     group_selected_button: gtk::Button,
+    script_trust_button: gtk::Button,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +105,9 @@ fn build_window(application: &adw::Application) {
         scan_page_start: Rc::new(Cell::new(0)),
         address_value_entries: Rc::new(RefCell::new(HashMap::new())),
         selected_address_ids: Rc::new(RefCell::new(HashSet::new())),
+        table_scripts_trusted: Rc::new(Cell::new(false)),
+        table_contains_auto_assembler: Rc::new(Cell::new(false)),
+        table_contains_lua: Rc::new(Cell::new(false)),
     };
 
     let header = adw::HeaderBar::builder().show_title(false).build();
@@ -389,12 +396,18 @@ fn build_window(application: &adw::Application) {
         .label("Group selected")
         .sensitive(false)
         .build();
+    let script_trust_button = gtk::Button::builder()
+        .label("Scripts blocked")
+        .icon_name("security-high-symbolic")
+        .visible(false)
+        .build();
     let address_structure_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(12)
         .build();
     address_structure_actions.append(&add_group_button);
     address_structure_actions.append(&group_selected_button);
+    address_structure_actions.append(&script_trust_button);
     let address_summary = gtk::Label::builder()
         .label("Add scan results here to edit or freeze their live values.")
         .wrap(true)
@@ -502,6 +515,7 @@ fn build_window(application: &adw::Application) {
         address_list,
         address_summary,
         group_selected_button,
+        script_trust_button,
     };
 
     update_scan_option_visibility(&widgets);
@@ -650,6 +664,46 @@ fn build_window(application: &adw::Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         move |_| present_save_table_dialog(&window, &state, &widgets)
+    });
+
+    widgets.script_trust_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_| {
+            if state.table_scripts_trusted.get() {
+                let result = state
+                    .engine
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("engine remains present while revoking table trust")
+                    .set_table_scripts_trusted(false);
+                match result {
+                    Ok(()) => {
+                        state.table_scripts_trusted.set(false);
+                        reload_address_list(&state, &widgets, false);
+                        widgets.address_summary.set_label(
+                            "Script trust was revoked and active Auto Assembler records were disabled.",
+                        );
+                    }
+                    Err(error) => {
+                        reload_address_list(&state, &widgets, false);
+                        widgets.address_summary.set_label(&format!(
+                            "Could not revoke script trust safely: {} ({})",
+                            error.message, error.code
+                        ));
+                    }
+                }
+            } else {
+                let action = crate::bridge::TableAction {
+                    record_count: 0,
+                    contains_scripts: true,
+                    contains_auto_assembler: state.table_contains_auto_assembler.get(),
+                    contains_lua: state.table_contains_lua.get(),
+                };
+                present_script_trust_dialog(&window, &state, &widgets, &action);
+            }
+        }
     });
 
     install_address_refresh_timer(&state, &widgets);
@@ -883,8 +937,21 @@ fn show_attach_error(
 }
 
 fn detach(state: &SessionState, widgets: &SessionWidgets) {
-    if let Some(engine) = state.engine.borrow_mut().as_mut() {
-        engine.detach();
+    let result = state
+        .engine
+        .borrow_mut()
+        .as_mut()
+        .map_or(Ok(()), Engine::detach);
+    if let Err(error) = result {
+        widgets.session_details.set_label(&format!(
+            "Could not close the session safely: {} ({})",
+            error.message, error.code
+        ));
+        widgets.address_summary.set_label(
+            "An active Auto Assembler record could not be disabled; the target remains attached.",
+        );
+        reload_address_list(state, widgets, false);
+        return;
     }
     state.attached.set(false);
     widgets.selected_process.set_label("No process attached");
@@ -1426,9 +1493,11 @@ fn present_open_table_dialog(
         .title("Open Cheat Table")
         .modal(true)
         .build();
-    dialog.open(Some(window), gtk::gio::Cancellable::NONE, {
+    let window = window.clone();
+    dialog.open(Some(&window), gtk::gio::Cancellable::NONE, {
         let state = state.clone();
         let widgets = widgets.clone();
+        let window = window.clone();
         move |result| {
             let Ok(file) = result else {
                 return;
@@ -1453,6 +1522,12 @@ fn present_open_table_dialog(
                 .load_table(path_text);
             match result {
                 Ok(action) => {
+                    state.table_scripts_trusted.set(false);
+                    state
+                        .table_contains_auto_assembler
+                        .set(action.contains_auto_assembler);
+                    state.table_contains_lua.set(action.contains_lua);
+                    update_script_trust_button(&state, &widgets);
                     state.selected_address_ids.borrow_mut().clear();
                     reload_address_list(&state, &widgets, state.attached.get());
                     let script_notice = if action.contains_scripts {
@@ -1466,6 +1541,9 @@ fn present_open_table_dialog(
                         if action.record_count == 1 { "" } else { "s" },
                         script_notice
                     ));
+                    if action.contains_scripts {
+                        present_script_trust_dialog(&window, &state, &widgets, &action);
+                    }
                 }
                 Err(error) => widgets.address_summary.set_label(&format!(
                     "Could not open the cheat table: {} ({})",
@@ -1474,6 +1552,98 @@ fn present_open_table_dialog(
             }
         }
     });
+}
+
+fn update_script_trust_button(state: &SessionState, widgets: &SessionWidgets) {
+    let has_auto_assembler = state.table_contains_auto_assembler.get();
+    let has_lua = state.table_contains_lua.get();
+    let has_scripts = has_auto_assembler || has_lua;
+    widgets.script_trust_button.set_visible(has_scripts);
+    if !has_scripts {
+        return;
+    }
+    if state.table_scripts_trusted.get() {
+        widgets.script_trust_button.set_label("Revoke script trust");
+        widgets.script_trust_button.set_tooltip_text(Some(
+            "Disable active Auto Assembler records and block this table again",
+        ));
+    } else if has_auto_assembler {
+        widgets.script_trust_button.set_label("Review script trust");
+        widgets.script_trust_button.set_tooltip_text(Some(
+            "Review the warning before unlocking Auto Assembler records",
+        ));
+    } else {
+        widgets.script_trust_button.set_label("Lua blocked");
+        widgets.script_trust_button.set_tooltip_text(Some(
+            "Lua is preserved but unavailable in this migration build",
+        ));
+    }
+}
+
+fn present_script_trust_dialog(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    action: &crate::bridge::TableAction,
+) {
+    let contents = match (action.contains_auto_assembler, action.contains_lua) {
+        (true, true) => "Auto Assembler and Lua",
+        (true, false) => "Auto Assembler",
+        (false, true) => "Lua",
+        (false, false) => "script",
+    };
+    let capability = if action.contains_auto_assembler {
+        "Trusting unlocks Auto Assembler record switches for this loaded table. "
+    } else {
+        ""
+    };
+    let lua_notice = if action.contains_lua {
+        "Lua is preserved but remains unavailable in this migration build."
+    } else {
+        "Scripts run only when you explicitly enable their record."
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading("This table contains executable scripts")
+        .body(format!(
+            "The table contains {contents}. Scripts can modify the target and Lua can access your system with this application's privileges. Only trust tables whose source and contents you have reviewed.\n\n{capability}{lua_notice}"
+        ))
+        .build();
+    dialog.add_response("blocked", "Keep blocked");
+    dialog.set_default_response(Some("blocked"));
+    dialog.set_close_response("blocked");
+    if action.contains_auto_assembler {
+        let contains_lua = action.contains_lua;
+        dialog.add_response("trust", "Trust Auto Assembler");
+        dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+        dialog.connect_response(Some("trust"), {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            move |_, _| {
+                let result = state
+                    .engine
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("engine remains present while changing table trust")
+                    .set_table_scripts_trusted(true);
+                match result {
+                    Ok(()) => {
+                        state.table_scripts_trusted.set(true);
+                        reload_address_list(&state, &widgets, state.attached.get());
+                        widgets.address_summary.set_label(if contains_lua {
+                            "Auto Assembler is trusted for this loaded table; record Lua remains blocked."
+                        } else {
+                            "Auto Assembler is trusted for this loaded table and runs only when enabled."
+                        });
+                    }
+                    Err(error) => widgets.address_summary.set_label(&format!(
+                        "Could not change table trust: {} ({})",
+                        error.message, error.code
+                    )),
+                }
+            }
+        });
+    }
+    dialog.present(Some(window));
 }
 
 fn present_save_table_dialog(
@@ -1557,13 +1727,18 @@ fn install_address_refresh_timer(state: &SessionState, widgets: &SessionWidgets)
 }
 
 fn reload_address_list(state: &SessionState, widgets: &SessionWidgets, refresh_values: bool) {
-    let page = {
+    let (page, scripts_trusted) = {
         let mut engine_slot = state.engine.borrow_mut();
         let Some(engine) = engine_slot.as_mut() else {
             return;
         };
-        engine.address_rows(0, ADDRESS_PAGE_SIZE, refresh_values)
+        (
+            engine.address_rows(0, ADDRESS_PAGE_SIZE, refresh_values),
+            engine.table_scripts_trusted(),
+        )
     };
+    state.table_scripts_trusted.set(scripts_trusted);
+    update_script_trust_button(state, widgets);
     render_address_records(state, widgets, page);
 }
 
@@ -1622,10 +1797,23 @@ fn render_address_records(
 
 fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record: &AddressRecord) {
     let indent = "\u{00a0}\u{00a0}".repeat(record.indent.max(0) as usize);
+    let scripts_trusted = state.table_scripts_trusted.get();
     let address = if record.is_group {
         "Group".to_owned()
-    } else if record.has_script {
-        "Script preserved; execution disabled".to_owned()
+    } else if record.has_auto_assembler && record.has_lua {
+        if scripts_trusted {
+            "Auto Assembler trusted; record Lua blocked".to_owned()
+        } else {
+            "Auto Assembler and Lua preserved; execution blocked".to_owned()
+        }
+    } else if record.has_auto_assembler {
+        if scripts_trusted {
+            "Auto Assembler trusted; enable explicitly".to_owned()
+        } else {
+            "Auto Assembler preserved; execution blocked".to_owned()
+        }
+    } else if record.has_lua {
+        "Lua preserved; execution unavailable".to_owned()
     } else if record.address_expression.is_empty() {
         format!("0x{:016X}", record.address)
     } else {
@@ -1773,16 +1961,31 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
         }
     });
 
+    let can_toggle = state.attached.get()
+        && !record.is_group
+        && (!record.has_script || (record.has_auto_assembler && scripts_trusted));
+    let freeze_tooltip = if record.has_auto_assembler {
+        if scripts_trusted {
+            "Enable or disable this trusted Auto Assembler record"
+        } else {
+            "Trust this table before enabling Auto Assembler"
+        }
+    } else if record.has_lua {
+        "Lua record execution is not available yet"
+    } else {
+        "Freeze this value"
+    };
     let freeze = gtk::CheckButton::builder()
         .active(record.active)
-        .tooltip_text("Freeze this value")
+        .tooltip_text(freeze_tooltip)
         .valign(Align::Center)
-        .sensitive(state.attached.get() && !record.is_group && !record.has_script)
+        .sensitive(can_toggle)
         .build();
     freeze.connect_toggled({
         let state = state.clone();
         let widgets = widgets.clone();
         let id = record.id;
+        let is_script = record.has_script;
         move |button| {
             let result = state
                 .engine
@@ -1790,12 +1993,23 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
                 .as_mut()
                 .expect("engine remains present while freezing an address")
                 .set_address_active(id, button.is_active());
-            if let Err(error) = result {
-                widgets.address_summary.set_label(&format!(
-                    "Could not freeze the value: {} ({})",
-                    error.message, error.code
-                ));
-                reload_address_list(&state, &widgets, true);
+            match result {
+                Ok(()) if is_script => {
+                    reload_address_list(&state, &widgets, false);
+                    widgets.address_summary.set_label(if button.is_active() {
+                        "The trusted Auto Assembler record is enabled."
+                    } else {
+                        "The Auto Assembler record is disabled."
+                    });
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    widgets.address_summary.set_label(&format!(
+                        "Could not change the record state: {} ({})",
+                        error.message, error.code
+                    ));
+                    reload_address_list(&state, &widgets, true);
+                }
             }
         }
     });
@@ -1819,10 +2033,13 @@ fn append_address_record(state: &SessionState, widgets: &SessionWidgets, record:
                 .delete_address(id);
             match result {
                 Ok(()) => reload_address_list(&state, &widgets, true),
-                Err(error) => widgets.address_summary.set_label(&format!(
-                    "Could not remove the record: {} ({})",
-                    error.message, error.code
-                )),
+                Err(error) => {
+                    reload_address_list(&state, &widgets, false);
+                    widgets.address_summary.set_label(&format!(
+                        "Could not remove the record: {} ({})",
+                        error.message, error.code
+                    ));
+                }
             }
         }
     });

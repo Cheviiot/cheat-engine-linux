@@ -10479,8 +10479,15 @@ static void test_address_list_controller_adapter_state() {
     bool trustGateOk = !rejected.success && rejected.errorCode == "active_script_rejected" &&
                        controller.count() == 0;
     auto imported = controller.replaceRecords({group, health, script, score}, true);
+    const auto directScriptActivation = controller.activateRecord(12, true);
+    trustGateOk = trustGateOk && !directScriptActivation.success &&
+                  directScriptActivation.errorCode == "script_not_executable";
     auto roundTrip = controller.exportRecords();
+    const auto snapshots = controller.records(0, 10, false);
     bool stateOk = imported.success && roundTrip.size() == 4 &&
+        snapshots.size() == 4 && !snapshots[0].hasScript &&
+        snapshots[1].hasScript && !snapshots[1].hasAutoAssembler && snapshots[1].hasLua &&
+        snapshots[2].hasScript && snapshots[2].hasAutoAssembler && snapshots[2].hasLua &&
         roundTrip[0].collapsed && !roundTrip[0].activateChildren &&
         roundTrip[1].addressExpression == health.addressExpression &&
         roundTrip[1].addressString == health.addressString &&

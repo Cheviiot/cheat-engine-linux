@@ -110,6 +110,8 @@ mod ffi {
         is_group: bool,
         collapsed: bool,
         has_script: bool,
+        has_auto_assembler: bool,
+        has_lua: bool,
         indent: i32,
     }
 
@@ -132,6 +134,8 @@ mod ffi {
         accepted: bool,
         record_count: u64,
         contains_scripts: bool,
+        contains_auto_assembler: bool,
+        contains_lua: bool,
         error_code: String,
         error_message: String,
     }
@@ -145,7 +149,7 @@ mod ffi {
         fn version(self: &EngineFacade) -> String;
         fn list_processes(self: &EngineFacade, query: &str, limit: u32) -> Vec<ProcessRow>;
         fn attach(self: Pin<&mut EngineFacade>, pid: i32, display_name: &str) -> AttachResult;
-        fn detach(self: Pin<&mut EngineFacade>);
+        fn detach(self: Pin<&mut EngineFacade>) -> AddressActionResult;
         fn is_attached(self: &EngineFacade) -> bool;
         fn attached_pid(self: &EngineFacade) -> i32;
         fn start_first_scan(self: Pin<&mut EngineFacade>, request: &ScanRequest)
@@ -212,6 +216,11 @@ mod ffi {
         ) -> AddressActionResult;
         fn load_table(self: Pin<&mut EngineFacade>, path: &str) -> TableActionResult;
         fn save_table(self: &EngineFacade, path: &str, json: bool) -> TableActionResult;
+        fn set_table_scripts_trusted(
+            self: Pin<&mut EngineFacade>,
+            trusted: bool,
+        ) -> AddressActionResult;
+        fn table_scripts_trusted(self: &EngineFacade) -> bool;
         fn freeze_addresses(self: Pin<&mut EngineFacade>);
     }
 }
@@ -560,6 +569,8 @@ pub struct AddressRecord {
     pub is_group: bool,
     pub collapsed: bool,
     pub has_script: bool,
+    pub has_auto_assembler: bool,
+    pub has_lua: bool,
     pub indent: i32,
 }
 
@@ -582,6 +593,8 @@ pub struct AddressError {
 pub struct TableAction {
     pub record_count: u64,
     pub contains_scripts: bool,
+    pub contains_auto_assembler: bool,
+    pub contains_lua: bool,
 }
 
 pub struct Engine {
@@ -641,8 +654,8 @@ impl Engine {
         })
     }
 
-    pub fn detach(&mut self) {
-        self.inner.pin_mut().detach();
+    pub fn detach(&mut self) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().detach()).map(|_| ())
     }
 
     pub fn is_attached(&self) -> bool {
@@ -767,6 +780,8 @@ impl Engine {
                         is_group: row.is_group,
                         collapsed: row.collapsed,
                         has_script: row.has_script,
+                        has_auto_assembler: row.has_auto_assembler,
+                        has_lua: row.has_lua,
                         indent: row.indent,
                     })
                 })
@@ -848,6 +863,14 @@ impl Engine {
         table_action(self.inner.save_table(path, json))
     }
 
+    pub fn set_table_scripts_trusted(&mut self, trusted: bool) -> Result<(), AddressError> {
+        address_action(self.inner.pin_mut().set_table_scripts_trusted(trusted)).map(|_| ())
+    }
+
+    pub fn table_scripts_trusted(&self) -> bool {
+        self.inner.table_scripts_trusted()
+    }
+
     pub fn freeze_addresses(&mut self) {
         self.inner.pin_mut().freeze_addresses();
     }
@@ -869,6 +892,8 @@ fn table_action(result: ffi::TableActionResult) -> Result<TableAction, AddressEr
         Ok(TableAction {
             record_count: result.record_count,
             contains_scripts: result.contains_scripts,
+            contains_auto_assembler: result.contains_auto_assembler,
+            contains_lua: result.contains_lua,
         })
     } else {
         Err(AddressError {
@@ -948,7 +973,7 @@ mod tests {
         assert!(engine.is_attached());
         assert_eq!(engine.attached_pid(), pid);
 
-        engine.detach();
+        engine.detach().expect("detach from self");
         assert!(!engine.is_attached());
         assert_eq!(engine.attached_pid(), 0);
     }
@@ -1043,7 +1068,7 @@ mod tests {
         assert_eq!(restored.total_count, 300);
         assert_eq!(restored.rows.len(), 256);
 
-        engine.detach();
+        engine.detach().expect("detach after scan");
         assert!(engine.scan_rows(action.generation, 0, 1).stale);
     }
 
@@ -1297,7 +1322,7 @@ mod tests {
             "decrease below the floor is restored"
         );
 
-        engine.detach();
+        engine.detach().expect("detach address-list target");
         let detached = engine.address_rows(0, 10, false);
         assert_eq!(detached.total_count, 1);
         assert!(!detached.rows[0].active);
@@ -1532,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn table_scripts_are_preserved_but_never_activated_on_load() {
+    fn table_scripts_are_preserved_and_require_explicit_trust() {
         let source = temporary_table_path("CT");
         let saved = temporary_table_path("roundtrip.CT");
         std::fs::write(
@@ -1550,6 +1575,13 @@ alloc(newmem,64)
 [DISABLE]
 dealloc(newmem)</AssemblerScript>
     </CheatEntry>
+    <CheatEntry>
+      <ID>8</ID>
+      <Description>"Record Lua"</Description>
+      <VariableType>4 Bytes</VariableType>
+      <Address>0</Address>
+      <LuaScript>error('record lua must remain blocked')</LuaScript>
+    </CheatEntry>
   </CheatEntries>
   <LuaScript>error('must not execute')</LuaScript>
 </CheatTable>
@@ -1562,15 +1594,42 @@ dealloc(newmem)</AssemblerScript>
             .load_table(source.to_str().expect("UTF-8 temp path"))
             .expect("load script table without execution");
         assert!(action.contains_scripts);
-        let row = &engine.address_rows(0, 10, false).rows[0];
-        assert!(row.has_script);
-        assert!(!row.active, "loaded scripts must always remain inactive");
+        assert!(action.contains_auto_assembler);
+        assert!(action.contains_lua);
+        assert!(!engine.table_scripts_trusted());
+        let rows = engine.address_rows(0, 10, false).rows;
+        let row = rows.iter().find(|row| row.id == 7).expect("AA row");
+        let lua_row = rows.iter().find(|row| row.id == 8).expect("Lua row");
+        assert!(row.has_script && row.has_auto_assembler && !row.has_lua);
+        assert!(lua_row.has_script && !lua_row.has_auto_assembler && lua_row.has_lua);
+        assert!(
+            !row.active && !lua_row.active,
+            "loaded scripts must remain inactive"
+        );
         assert_eq!(
             engine
                 .set_address_active(row.id, true)
-                .expect_err("script activation is intentionally unavailable")
+                .expect_err("untrusted script activation must remain blocked")
                 .code,
-            "script_not_executable"
+            "table_not_trusted"
+        );
+        engine
+            .set_table_scripts_trusted(true)
+            .expect("trust is an explicit, non-executing state change");
+        assert!(engine.table_scripts_trusted());
+        assert_eq!(
+            engine
+                .set_address_active(lua_row.id, true)
+                .expect_err("record Lua is not executable yet")
+                .code,
+            "lua_execution_unavailable"
+        );
+        assert_eq!(
+            engine
+                .set_address_active(row.id, true)
+                .expect_err("activation still needs a process")
+                .code,
+            "no_session"
         );
 
         engine
@@ -1579,9 +1638,158 @@ dealloc(newmem)</AssemblerScript>
         let xml = std::fs::read_to_string(&saved).expect("read saved script table");
         assert!(xml.contains("error('must not execute')"));
         assert!(xml.contains("alloc(newmem,64)"));
+        assert!(xml.contains("record lua must remain blocked"));
 
         std::fs::remove_file(source).expect("remove script table fixture");
         std::fs::remove_file(saved).expect("remove script table round trip");
+    }
+
+    #[test]
+    fn trusted_auto_assembler_activation_disables_and_cleans_up() {
+        let value = Box::new(UnsafeCell::new(41_i32));
+        let address = value.get() as usize;
+        let source = temporary_table_path("CT");
+        std::fs::write(
+            &source,
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable>
+  <CheatEntries>
+    <CheatEntry>
+      <ID>8</ID>
+      <Description>"Trusted scripts"</Description>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>9</ID>
+          <Description>"Trusted patch"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{address:X}:
+dd #99
+[DISABLE]</AssemblerScript>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+</CheatTable>
+"#
+            ),
+        )
+        .expect("write executable table fixture");
+
+        let mut engine = attached_engine();
+        let action = engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("load script without executing it");
+        assert!(action.contains_auto_assembler);
+        let rows = engine.address_rows(0, 10, false).rows;
+        let group_id = rows
+            .iter()
+            .find(|row| row.is_group)
+            .expect("script group")
+            .id;
+        let id = rows
+            .iter()
+            .find(|row| row.has_auto_assembler)
+            .expect("Auto Assembler row")
+            .id;
+        assert_eq!(unsafe { *value.get() }, 41);
+        assert_eq!(
+            engine
+                .set_address_active(id, true)
+                .expect_err("untrusted table must not patch memory")
+                .code,
+            "table_not_trusted"
+        );
+        assert_eq!(unsafe { *value.get() }, 41);
+
+        engine
+            .set_table_scripts_trusted(true)
+            .expect("explicitly trust this table");
+        engine
+            .set_address_active(id, true)
+            .expect("enable trusted Auto Assembler record");
+        assert_eq!(unsafe { *value.get() }, 99);
+        assert!(
+            engine
+                .address_rows(0, 10, false)
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("AA row after activation")
+                .active
+        );
+
+        engine
+            .set_table_scripts_trusted(false)
+            .expect("revoking trust disables active scripts first");
+        assert_eq!(unsafe { *value.get() }, 41);
+        assert!(
+            !engine
+                .address_rows(0, 10, false)
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("AA row after trust revocation")
+                .active
+        );
+        assert!(!engine.table_scripts_trusted());
+
+        engine
+            .set_table_scripts_trusted(true)
+            .expect("trust the same loaded table again");
+        engine
+            .set_address_active(id, true)
+            .expect("re-enable trusted record");
+        assert_eq!(unsafe { *value.get() }, 99);
+        engine
+            .attach(std::process::id() as i32, "reattach cleanup")
+            .expect("changing sessions disables the old target script first");
+        assert_eq!(unsafe { *value.get() }, 41);
+        assert!(
+            !engine
+                .address_rows(0, 10, false)
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("AA row after reattach")
+                .active
+        );
+
+        engine
+            .set_address_active(id, true)
+            .expect("trust remains scoped to the loaded table after reattach");
+        assert_eq!(unsafe { *value.get() }, 99);
+        engine
+            .detach()
+            .expect("detaching disables the active script first");
+        assert_eq!(unsafe { *value.get() }, 41);
+        assert!(
+            !engine
+                .address_rows(0, 10, false)
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("AA row after detach")
+                .active
+        );
+
+        engine
+            .attach(std::process::id() as i32, "delete cleanup")
+            .expect("reattach after cleanup");
+        engine
+            .set_address_active(id, true)
+            .expect("enable before deletion cleanup");
+        assert_eq!(unsafe { *value.get() }, 99);
+        engine
+            .delete_address(group_id)
+            .expect("deleting an active script subtree disables it first");
+        assert_eq!(unsafe { *value.get() }, 41);
+        assert_eq!(engine.address_rows(0, 10, false).total_count, 0);
+
+        std::fs::remove_file(source).expect("remove executable table fixture");
+        std::hint::black_box(value);
     }
 
     #[test]

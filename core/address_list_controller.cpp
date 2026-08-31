@@ -244,11 +244,21 @@ std::string hexadecimalAddress(uintptr_t address) {
     return stream.str();
 }
 
-bool tableContainsScripts(const CheatTable& table) {
+bool tableContainsAutoAssembler(const CheatTable& table) {
+    return std::any_of(table.entries.begin(), table.entries.end(), [](const CheatEntry& entry) {
+        return !entry.autoAsmScript.empty();
+    });
+}
+
+bool tableContainsLua(const CheatTable& table) {
     if (!table.luaScript.empty()) return true;
     return std::any_of(table.entries.begin(), table.entries.end(), [](const CheatEntry& entry) {
-        return !entry.autoAsmScript.empty() || !entry.luaScript.empty();
+        return !entry.luaScript.empty();
     });
+}
+
+bool tableContainsScripts(const CheatTable& table) {
+    return tableContainsAutoAssembler(table) || tableContainsLua(table);
 }
 
 } // namespace
@@ -830,6 +840,28 @@ AddressOperationResult AddressListController::setRecordCollapsed(int id, bool co
     return success(id);
 }
 
+AddressOperationResult AddressListController::commitExecutedScriptState(
+    int id, bool active, const std::string& status) {
+    const int index = indexOf(id);
+    if (index < 0)
+        return failure(id, "record_not_found", "The address-list record no longer exists.");
+    auto& record = records_[static_cast<std::size_t>(index)];
+    if (record.isGroup || (record.script.empty() && record.luaScript.empty()))
+        return failure(id, "record_not_script", "The address-list record is not a script.");
+    const bool changed = record.active != active ||
+                         (!status.empty() && record.currentValue != status);
+    record.active = active;
+    record.frozenValue.clear();
+    record.readable = true;
+    record.error.clear();
+    if (!status.empty()) record.currentValue = status;
+    if (changed) {
+        ++generation_;
+        if (activationCallback_) activationCallback_(id, active);
+    }
+    return success(id);
+}
+
 TableOperationResult AddressListController::loadTable(const std::string& path) {
     if (path.empty())
         return {.success = false, .errorCode = "path_empty",
@@ -927,14 +959,19 @@ TableOperationResult AddressListController::loadTable(const std::string& path) {
         loaded.push_back(std::move(record));
     }
 
-    const bool containsScripts = tableContainsScripts(parsed);
+    const bool containsAutoAssembler = tableContainsAutoAssembler(parsed);
+    const bool containsLua = tableContainsLua(parsed);
+    const bool containsScripts = containsAutoAssembler || containsLua;
     disableAllWithoutExecute();
     records_ = std::move(loaded);
     tableMetadata_ = std::move(parsed);
     nextId_ = nextId;
     ++generation_;
     return {.success = true, .recordCount = records_.size(),
-            .containsScripts = containsScripts, .errorCode = {}, .errorMessage = {}};
+            .containsScripts = containsScripts,
+            .containsAutoAssembler = containsAutoAssembler,
+            .containsLua = containsLua,
+            .errorCode = {}, .errorMessage = {}};
 }
 
 TableOperationResult AddressListController::saveTable(const std::string& path,
@@ -1004,21 +1041,29 @@ TableOperationResult AddressListController::saveTable(const std::string& path,
     } catch (const std::exception& error) {
         return {.success = false, .recordCount = records_.size(),
                 .containsScripts = tableContainsScripts(table),
+                .containsAutoAssembler = tableContainsAutoAssembler(table),
+                .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
                 .errorMessage = std::string("The cheat table could not be saved: ") + error.what()};
     } catch (...) {
         return {.success = false, .recordCount = records_.size(),
                 .containsScripts = tableContainsScripts(table),
+                .containsAutoAssembler = tableContainsAutoAssembler(table),
+                .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
                 .errorMessage = "The cheat table could not be saved."};
     }
     if (!saved)
         return {.success = false, .recordCount = records_.size(),
                 .containsScripts = tableContainsScripts(table),
+                .containsAutoAssembler = tableContainsAutoAssembler(table),
+                .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
                 .errorMessage = "The cheat-table file could not be written."};
     return {.success = true, .recordCount = records_.size(),
             .containsScripts = tableContainsScripts(table),
+            .containsAutoAssembler = tableContainsAutoAssembler(table),
+            .containsLua = tableContainsLua(table),
             .errorCode = {}, .errorMessage = {}};
 }
 
@@ -1062,6 +1107,8 @@ AddressRecordSnapshot AddressListController::snapshot(const Record& record) cons
             .isGroup = record.isGroup,
             .collapsed = record.collapsed,
             .hasScript = !record.script.empty() || !record.luaScript.empty(),
+            .hasAutoAssembler = !record.script.empty(),
+            .hasLua = !record.luaScript.empty(),
             .indent = record.indent};
 }
 

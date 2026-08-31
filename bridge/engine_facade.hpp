@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ce {
 class AddressListController;
@@ -43,7 +44,7 @@ public:
     rust::String version() const;
     rust::Vec<ProcessRow> list_processes(rust::Str query, std::uint32_t limit) const;
     AttachResult attach(std::int32_t pid, rust::Str display_name);
-    void detach() noexcept;
+    AddressActionResult detach();
     bool is_attached() const noexcept;
     std::int32_t attached_pid() const noexcept;
     ScanStartResult start_first_scan(const ScanRequest& request);
@@ -72,11 +73,19 @@ public:
     AddressActionResult set_address_collapsed(std::int32_t id, bool collapsed);
     TableActionResult load_table(rust::Str path);
     TableActionResult save_table(rust::Str path, bool json) const;
+    AddressActionResult set_table_scripts_trusted(bool trusted);
+    bool table_scripts_trusted() const noexcept;
     void freeze_addresses() noexcept;
 
 private:
+    struct ScriptRuntime;
+
     void join_scan_worker() noexcept;
     void clear_scan_state() noexcept;
+    bool deactivate_scripts(const std::vector<int>& ids, std::string& errorCode,
+                            std::string& errorMessage) noexcept;
+    bool deactivate_all_scripts(std::string& errorCode,
+                                std::string& errorMessage) noexcept;
 
     std::unique_ptr<ce::ProcessHandle> process_;
     std::unique_ptr<ce::MemoryScanner> scanner_;
@@ -85,6 +94,7 @@ private:
     std::unique_ptr<ce::ScanConfig> scan_config_;
     std::unique_ptr<ce::ScanConfig> undo_scan_config_;
     std::unique_ptr<ce::AddressListController> address_list_;
+    std::unique_ptr<ScriptRuntime> script_runtime_;
     bool scan_display_hex_ = false;
     bool undo_scan_display_hex_ = false;
     std::thread scan_worker_;

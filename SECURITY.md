@@ -6,11 +6,13 @@ This tool inspects and modifies other processes' memory. It is frequently run
 with elevated privileges (`ptrace`, often under `sudo`), and its cheat-table
 format is scriptable.
 
-**Do not open `.CT` / `.CETRAINER` files from sources you do not trust.** A cheat
-table can embed Lua that runs automatically. Opening a malicious table can
-execute arbitrary code on your machine, typically with whatever privileges you
-launched the tool with (i.e. root, if you used `sudo`). Treat a shared table like
-a shared executable.
+**Do not execute scripts from `.CT` / `.CETRAINER` files you do not trust.** A
+cheat table can embed Lua and Auto Assembler payloads. The legacy Qt frontend
+asks before table-level Lua runs. The GTK migration frontend imports every
+script inactive, requires explicit table-scoped trust before an Auto Assembler
+record can be enabled, and still keeps Lua execution blocked. Treat a shared
+table like a shared executable even when the current frontend initially opens
+it in a non-executing state.
 
 The two most dangerous parts of the Lua surface are **denied by default** and
 only enabled by an out-of-band opt-in that a table's own script cannot set — the

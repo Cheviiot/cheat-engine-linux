@@ -2,6 +2,7 @@
 
 #include "ce-gtk/src/bridge.rs.h"
 #include "core/address_list_controller.hpp"
+#include "core/autoasm.hpp"
 #include "core/target_profile.hpp"
 #include "core/value_transform.hpp"
 #include "core/version.hpp"
@@ -20,6 +21,8 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -723,12 +726,23 @@ std::string format_scan_value(const ce::ScanConfig& config, bool display_hex,
 
 } // namespace
 
+struct EngineFacade::ScriptRuntime {
+    ce::AutoAssembler assembler;
+    std::unordered_map<int, ce::DisableInfo> disableInfoById;
+    std::vector<int> activationOrder;
+    bool trusted = false;
+};
+
 EngineFacade::EngineFacade()
-    : address_list_(std::make_unique<ce::AddressListController>()) {}
+    : address_list_(std::make_unique<ce::AddressListController>()),
+      script_runtime_(std::make_unique<ScriptRuntime>()) {}
 
 EngineFacade::~EngineFacade() {
     cancel_scan();
     join_scan_worker();
+    std::string ignoredCode;
+    std::string ignoredMessage;
+    deactivate_all_scripts(ignoredCode, ignoredMessage);
     address_list_->setProcess(nullptr);
 }
 
@@ -798,6 +812,13 @@ AttachResult EngineFacade::attach(std::int32_t pid, rust::Str display_name) {
         std::uint8_t byte = 0;
         auto read = candidate->read(region.base, &byte, sizeof byte);
         if (read && *read == sizeof byte) {
+            std::string scriptErrorCode;
+            std::string scriptErrorMessage;
+            if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
+                result.error_code = scriptErrorCode;
+                result.error_message = scriptErrorMessage;
+                return result;
+            }
             clear_scan_state();
             process_ = std::move(candidate);
             address_list_->setProcess(process_.get());
@@ -820,12 +841,26 @@ AttachResult EngineFacade::attach(std::int32_t pid, rust::Str display_name) {
     return result;
 }
 
-void EngineFacade::detach() noexcept {
+AddressActionResult EngineFacade::detach() {
     cancel_scan();
     join_scan_worker();
     clear_scan_state();
+    std::string scriptErrorCode;
+    std::string scriptErrorMessage;
+    if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = 0,
+            .error_code = scriptErrorCode,
+            .error_message = scriptErrorMessage,
+        };
+    }
     address_list_->setProcess(nullptr);
     process_.reset();
+    script_runtime_->disableInfoById.clear();
+    script_runtime_->activationOrder.clear();
+    return AddressActionResult{
+        .accepted = true, .id = 0, .error_code = {}, .error_message = {}};
 }
 
 bool EngineFacade::is_attached() const noexcept {
@@ -1138,6 +1173,8 @@ AddressPage EngineFacade::address_rows(std::uint64_t start, std::uint32_t limit,
             .is_group = record.isGroup,
             .collapsed = record.collapsed,
             .has_script = record.hasScript,
+            .has_auto_assembler = record.hasAutoAssembler,
+            .has_lua = record.hasLua,
             .indent = record.indent,
         });
     }
@@ -1245,14 +1282,236 @@ AddressActionResult EngineFacade::set_address_value(std::int32_t id, rust::Str v
     return response;
 }
 
+bool EngineFacade::deactivate_scripts(const std::vector<int>& ids,
+                                      std::string& errorCode,
+                                      std::string& errorMessage) noexcept {
+    errorCode.clear();
+    errorMessage.clear();
+    try {
+        if (ids.empty()) return true;
+
+        const std::unordered_set<int> requested(ids.begin(), ids.end());
+        std::vector<int> ordered;
+        ordered.reserve(requested.size());
+        for (auto iterator = script_runtime_->activationOrder.rbegin();
+             iterator != script_runtime_->activationOrder.rend(); ++iterator) {
+            if (requested.contains(*iterator)) ordered.push_back(*iterator);
+        }
+        for (const int id : requested) {
+            if (script_runtime_->disableInfoById.contains(id) &&
+                std::find(ordered.begin(), ordered.end(), id) == ordered.end())
+                ordered.push_back(id);
+        }
+        if (ordered.empty()) return true;
+        if (!process_) {
+            errorCode = "script_target_unavailable";
+            errorMessage =
+                "The original target is unavailable, so active Auto Assembler records "
+                "cannot be disabled safely.";
+            return false;
+        }
+
+        const auto records = address_list_->exportRecords();
+        for (const int id : ordered) {
+            const auto record = std::find_if(
+                records.begin(), records.end(), [id](const auto& item) { return item.id == id; });
+            const auto disableInfo = script_runtime_->disableInfoById.find(id);
+            if (record == records.end() || record->script.empty() ||
+                disableInfo == script_runtime_->disableInfoById.end()) {
+                errorCode = "script_disable_state_missing";
+                errorMessage =
+                    "Runtime state needed to disable an Auto Assembler record is missing.";
+                return false;
+            }
+
+            ce::AutoAsmResult disabled;
+            try {
+                disabled = script_runtime_->assembler.disable(
+                    *process_, record->script, disableInfo->second);
+            } catch (const std::exception& error) {
+                disabled.success = false;
+                disabled.error = error.what();
+            } catch (...) {
+                disabled.success = false;
+                disabled.error = "The Auto Assembler raised an unknown native error.";
+            }
+            if (disabled.success) {
+                for (const auto& original : disableInfo->second.originals) {
+                    const bool belongedToFreedAllocation = std::any_of(
+                        disableInfo->second.allocs.begin(),
+                        disableInfo->second.allocs.end(),
+                        [&original](const ce::DisableInfo::AllocEntry& allocation) {
+                            return original.address >= allocation.address &&
+                                   original.address - allocation.address < allocation.size;
+                        });
+                    if (belongedToFreedAllocation) continue;
+                    std::vector<std::uint8_t> restored(original.bytes.size());
+                    const auto read = process_->read(
+                        original.address, restored.data(), restored.size());
+                    if (!read || *read != restored.size() || restored != original.bytes) {
+                        disabled.success = false;
+                        disabled.error =
+                            "The target did not confirm restoration of the original bytes.";
+                        break;
+                    }
+                }
+            }
+            if (!disabled.success) {
+                errorCode = "auto_assembler_disable_failed";
+                errorMessage = disabled.error.empty()
+                    ? "The Auto Assembler record could not be disabled."
+                    : disabled.error;
+                return false;
+            }
+
+            const auto committed = address_list_->commitExecutedScriptState(
+                id, false, record->luaScript.empty()
+                               ? "(Auto Assembler script disabled)"
+                               : "(Auto Assembler disabled; record Lua remains blocked)");
+            script_runtime_->disableInfoById.erase(id);
+            std::erase(script_runtime_->activationOrder, id);
+            if (!committed.success) {
+                errorCode = "script_state_update_failed";
+                errorMessage = committed.errorMessage;
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        errorCode = "script_cleanup_failed";
+        errorMessage = error.what();
+        return false;
+    } catch (...) {
+        errorCode = "script_cleanup_failed";
+        errorMessage = "An unknown native error interrupted script cleanup.";
+        return false;
+    }
+}
+
+bool EngineFacade::deactivate_all_scripts(std::string& errorCode,
+                                          std::string& errorMessage) noexcept {
+    try {
+        std::vector<int> ids;
+        ids.reserve(script_runtime_->disableInfoById.size());
+        for (const auto& [id, _] : script_runtime_->disableInfoById) ids.push_back(id);
+        return deactivate_scripts(ids, errorCode, errorMessage);
+    } catch (const std::exception& error) {
+        errorCode = "script_cleanup_failed";
+        errorMessage = error.what();
+        return false;
+    } catch (...) {
+        errorCode = "script_cleanup_failed";
+        errorMessage = "An unknown native error interrupted script cleanup.";
+        return false;
+    }
+}
+
 AddressActionResult EngineFacade::set_address_active(std::int32_t id, bool active) {
-    const auto result = address_list_->activateRecord(id, active);
+    const auto records = address_list_->exportRecords();
+    const auto found = std::find_if(records.begin(), records.end(), [id](const auto& record) {
+        return record.id == id;
+    });
+    if (found == records.end()) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "record_not_found",
+            .error_message = "The address-list record no longer exists.",
+        };
+    }
+    if (found->script.empty() && found->luaScript.empty()) {
+        const auto result = address_list_->activateRecord(id, active);
+        return AddressActionResult{
+            .accepted = result.success,
+            .id = result.id,
+            .error_code = result.errorCode,
+            .error_message = result.errorMessage,
+        };
+    }
+    if (found->script.empty()) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "lua_execution_unavailable",
+            .error_message =
+                "Lua records are preserved but cannot be executed by the GTK frontend yet.",
+        };
+    }
+    if (found->active == active) {
+        return AddressActionResult{
+            .accepted = true, .id = id, .error_code = {}, .error_message = {}};
+    }
+    if (!active) {
+        std::string errorCode;
+        std::string errorMessage;
+        const bool disabled = deactivate_scripts({id}, errorCode, errorMessage);
+        return AddressActionResult{
+            .accepted = disabled,
+            .id = id,
+            .error_code = errorCode,
+            .error_message = errorMessage,
+        };
+    }
+    if (!script_runtime_->trusted) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "table_not_trusted",
+            .error_message =
+                "Trust this loaded table before enabling its Auto Assembler records.",
+        };
+    }
+    if (!process_) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "no_session",
+            .error_message = "Attach to a process before enabling an Auto Assembler record.",
+        };
+    }
+
+    ce::AutoAsmResult execution;
+    try {
+        execution = script_runtime_->assembler.execute(*process_, found->script);
+    } catch (const std::exception& error) {
+        execution.success = false;
+        execution.error = error.what();
+    } catch (...) {
+        execution.success = false;
+        execution.error = "The Auto Assembler raised an unknown native error.";
+    }
+    if (!execution.success) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "auto_assembler_failed",
+            .error_message = execution.error.empty()
+                ? "The Auto Assembler record could not be enabled."
+                : execution.error,
+        };
+    }
+
+    const auto committed = address_list_->commitExecutedScriptState(
+        id, true, found->luaScript.empty()
+                      ? "(Auto Assembler script enabled)"
+                      : "(Auto Assembler enabled; record Lua remains blocked)");
+    if (!committed.success) {
+        try {
+            script_runtime_->assembler.disable(*process_, found->script,
+                                                execution.disableInfo);
+        } catch (...) {
+        }
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = "script_state_update_failed",
+            .error_message = committed.errorMessage,
+        };
+    }
+    script_runtime_->disableInfoById[id] = std::move(execution.disableInfo);
+    script_runtime_->activationOrder.push_back(id);
     return AddressActionResult{
-        .accepted = result.success,
-        .id = result.id,
-        .error_code = result.errorCode,
-        .error_message = result.errorMessage,
-    };
+        .accepted = true, .id = id, .error_code = {}, .error_message = {}};
 }
 
 AddressActionResult EngineFacade::set_address_freeze_mode(std::int32_t id,
@@ -1276,6 +1535,31 @@ AddressActionResult EngineFacade::set_address_freeze_mode(std::int32_t id,
 }
 
 AddressActionResult EngineFacade::delete_address(std::int32_t id) {
+    const auto records = address_list_->exportRecords();
+    const auto found = std::find_if(records.begin(), records.end(), [id](const auto& record) {
+        return record.id == id;
+    });
+    std::vector<int> removedIds;
+    if (found != records.end()) {
+        const auto row = static_cast<std::size_t>(std::distance(records.begin(), found));
+        removedIds.push_back(id);
+        if (found->isGroup) {
+            for (std::size_t child = row + 1; child < records.size(); ++child) {
+                if (records[child].indent <= found->indent) break;
+                removedIds.push_back(records[child].id);
+            }
+        }
+    }
+    std::string scriptErrorCode;
+    std::string scriptErrorMessage;
+    if (!deactivate_scripts(removedIds, scriptErrorCode, scriptErrorMessage)) {
+        return AddressActionResult{
+            .accepted = false,
+            .id = id,
+            .error_code = scriptErrorCode,
+            .error_message = scriptErrorMessage,
+        };
+    }
     const auto result = address_list_->removeRecord(id);
     return AddressActionResult{
         .accepted = result.success,
@@ -1348,15 +1632,37 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
             .accepted = false,
             .record_count = 0,
             .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
             .error_code = "invalid_path",
             .error_message = "The cheat-table path is invalid or too long.",
         };
     }
+    std::string scriptErrorCode;
+    std::string scriptErrorMessage;
+    if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
+        return TableActionResult{
+            .accepted = false,
+            .record_count = static_cast<std::uint64_t>(address_list_->count()),
+            .contains_scripts = true,
+            .contains_auto_assembler = true,
+            .contains_lua = false,
+            .error_code = scriptErrorCode,
+            .error_message = scriptErrorMessage,
+        };
+    }
     const auto result = address_list_->loadTable(file);
+    if (result.success) {
+        script_runtime_->trusted = false;
+        script_runtime_->disableInfoById.clear();
+        script_runtime_->activationOrder.clear();
+    }
     return TableActionResult{
         .accepted = result.success,
         .record_count = static_cast<std::uint64_t>(result.recordCount),
         .contains_scripts = result.containsScripts,
+        .contains_auto_assembler = result.containsAutoAssembler,
+        .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
     };
@@ -1369,6 +1675,8 @@ TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
             .accepted = false,
             .record_count = 0,
             .contains_scripts = false,
+            .contains_auto_assembler = false,
+            .contains_lua = false,
             .error_code = "invalid_path",
             .error_message = "The cheat-table path is invalid or too long.",
         };
@@ -1378,9 +1686,33 @@ TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
         .accepted = result.success,
         .record_count = static_cast<std::uint64_t>(result.recordCount),
         .contains_scripts = result.containsScripts,
+        .contains_auto_assembler = result.containsAutoAssembler,
+        .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
     };
+}
+
+AddressActionResult EngineFacade::set_table_scripts_trusted(bool trusted) {
+    if (!trusted) {
+        std::string errorCode;
+        std::string errorMessage;
+        if (!deactivate_all_scripts(errorCode, errorMessage)) {
+            return AddressActionResult{
+                .accepted = false,
+                .id = 0,
+                .error_code = errorCode,
+                .error_message = errorMessage,
+            };
+        }
+    }
+    script_runtime_->trusted = trusted;
+    return AddressActionResult{
+        .accepted = true, .id = 0, .error_code = {}, .error_message = {}};
+}
+
+bool EngineFacade::table_scripts_trusted() const noexcept {
+    return script_runtime_->trusted;
 }
 
 void EngineFacade::freeze_addresses() noexcept {

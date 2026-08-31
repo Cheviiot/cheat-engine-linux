@@ -85,6 +85,8 @@ struct AddressRecordSnapshot {
     bool isGroup = false;
     bool collapsed = false;
     bool hasScript = false;
+    bool hasAutoAssembler = false;
+    bool hasLua = false;
     int indent = 0;
 };
 
@@ -99,6 +101,8 @@ struct TableOperationResult {
     bool success = false;
     std::size_t recordCount = 0;
     bool containsScripts = false;
+    bool containsAutoAssembler = false;
+    bool containsLua = false;
     std::string errorCode;
     std::string errorMessage;
 };
@@ -130,6 +134,12 @@ public:
     AddressOperationResult moveRecordBlock(int id, std::size_t destination,
                                            int newRootIndent = -1);
     AddressOperationResult setRecordCollapsed(int id, bool collapsed);
+    /// Commit the active state only after an external, explicitly trusted
+    /// script executor has successfully enabled or disabled this record. This
+    /// method never parses or executes the payload itself, so activateRecord()
+    /// remains the non-bypassable default-deny path for script records.
+    AddressOperationResult commitExecutedScriptState(int id, bool active,
+                                                      const std::string& status);
     std::vector<AddressRecordState> exportRecords() const { return records_; }
     AddressOperationResult replaceRecords(std::vector<AddressRecordState> records,
                                           bool allowActiveScripts = false);

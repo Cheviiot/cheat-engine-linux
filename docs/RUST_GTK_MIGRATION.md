@@ -65,14 +65,24 @@ Completed in the foundation and first vertical slices:
 - native GTK file dialogs and address-list actions for opening/saving tables,
   adding empty groups, grouping selected records, moving complete subtrees, and
   collapsing groups;
-- a conservative table trust boundary: imported records are always inactive,
-  Lua and Auto Assembler content is visibly marked and preserved but cannot be
-  executed, and password-protected CETRAINER input returns an explicit
-  unsupported error until a password workflow exists;
+- an explicit, table-scoped GTK trust boundary: imported records are always
+  inactive, Lua and Auto Assembler are identified separately, and Auto
+  Assembler record switches unlock only after a default-deny warning; trust can
+  be revoked at any time and no script runs merely because trust was granted;
+- runtime Auto Assembler disable state stays behind the CXX facade and is used
+  to restore original target bytes before trust revocation, record/subtree
+  deletion, target replacement, detach, or normal facade destruction; failed
+  cleanup prevents an interactive detach or target change instead of silently
+  losing the restoration state;
+- table-level and per-record Lua remain visibly preserved but non-executable,
+  and password-protected CETRAINER input returns an explicit unsupported error
+  until reviewed Lua and password workflows exist;
 - bridge tests that exercise real self-process writes, normal and directional
   freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
   codecs, plus group/subtree semantics, `.CT` hierarchy round trips, atomic
-  failure behavior, protected-table rejection, and script non-execution;
+  failure behavior, protected-table rejection, script non-execution before
+  trust, real trusted AA enable/disable, trust revocation, reattach/detach
+  cleanup, and deletion cleanup;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
@@ -82,13 +92,13 @@ virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
 contract.  The address-list controller is now the GTK source of truth and the
 Qt model delegates hierarchy plus the safe `IAddressList` surface through a
 lossless adapter.  Qt still owns its periodic refresh and freeze timers, inline
-value-editor verification, and existing Auto Assembler execution.  Completing
-that timer/execution extraction is the remaining Phase 2 work and must preserve
-Qt's current behavior.  The following slice adds an explicit GTK trust prompt
-and a separately reviewed Lua/Auto Assembler activation path.  The GTK frontend
-does not yet open password-protected CETRAINER files, expose a loss report, or
-virtualize address rows beyond its bounded first page.  No product identifier
-should be published before the branding decision.
+value-editor verification, and its legacy Auto Assembler adapter.  GTK now has
+the separately reviewed, explicit-trust Auto Assembler path; completing the
+periodic timer extraction and adding a similarly reviewed Lua execution path
+are the remaining Phase 2 work.  The GTK frontend does not yet open
+password-protected CETRAINER files, expose a loss report, or virtualize address
+rows beyond its bounded first page.  No product identifier should be published
+before the branding decision.
 
 ## Goal
 
@@ -407,8 +417,9 @@ recorded in a short decision note before public release.
 7. ~~Add the complete scan request/value-type/comparison surface.~~
 8. Replace the explicit pager with a virtualized bounded-cache GTK model.
 9. Extract the toolkit-neutral address-list controller and adapt Qt to it
-   (controller, GTK ownership, and Qt hierarchy adapter complete; Qt live
-   `IAddressList` operations remain).
+   (controller, GTK ownership, hierarchy, and the safe live `IAddressList`
+   surface complete; Qt's periodic refresh/freeze timers remain).
 10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
-11. Grouping/reordering and lossless modeled-field `.CT`/JSON persistence are
-    complete; next gate script activation behind an explicit trust prompt.
+11. Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, the GTK
+    trust prompt, and trusted Auto Assembler activation/cleanup are complete;
+    next add script review UI and a separately constrained Lua path.
