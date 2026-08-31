@@ -2068,6 +2068,20 @@ static std::filesystem::path makeScanDir() {
            ("scan-" + std::to_string(getpid()) + "-" + std::to_string(scanCounter.fetch_add(1)));
 }
 
+class ScanActivityGuard {
+public:
+    explicit ScanActivityGuard(std::atomic<bool>& active) : active_(active) {
+        active_.store(true, std::memory_order_release);
+    }
+    ~ScanActivityGuard() { active_.store(false, std::memory_order_release); }
+
+    ScanActivityGuard(const ScanActivityGuard&) = delete;
+    ScanActivityGuard& operator=(const ScanActivityGuard&) = delete;
+
+private:
+    std::atomic<bool>& active_;
+};
+
 std::unique_ptr<ScanResult> pruneScanResult(const ScanResult& src, size_t valueSize,
                                             const std::vector<bool>& remove) {
     // storeFirst=true so the pruned copy keeps a first-scan-value stream: a survivor's
@@ -2094,6 +2108,7 @@ std::unique_ptr<ScanResult> pruneScanResult(const ScanResult& src, size_t valueS
 ScanResult MemoryScanner::firstScan(ProcessHandle& proc, const ScanConfig& config) {
     cancelled_.store(false);
     progress_.store(0);
+    ScanActivityGuard activity(active_);
 
     if (config.valueType == ValueType::Grouped) {
         if (config.groupedTerms.empty())
@@ -2401,6 +2416,7 @@ ScanResult MemoryScanner::firstScan(ProcessHandle& proc, const ScanConfig& confi
 ScanResult MemoryScanner::nextScan(ProcessHandle& proc, const ScanConfig& config, const ScanResult& previous) {
     cancelled_.store(false);
     progress_.store(0);
+    ScanActivityGuard activity(active_);
 
     if (config.valueType == ValueType::Grouped) {
         if (config.groupedTerms.empty())

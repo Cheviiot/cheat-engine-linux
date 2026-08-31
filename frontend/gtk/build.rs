@@ -15,4 +15,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.hpp");
     println!("cargo:rerun-if-changed=../../bridge/engine_facade.cpp");
     println!("cargo:rerun-if-changed=../../core/version.hpp");
+    println!("cargo:rerun-if-changed=../../core/target_profile.hpp");
+    println!("cargo:rerun-if-changed=../../core/types.hpp");
+    println!("cargo:rerun-if-changed=../../platform/process_api.hpp");
+    println!("cargo:rerun-if-changed=../../platform/linux/linux_process.hpp");
+    println!("cargo:rerun-if-changed=../../scanner/memory_scanner.hpp");
 }

@@ -5,7 +5,7 @@ and final visual identity are intentionally left open until the naming review.
 
 ## Implementation progress
 
-Completed in the foundation slice:
+Completed in the foundation and first vertical slices:
 
 - reproducible `lch-rust-gtk-dev` Ubuntu 24.04 Distrobox and pinned Rust 1.92;
 - independent Qt and GTK frontend CMake options;
@@ -13,11 +13,21 @@ Completed in the foundation slice:
 - a CXX `EngineFacade` connected to the real shared `libcecore` version API;
 - a bounded process-list bridge endpoint (maximum 512 rows and bounded query);
 - an Adwaita application shell and asynchronous, searchable process chooser;
+- a persistent attach/detach session with architecture, runtime, namespace, and
+  tracer diagnostics plus an actual target-memory readability probe;
+- stable, actionable errors for missing processes, restricted `/proc`, Yama/
+  `CAP_SYS_PTRACE` denial, already-traced targets, and unreadable mappings;
+- an asynchronous exact Int32 first scan backed by the existing
+  `MemoryScanner`, with progress, cancellation, result count, write-error state,
+  and a strictly bounded 100-row preview;
+- deterministic bridge tests for self attach, child-process attach, failed
+  reattach state preservation, and a known value in a bounded memory range;
 - CXX contract, Rust unit, GTK/Xvfb startup, Qt smoke, and core regression tests.
 
 The application ID and window title are explicitly development placeholders.
-The next vertical slice is attach/detach plus target diagnostics; no product
-identifier should be published before the branding decision.
+The bounded scan preview is deliberately not the final result model.  The next
+slice replaces it with generation-aware paging and then adds next/undo scans.
+No product identifier should be published before the branding decision.
 
 ## Goal
 
@@ -327,9 +337,10 @@ recorded in a short decision note before public release.
 
 ## Immediate implementation queue
 
-1. Phase 0 baseline fixes and Distrobox bootstrap documentation.
-2. Minimal Cargo/GTK application that opens an `AdwApplicationWindow`.
-3. CXX/Corrosion link spike with `EngineFacade::version()`.
-4. Bounded process list plus attach/detach.
-5. Address-list controller extraction.
-6. Asynchronous first-scan vertical slice with a paged result list.
+1. ~~Phase 0 baseline fixes and Distrobox bootstrap documentation.~~
+2. ~~Minimal Cargo/GTK application and CXX/Corrosion version spike.~~
+3. ~~Bounded process list, attach/detach, and target diagnostics.~~
+4. ~~Asynchronous Int32 first-scan spike with progress and cancellation.~~
+5. Replace the 100-row preview with generation-aware, bounded result paging.
+6. Add next scan, undo, and the complete scan request/value-type surface.
+7. Extract the toolkit-neutral address-list controller and adapt Qt to it.

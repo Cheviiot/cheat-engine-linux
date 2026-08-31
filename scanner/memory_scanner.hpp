@@ -209,6 +209,11 @@ public:
     /// Progress (0.0 to 1.0).
     float progress() const { return progress_.load(std::memory_order_relaxed); }
 
+    /// True after a scan has reset its cancellation state and until it returns.
+    /// Async controllers can wait for this hand-off before exposing Cancel,
+    /// avoiding a start/cancel race where the scan's reset loses an early request.
+    bool running() const { return active_.load(std::memory_order_acquire); }
+
     /// Cancel a running scan.
     void cancel() { cancelled_.store(true, std::memory_order_relaxed); }
 
@@ -216,6 +221,7 @@ private:
     int threadCount_;
     std::atomic<float> progress_{0};
     std::atomic<bool> cancelled_{false};
+    std::atomic<bool> active_{false};
 
     static size_t valueSizeFor(ValueType vt);
 };

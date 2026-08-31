@@ -7,6 +7,47 @@ mod ffi {
         sandboxed: bool,
     }
 
+    struct AttachResult {
+        success: bool,
+        pid: i32,
+        name: String,
+        summary: String,
+        arch: String,
+        endianness: String,
+        wine: bool,
+        sandboxed: bool,
+        already_traced: bool,
+        tracer_pid: i32,
+        yama_scope: String,
+        notes: Vec<String>,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct ScanStartResult {
+        accepted: bool,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct ScanHit {
+        address: u64,
+        value: String,
+    }
+
+    struct ScanStatus {
+        started: bool,
+        running: bool,
+        cancel_requested: bool,
+        cancelled: bool,
+        completed: bool,
+        progress: f32,
+        result_count: u64,
+        write_error: bool,
+        error_message: String,
+        preview: Vec<ScanHit>,
+    }
+
     unsafe extern "C++" {
         include!("bridge/engine_facade.hpp");
 
@@ -15,6 +56,19 @@ mod ffi {
         fn create_engine_facade() -> UniquePtr<EngineFacade>;
         fn version(self: &EngineFacade) -> String;
         fn list_processes(self: &EngineFacade, query: &str, limit: u32) -> Vec<ProcessRow>;
+        fn attach(self: Pin<&mut EngineFacade>, pid: i32, display_name: &str) -> AttachResult;
+        fn detach(self: Pin<&mut EngineFacade>);
+        fn is_attached(self: &EngineFacade) -> bool;
+        fn attached_pid(self: &EngineFacade) -> i32;
+        fn start_first_scan_i32(
+            self: Pin<&mut EngineFacade>,
+            value: i32,
+            start_address: u64,
+            stop_address: u64,
+            alignment: u32,
+        ) -> ScanStartResult;
+        fn scan_status(self: &EngineFacade) -> ScanStatus;
+        fn cancel_scan(self: Pin<&mut EngineFacade>);
     }
 }
 
@@ -26,9 +80,55 @@ pub struct Process {
     pub sandboxed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Session {
+    pub pid: i32,
+    pub name: String,
+    pub summary: String,
+    pub arch: String,
+    pub endianness: String,
+    pub wine: bool,
+    pub sandboxed: bool,
+    pub already_traced: bool,
+    pub tracer_pid: i32,
+    pub yama_scope: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanHit {
+    pub address: u64,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanStatus {
+    pub started: bool,
+    pub running: bool,
+    pub cancel_requested: bool,
+    pub cancelled: bool,
+    pub completed: bool,
+    pub progress: f32,
+    pub result_count: u64,
+    pub write_error: bool,
+    pub error_message: String,
+    pub preview: Vec<ScanHit>,
+}
+
 pub struct Engine {
     inner: cxx::UniquePtr<ffi::EngineFacade>,
 }
+
+// Engine owns its C++ facade uniquely and the Linux process handle has no UI or
+// thread affinity. Moving the whole owner to a worker thread is therefore safe;
+// callers never share or access it concurrently.
+unsafe impl Send for Engine {}
 
 impl Engine {
     pub fn new() -> Self {
@@ -53,6 +153,92 @@ impl Engine {
             })
             .collect()
     }
+
+    pub fn attach(&mut self, pid: i32, display_name: &str) -> Result<Session, AttachError> {
+        let result = self.inner.pin_mut().attach(pid, display_name);
+        if !result.success {
+            return Err(AttachError {
+                code: result.error_code,
+                message: result.error_message,
+            });
+        }
+
+        Ok(Session {
+            pid: result.pid,
+            name: result.name,
+            summary: result.summary,
+            arch: result.arch,
+            endianness: result.endianness,
+            wine: result.wine,
+            sandboxed: result.sandboxed,
+            already_traced: result.already_traced,
+            tracer_pid: result.tracer_pid,
+            yama_scope: result.yama_scope,
+            notes: result.notes,
+        })
+    }
+
+    pub fn detach(&mut self) {
+        self.inner.pin_mut().detach();
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.inner.is_attached()
+    }
+
+    pub fn attached_pid(&self) -> i32 {
+        self.inner.attached_pid()
+    }
+
+    pub fn start_first_scan_i32(
+        &mut self,
+        value: i32,
+        start_address: u64,
+        stop_address: u64,
+        alignment: u32,
+    ) -> Result<(), AttachError> {
+        let result = self.inner.pin_mut().start_first_scan_i32(
+            value,
+            start_address,
+            stop_address,
+            alignment,
+        );
+        if result.accepted {
+            Ok(())
+        } else {
+            Err(AttachError {
+                code: result.error_code,
+                message: result.error_message,
+            })
+        }
+    }
+
+    pub fn scan_status(&self) -> ScanStatus {
+        let status = self.inner.scan_status();
+        ScanStatus {
+            started: status.started,
+            running: status.running,
+            cancel_requested: status.cancel_requested,
+            cancelled: status.cancelled,
+            completed: status.completed,
+            progress: status.progress,
+            result_count: status.result_count,
+            write_error: status.write_error,
+            error_message: status.error_message,
+            preview: status
+                .preview
+                .into_iter()
+                .map(|hit| ScanHit {
+                    address: hit.address,
+                    value: hit.value,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn cancel_scan(&mut self) {
+        self.inner.pin_mut().cancel_scan();
+    }
 }
 
 impl Default for Engine {
@@ -63,6 +249,9 @@ impl Default for Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     use super::Engine;
 
     #[test]
@@ -80,5 +269,89 @@ mod tests {
     fn process_listing_filters_unknown_names() {
         let query = "ce-gtk-process-name-that-cannot-reasonably-exist-7f93d4";
         assert!(Engine::new().list_processes(query, 32).is_empty());
+    }
+
+    #[test]
+    fn attaches_to_self_and_detaches() {
+        let mut engine = Engine::new();
+        let pid = std::process::id() as i32;
+
+        let session = engine.attach(pid, "bridge test").expect("attach to self");
+        assert_eq!(session.pid, pid);
+        assert!(engine.is_attached());
+        assert_eq!(engine.attached_pid(), pid);
+
+        engine.detach();
+        assert!(!engine.is_attached());
+        assert_eq!(engine.attached_pid(), 0);
+    }
+
+    #[test]
+    fn failed_attach_preserves_current_session() {
+        let mut engine = Engine::new();
+        let pid = std::process::id() as i32;
+        engine.attach(pid, "bridge test").expect("attach to self");
+
+        let error = engine
+            .attach(-1, "invalid")
+            .expect_err("invalid PID must fail");
+        assert_eq!(error.code, "process_not_found");
+        assert_eq!(engine.attached_pid(), pid);
+    }
+
+    #[test]
+    fn attaches_to_child_process() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start child process");
+        let mut engine = Engine::new();
+
+        let result = engine.attach(child.id() as i32, "sleep child");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let session = result.expect("parent should be allowed to read child memory");
+        assert_eq!(session.name, "sleep child");
+    }
+
+    #[test]
+    fn first_scan_finds_known_value_in_bounded_self_range() {
+        let sentinel = Box::new(0x0123_4567_i32);
+        let address = (&raw const *sentinel) as u64;
+        let mut engine = Engine::new();
+        engine
+            .attach(std::process::id() as i32, "scan fixture")
+            .expect("attach to self");
+
+        engine
+            .start_first_scan_i32(*sentinel, address, address + 4, 1)
+            .expect("start bounded first scan");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            let status = engine.scan_status();
+            if !status.running {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "scan timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.completed, "scan failed: {}", status.error_message);
+        assert_eq!(status.result_count, 1);
+        assert_eq!(status.preview[0].address, address);
+        assert_eq!(status.preview[0].value, sentinel.to_string());
+    }
+
+    #[test]
+    fn first_scan_requires_attached_session() {
+        let mut engine = Engine::new();
+        let error = engine
+            .start_first_scan_i32(42, 0, 4, 1)
+            .expect_err("scan without session must fail");
+        assert_eq!(error.code, "no_session");
     }
 }
