@@ -119,6 +119,7 @@ int main(int argc, char* argv[]) {
     const QStringList cliArgs = app.arguments();
     uintptr_t memviewAddr = 0;
     bool wantMemview = false, wantSettings = false, wantFindWrites = false;
+    bool wantAddressListAdapterSmoke = false;
     uintptr_t findWritesAddr = 0;
     QString wantPanel, wantSettingsPage;
     for (int i = 1; i < cliArgs.size(); ++i) {
@@ -128,6 +129,8 @@ int main(int argc, char* argv[]) {
             wantFindWrites = ok;
         } else if (cliArgs.at(i) == QLatin1String("--settings")) {
             wantSettings = true;
+        } else if (cliArgs.at(i) == QLatin1String("--address-list-adapter-smoke")) {
+            wantAddressListAdapterSmoke = true;
         } else if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--settings-page")) {
             wantSettings = true;
             wantSettingsPage = cliArgs.at(i + 1);
@@ -142,6 +145,11 @@ int main(int argc, char* argv[]) {
             memviewAddr = static_cast<uintptr_t>(cliArgs.at(i + 1).toULongLong(&ok, 0));
             wantMemview = ok;
         }
+    }
+    if (wantAddressListAdapterSmoke) {
+        const bool ok = w.runAddressListAdapterSmoke();
+        std::printf("gui address-list adapter smoke: %s\n", ok ? "OK" : "FAILED");
+        return ok ? 0 : 1;
     }
     QWidget* shotTarget = &w;
     if (wantMemview) {

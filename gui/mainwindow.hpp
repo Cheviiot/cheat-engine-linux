@@ -10,6 +10,7 @@
 #include "core/value_codec.hpp"
 #include "core/value_transform.hpp"
 #include "core/address_list.hpp"
+#include "core/address_list_controller.hpp"
 #include "core/ct_file.hpp"
 #include "scripting/lua_engine.hpp"
 #include "symbols/elf_symbols.hpp"
@@ -81,6 +82,9 @@ public:
         startCodeFinderForAddress(addr, /*writesOnly=*/true);
         codeFinderNoPrompt_ = false;
     }
+
+    /// Headless regression hook for the Qt -> shared-controller adapter.
+    bool runAddressListAdapterSmoke();
 
 private slots:
     void onOpenProcess();
@@ -317,6 +321,7 @@ struct AddressEntry {
     QString frozenValue;      // Value to continuously write when active
     ce::FreezeMode freezeMode = ce::FreezeMode::Normal;
     QString autoAsmScript;    // Auto-assembler script to run on enable/disable
+    QString luaScript;        // Per-record Lua payload (preserved; execution is policy-controlled)
     ce::DisableInfo autoAsmDisableInfo;
     QString color;            // Hex color for display
     QString dropdownList;     // "value:label;value:label" choices
@@ -335,6 +340,8 @@ struct AddressEntry {
     bool showAsHex = false;   // Display/edit the value in hexadecimal
     bool showAsSigned = true; // CE ShowAsSigned: integer values display signed vs unsigned
     QString addressExpr;      // If set, re-evaluated each refresh (pointer records)
+    QString addressString;    // Original CE <Address> base for lossless table round trips
+    std::vector<std::int64_t> offsets;  // Original CE pointer offsets (outermost first)
     ce::ValueCodec codec;     // Obfuscation codec: value is stored encode(logical) in
                               // memory; display decodes, edit/freeze encode (default none)
     bool bigEndian = false;   // Value bytes are big-endian (emulated PS3/Wii/GameCube);
@@ -476,6 +483,8 @@ signals:
     void valueReverted(uintptr_t addr, const QString& wrote, const QString& now);
 
 private:
+    bool syncSharedControllerFromEntries();
+    void importEntriesFromSharedController();
     bool setEntryActive(int row, bool active);
     void reportActivationError(const QString& title, const QString& message);
     // After a manual (non-frozen) value edit, re-read shortly after and emit
@@ -489,6 +498,7 @@ private:
     int allocId() { return nextId_++; }
 
     std::vector<AddressEntry> entries_;
+    ce::AddressListController sharedController_;
     std::vector<ce::ModuleInfo> moduleCache_;   // for module+offset address display
     ce::ProcessHandle* proc_ = nullptr;
     ce::SymbolResolver* symbolResolver_ = nullptr;   // shared user/module symbols (may be null)

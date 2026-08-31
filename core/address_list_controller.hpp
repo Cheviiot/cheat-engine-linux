@@ -22,6 +22,51 @@ namespace ce {
 class ProcessHandle;
 class SymbolResolver;
 
+/// Complete toolkit-neutral state of one address-list record.
+///
+/// Unlike AddressRecordSnapshot this is a lossless adapter/persistence value:
+/// Qt may export its existing model into the shared controller, apply a core
+/// hierarchy operation, and import it again without dropping codecs, hotkeys,
+/// scripts, or CE-specific options. Runtime-only frontend objects (for example
+/// Auto Assembler DisableInfo) deliberately stay in the owning frontend and are
+/// associated by this record's stable id.
+struct AddressRecordState {
+    int id = 0;
+    std::string description;
+    uintptr_t address = 0;
+    std::string addressExpression;
+    ValueType type = ValueType::Int32;
+    std::size_t byteCount = 0;
+    std::string currentValue;
+    std::string frozenValue;
+    std::string error;
+    bool readable = false;
+    bool active = false;
+    FreezeMode freezeMode = FreezeMode::Normal;
+    bool showAsHex = false;
+    bool showAsSigned = true;
+    bool bigEndian = false;
+    bool isGroup = false;
+    bool collapsed = false;
+    bool activateChildren = true;
+    bool deactivateChildren = true;
+    int indent = 0;
+    std::string color;
+    std::string script;
+    std::string luaScript;
+    std::string addressString;
+    std::vector<std::int64_t> offsets;
+    std::string dropdownList;
+    std::string hotkeyKeys;
+    std::string increaseHotkeyKeys;
+    std::string decreaseHotkeyKeys;
+    std::string setValueHotkeyKeys;
+    std::string setValueHotkeyValue;
+    std::string hotkeyStep = "1";
+    std::string optionsXml;
+    ValueCodec codec;
+};
+
 struct AddressRecordSnapshot {
     int id = 0;
     std::string description;
@@ -82,7 +127,12 @@ public:
     AddressOperationResult groupRecords(const std::vector<int>& ids,
                                         const std::string& description);
     AddressOperationResult moveRecord(int id, int direction);
+    AddressOperationResult moveRecordBlock(int id, std::size_t destination,
+                                           int newRootIndent = -1);
     AddressOperationResult setRecordCollapsed(int id, bool collapsed);
+    std::vector<AddressRecordState> exportRecords() const { return records_; }
+    AddressOperationResult replaceRecords(std::vector<AddressRecordState> records,
+                                          bool allowActiveScripts = false);
     TableOperationResult loadTable(const std::string& path);
     TableOperationResult saveTable(const std::string& path, bool json) const;
     void freezeTick() noexcept;
@@ -117,42 +167,7 @@ public:
     }
 
 private:
-    struct Record {
-        int id = 0;
-        std::string description;
-        uintptr_t address = 0;
-        std::string addressExpression;
-        ValueType type = ValueType::Int32;
-        std::size_t byteCount = 0;
-        std::string currentValue;
-        std::string frozenValue;
-        std::string error;
-        bool readable = false;
-        bool active = false;
-        FreezeMode freezeMode = FreezeMode::Normal;
-        bool showAsHex = false;
-        bool showAsSigned = true;
-        bool bigEndian = false;
-        bool isGroup = false;
-        bool collapsed = false;
-        bool activateChildren = true;
-        bool deactivateChildren = true;
-        int indent = 0;
-        std::string color;
-        std::string script;
-        std::string luaScript;
-        std::string addressString;
-        std::vector<std::int64_t> offsets;
-        std::string dropdownList;
-        std::string hotkeyKeys;
-        std::string increaseHotkeyKeys;
-        std::string decreaseHotkeyKeys;
-        std::string setValueHotkeyKeys;
-        std::string setValueHotkeyValue;
-        std::string hotkeyStep;
-        std::string optionsXml;
-        ValueCodec codec;
-    };
+    using Record = AddressRecordState;
 
     int indexOf(int id) const noexcept;
     bool resolveAddress(Record& record);

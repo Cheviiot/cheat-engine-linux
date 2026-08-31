@@ -107,6 +107,8 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <limits>
+#include <unordered_set>
 
 namespace ce::gui {
 // The scan-results table renders at most this many rows (keeping a million-hit
@@ -1044,6 +1046,79 @@ void MainWindow::updateOverlayStatus() {
         .arg(processLabel_->text())
         .arg(active)
         .arg(total));
+}
+
+bool MainWindow::runAddressListAdapterSmoke() {
+    QJsonArray fixture;
+    QJsonObject health;
+    health["id"] = 11;
+    health["description"] = "Health";
+    health["address"] = "0x1000";
+    health["addressExpr"] = "[[game+20]+8]+10";
+    health["addressString"] = "game+20";
+    health["offsets"] = QJsonArray{QString("16"), QString("8")};
+    health["type"] = "i32";
+    health["value"] = "100";
+    health["dropdown"] = "100:Full;0:Empty";
+    health["hotkeys"] = "Ctrl+H";
+    health["lua"] = "return 7";
+    health["codec"] = "xor:0x55";
+    health["bigEndian"] = true;
+    fixture.append(health);
+
+    QJsonObject armor;
+    armor["id"] = 12;
+    armor["description"] = "Armor";
+    armor["address"] = "0x2000";
+    armor["type"] = "i16";
+    armor["value"] = "50";
+    armor["increaseHotkey"] = "Ctrl+Up";
+    armor["decreaseHotkey"] = "Ctrl+Down";
+    armor["hotkeyStep"] = "5";
+    fixture.append(armor);
+
+    QJsonObject score;
+    score["id"] = 13;
+    score["description"] = "Score";
+    score["address"] = "0x3000";
+    score["type"] = "i64";
+    score["value"] = "9000";
+    fixture.append(score);
+
+    addressListModel_->fromJson(fixture);
+    addressListModel_->groupSelectedRows({0, 1}, "Player");
+    const auto grouped = addressListModel_->entries();
+    const bool groupedOk = grouped.size() == 4 && grouped[0].isGroup &&
+        grouped[0].description == "Player" && grouped[1].id == 11 &&
+        grouped[1].indent == 1 && grouped[2].id == 12 && grouped[2].indent == 1 &&
+        grouped[3].id == 13;
+    if (!groupedOk) return false;
+
+    const int groupId = grouped[0].id;
+    const int movedRow = addressListModel_->moveEntry(0, 1);
+    if (movedRow != 1 || addressListModel_->entries()[0].id != 13 ||
+        addressListModel_->entries()[1].id != groupId)
+        return false;
+    if (!addressListModel_->toggleGroupCollapse(1) ||
+        !addressListModel_->entries()[1].collapsed)
+        return false;
+
+    const auto serialized = addressListModel_->toJson();
+    if (serialized.size() != 4) return false;
+    const auto healthAfter = serialized[2].toObject();
+    const bool metadataOk = healthAfter["id"].toInt() == 11 &&
+        healthAfter["lua"].toString() == "return 7" &&
+        healthAfter["dropdown"].toString() == "100:Full;0:Empty" &&
+        healthAfter["hotkeys"].toString() == "Ctrl+H" &&
+        healthAfter["codec"].toString() == "xor:0x55" &&
+        healthAfter["bigEndian"].toBool() &&
+        healthAfter["addressString"].toString() == "game+20" &&
+        healthAfter["offsets"].toArray().size() == 2;
+    if (!metadataOk) return false;
+
+    addressListModel_->removeEntry(1);
+    return addressListModel_->entries().size() == 1 &&
+           addressListModel_->entries()[0].id == 13;
 }
 
 // The monospace font from the Settings dialog (display/fontFamily + fontSize),
@@ -3154,7 +3229,20 @@ ce::CheatTable MainWindow::buildCheatTable() const {
         e.description = obj["description"].toString().toStdString();
         e.address = obj["address"].toString().toULongLong(nullptr, 16);
         auto exprStr = obj["addressExpr"].toString();
-        if (!exprStr.isEmpty()) e.addressString = exprStr.toStdString();
+        e.addressString = obj["addressString"].toString().toStdString();
+        for (const auto& offset : obj["offsets"].toArray()) {
+            bool ok = false;
+            const auto parsed = offset.toString().toLongLong(&ok);
+            if (ok) e.offsets.push_back(parsed);
+        }
+        if (!exprStr.isEmpty() && e.addressString.empty() && e.offsets.empty()) {
+            if (const auto pointer = ce::parsePointerExpression(exprStr.toStdString())) {
+                e.addressString = pointer->base;
+                e.offsets = pointer->offsets;
+            } else {
+                e.addressString = exprStr.toStdString();
+            }
+        }
         auto typeStr = obj["type"].toString().toStdString();
         if (typeStr == "byte") e.type = ce::ValueType::Byte;
         else if (typeStr == "i16") e.type = ce::ValueType::Int16;
@@ -3175,8 +3263,12 @@ ce::CheatTable MainWindow::buildCheatTable() const {
         e.active = obj["active"].toBool();
         e.showAsHex = obj["showAsHex"].toBool();
         e.showAsSigned = obj["showAsSigned"].toBool(true);
+        e.bigEndian = obj["bigEndian"].toBool();
+        if (const auto codec = ce::ValueCodec::parse(obj["codec"].toString().toStdString()))
+            e.codec = *codec;
         e.freezeMode = (ce::FreezeMode)obj["freezeMode"].toInt();
         e.autoAsmScript = obj["asm"].toString().toStdString();
+        e.luaScript = obj["lua"].toString().toStdString();
         e.color = obj["color"].toString().toStdString();
         e.dropdownList = obj["dropdown"].toString().toStdString();
         e.hotkeyKeys = obj["hotkeys"].toString().toStdString();
@@ -3410,13 +3502,25 @@ static QJsonArray cheatEntriesToJson(const ce::CheatTable& table) {
                 : e.addressString;
             obj["addressExpr"] = QString::fromStdString(ce::buildPointerExpression(base, e.offsets));
         }
+        if (!e.addressString.empty())
+            obj["addressString"] = QString::fromStdString(e.addressString);
+        if (!e.offsets.empty()) {
+            QJsonArray offsets;
+            for (const auto offset : e.offsets)
+                offsets.append(QString::number(offset));
+            obj["offsets"] = offsets;
+        }
         obj["type"] = QString::number((int)e.type);
         obj["value"] = QString::fromStdString(e.value);
         obj["active"] = e.active;
         obj["showAsHex"] = e.showAsHex;
         obj["showAsSigned"] = e.showAsSigned;
+        obj["bigEndian"] = e.bigEndian;
+        if (e.codec.active())
+            obj["codec"] = QString::fromStdString(e.codec.describe());
         obj["freezeMode"] = (int)e.freezeMode;
         obj["asm"] = QString::fromStdString(e.autoAsmScript);
+        obj["lua"] = QString::fromStdString(e.luaScript);
         obj["color"] = QString::fromStdString(e.color);
         obj["dropdown"] = QString::fromStdString(e.dropdownList);
         obj["hotkeys"] = QString::fromStdString(e.hotkeyKeys);
@@ -4379,7 +4483,134 @@ uintptr_t ScanResultsModel::addressAt(int row) const {
 // AddressListModel
 // ═══════════════════════════════════════════════════════════════
 
+static ce::AddressRecordState toSharedRecord(const AddressEntry& entry) {
+    ce::AddressRecordState record;
+    record.id = entry.id;
+    record.description = entry.description.toStdString();
+    record.address = entry.address;
+    record.addressExpression = entry.addressExpr.toStdString();
+    record.type = entry.type;
+    record.byteCount = entry.byteCount;
+    record.currentValue = entry.currentValue.toStdString();
+    record.frozenValue = entry.frozenValue.toStdString();
+    record.readable = entry.isGroup || !entry.autoAsmScript.isEmpty() ||
+                      (entry.currentValue != "?" && entry.currentValue != "??");
+    record.active = entry.active;
+    record.freezeMode = entry.freezeMode;
+    record.showAsHex = entry.showAsHex;
+    record.showAsSigned = entry.showAsSigned;
+    record.bigEndian = entry.bigEndian;
+    record.isGroup = entry.isGroup;
+    record.collapsed = entry.collapsed;
+    record.activateChildren = entry.activateChildren;
+    record.deactivateChildren = entry.deactivateChildren;
+    record.indent = entry.indent;
+    record.color = entry.color.toStdString();
+    record.script = entry.autoAsmScript.toStdString();
+    record.luaScript = entry.luaScript.toStdString();
+    record.addressString = entry.addressString.toStdString();
+    record.offsets = entry.offsets;
+    record.dropdownList = entry.dropdownList.toStdString();
+    record.hotkeyKeys = entry.hotkeyKeys.toStdString();
+    record.increaseHotkeyKeys = entry.increaseHotkeyKeys.toStdString();
+    record.decreaseHotkeyKeys = entry.decreaseHotkeyKeys.toStdString();
+    record.setValueHotkeyKeys = entry.setValueHotkeyKeys.toStdString();
+    record.setValueHotkeyValue = entry.setValueHotkeyValue.toStdString();
+    record.hotkeyStep = entry.hotkeyStep.toStdString();
+    record.optionsXml = entry.optionsXml.toStdString();
+    record.codec = entry.codec;
+
+    // The editable expression is authoritative. Reconstruct the original CE
+    // base/offset representation so a structural round-trip cannot leave stale
+    // pointer metadata behind after an inline address edit.
+    if (!record.addressExpression.empty()) {
+        if (const auto pointer = ce::parsePointerExpression(record.addressExpression)) {
+            record.addressString = pointer->base;
+            record.offsets = pointer->offsets;
+        } else {
+            record.addressString = record.addressExpression;
+            record.offsets.clear();
+        }
+    }
+    return record;
+}
+
+static AddressEntry fromSharedRecord(const ce::AddressRecordState& record) {
+    AddressEntry entry;
+    entry.id = record.id;
+    entry.description = QString::fromStdString(record.description);
+    entry.address = record.address;
+    entry.addressExpr = QString::fromStdString(record.addressExpression);
+    entry.addressString = QString::fromStdString(record.addressString);
+    entry.offsets = record.offsets;
+    if (entry.addressExpr.isEmpty() &&
+        (!record.addressString.empty() || !record.offsets.empty()))
+        entry.addressExpr = QString::fromStdString(
+            ce::buildPointerExpression(record.addressString, record.offsets));
+    entry.type = record.type;
+    entry.byteCount = record.byteCount;
+    entry.currentValue = QString::fromStdString(record.currentValue);
+    entry.frozenValue = QString::fromStdString(record.frozenValue);
+    entry.active = record.active;
+    entry.freezeMode = record.freezeMode;
+    entry.showAsHex = record.showAsHex;
+    entry.showAsSigned = record.showAsSigned;
+    entry.bigEndian = record.bigEndian;
+    entry.isGroup = record.isGroup;
+    entry.collapsed = record.collapsed;
+    entry.activateChildren = record.activateChildren;
+    entry.deactivateChildren = record.deactivateChildren;
+    entry.indent = record.indent;
+    entry.color = QString::fromStdString(record.color);
+    entry.autoAsmScript = QString::fromStdString(record.script);
+    entry.luaScript = QString::fromStdString(record.luaScript);
+    entry.dropdownList = QString::fromStdString(record.dropdownList);
+    entry.hotkeyKeys = QString::fromStdString(record.hotkeyKeys);
+    entry.increaseHotkeyKeys = QString::fromStdString(record.increaseHotkeyKeys);
+    entry.decreaseHotkeyKeys = QString::fromStdString(record.decreaseHotkeyKeys);
+    entry.setValueHotkeyKeys = QString::fromStdString(record.setValueHotkeyKeys);
+    entry.setValueHotkeyValue = QString::fromStdString(record.setValueHotkeyValue);
+    entry.hotkeyStep = QString::fromStdString(record.hotkeyStep);
+    entry.optionsXml = QString::fromStdString(record.optionsXml);
+    entry.codec = record.codec;
+    return entry;
+}
+
 AddressListModel::AddressListModel(QObject* parent) : QAbstractTableModel(parent) {}
+
+bool AddressListModel::syncSharedControllerFromEntries() {
+    std::vector<ce::AddressRecordState> records;
+    records.reserve(entries_.size());
+    for (const auto& entry : entries_) records.push_back(toSharedRecord(entry));
+    return sharedController_.replaceRecords(std::move(records), true).success;
+}
+
+void AddressListModel::importEntriesFromSharedController() {
+    std::unordered_map<int, ce::DisableInfo> disableInfoById;
+    disableInfoById.reserve(entries_.size());
+    for (const auto& entry : entries_)
+        if (!entry.autoAsmDisableInfo.allocs.empty() ||
+            !entry.autoAsmDisableInfo.originals.empty() ||
+            !entry.autoAsmDisableInfo.symbols.empty())
+            disableInfoById.emplace(entry.id, entry.autoAsmDisableInfo);
+
+    auto records = sharedController_.exportRecords();
+    std::vector<AddressEntry> imported;
+    imported.reserve(records.size());
+    int nextId = 1;
+    for (const auto& record : records) {
+        auto entry = fromSharedRecord(record);
+        if (const auto found = disableInfoById.find(entry.id); found != disableInfoById.end())
+            entry.autoAsmDisableInfo = std::move(found->second);
+        nextId = std::max(nextId, entry.id + 1);
+        imported.push_back(std::move(entry));
+    }
+
+    beginResetModel();
+    entries_ = std::move(imported);
+    nextId_ = nextId;
+    endResetModel();
+}
 
 int AddressListModel::addEntry(uintptr_t addr, ValueType type, const QString& desc,
                                const QString& addressExpr, size_t byteCount) {
@@ -4431,6 +4662,8 @@ void AddressListModel::setEntryAddress(int row, uintptr_t addr, const QString& e
     if (e.isGroup || !e.autoAsmScript.isEmpty()) return;  // not addressable
     e.address = addr;
     e.addressExpr = expr;      // pointer expression re-resolves each refresh
+    e.addressString.clear();
+    e.offsets.clear();
     e.currentValue.clear();    // force a re-read at the new address
     emit dataChanged(index(row, 2), index(row, columnCount() - 1),
                      {Qt::DisplayRole, Qt::EditRole});
@@ -4443,14 +4676,9 @@ void AddressListModel::setEntryDescription(int row, const QString& desc) {
 }
 
 void AddressListModel::addGroup(const QString& desc) {
-    beginInsertRows({}, entries_.size(), entries_.size());
-    AddressEntry entry;
-    entry.id = allocId();
-    entry.description = desc;
-    entry.currentValue.clear();
-    entry.isGroup = true;
-    entries_.push_back(std::move(entry));
-    endInsertRows();
+    if (!syncSharedControllerFromEntries()) return;
+    sharedController_.createGroup(desc.toStdString());
+    importEntriesFromSharedController();
 }
 
 static const char* typeToStr(ValueType vt) {
@@ -4757,11 +4985,21 @@ QJsonArray AddressListModel::toJson() const {
         obj["description"] = e.description;
         obj["address"] = QString("0x%1").arg(e.address, 0, 16);
         if (!e.addressExpr.isEmpty()) obj["addressExpr"] = e.addressExpr;
+        const auto shared = toSharedRecord(e);
+        if (!shared.addressString.empty())
+            obj["addressString"] = QString::fromStdString(shared.addressString);
+        if (!shared.offsets.empty()) {
+            QJsonArray offsets;
+            for (const auto offset : shared.offsets)
+                offsets.append(QString::number(offset));
+            obj["offsets"] = offsets;
+        }
         obj["type"] = typeToStr(e.type);
         if (e.byteCount > 0) obj["byteCount"] = (int)e.byteCount;   // AOB/string length
         obj["value"] = e.currentValue;
         obj["active"] = e.active;
         obj["asm"] = e.autoAsmScript;
+        if (!e.luaScript.isEmpty()) obj["lua"] = e.luaScript;
         obj["color"] = e.color;
         obj["dropdown"] = e.dropdownList;
         obj["hotkeys"] = e.hotkeyKeys;
@@ -4799,19 +5037,51 @@ void AddressListModel::fromJson(const QJsonArray& arr) {
     beginResetModel();
     entries_.clear();
     std::vector<int> parentIndentById;
+    std::unordered_set<int> importedIds;
+    importedIds.reserve(static_cast<std::size_t>(arr.size()));
     for (auto val : arr) {
         auto obj = val.toObject();
         AddressEntry e;
-        e.id = obj.contains("id") ? obj["id"].toInt() : allocId();
-        if (e.id >= nextId_) nextId_ = e.id + 1;
+        const int requestedId = obj.contains("id") ? obj["id"].toInt() : 0;
+        if (requestedId > 0 && requestedId < std::numeric_limits<int>::max() &&
+            importedIds.insert(requestedId).second) {
+            e.id = requestedId;
+            nextId_ = std::max(nextId_, requestedId + 1);
+        } else {
+            while (nextId_ < std::numeric_limits<int>::max() &&
+                   importedIds.contains(nextId_))
+                ++nextId_;
+            if (nextId_ >= std::numeric_limits<int>::max()) continue;
+            e.id = nextId_++;
+            importedIds.insert(e.id);
+        }
         e.description = obj["description"].toString();
         e.address = obj["address"].toString().toULongLong(nullptr, 16);
         e.addressExpr = obj["addressExpr"].toString();
+        e.addressString = obj["addressString"].toString();
+        for (const auto& offset : obj["offsets"].toArray()) {
+            bool ok = false;
+            qint64 parsed = 0;
+            if (offset.isString()) {
+                parsed = offset.toString().toLongLong(&ok);
+            } else if (offset.isDouble()) {
+                const double numeric = offset.toDouble();
+                ok = std::isfinite(numeric) && std::trunc(numeric) == numeric &&
+                     numeric >= static_cast<double>(std::numeric_limits<qint64>::min()) &&
+                     numeric <= static_cast<double>(std::numeric_limits<qint64>::max());
+                if (ok) parsed = static_cast<qint64>(numeric);
+            }
+            if (ok) e.offsets.push_back(parsed);
+        }
+        if (e.addressExpr.isEmpty() && (!e.addressString.isEmpty() || !e.offsets.empty()))
+            e.addressExpr = QString::fromStdString(ce::buildPointerExpression(
+                e.addressString.toStdString(), e.offsets));
         e.type = strToType(obj["type"].toString());
         e.byteCount = (size_t)obj["byteCount"].toInt(0);   // AOB/string length (0 if absent)
         e.currentValue = obj["value"].toString();
         e.active = obj["active"].toBool();
         e.autoAsmScript = obj["asm"].toString();
+        e.luaScript = obj["lua"].toString();
         e.color = obj["color"].toString();
         e.dropdownList = obj["dropdown"].toString();
         e.hotkeyKeys = obj["hotkeys"].toString();
@@ -4964,22 +5234,30 @@ bool AddressListModel::adjustEntryValue(int row, double delta) {
 void AddressListModel::indentRows(QList<int> rows) {
     if (rows.isEmpty()) return;
     std::sort(rows.begin(), rows.end());
+    if (!syncSharedControllerFromEntries()) return;
+    std::vector<int> indents;
+    indents.reserve(entries_.size());
+    for (const auto& entry : entries_) indents.push_back(entry.indent);
     for (int row : rows) {
         if (row <= 0 || row >= (int)entries_.size()) continue;
-        int maxIndent = entries_[row - 1].indent + 1;
-        entries_[row].indent = std::min(entries_[row].indent + 1, maxIndent);
+        const int maxIndent = indents[static_cast<std::size_t>(row - 1)] + 1;
+        const int requested = std::min(
+            indents[static_cast<std::size_t>(row)] + 1, maxIndent);
+        if (sharedController_.setIndent(entries_[row].id, requested))
+            indents[static_cast<std::size_t>(row)] = requested;
     }
-    emit dataChanged(index(rows.first(), 0), index(rows.last(), columnCount() - 1));
+    importEntriesFromSharedController();
 }
 
 void AddressListModel::outdentRows(QList<int> rows) {
     if (rows.isEmpty()) return;
     std::sort(rows.begin(), rows.end());
+    if (!syncSharedControllerFromEntries()) return;
     for (int row : rows) {
         if (row < 0 || row >= (int)entries_.size()) continue;
-        entries_[row].indent = std::max(0, entries_[row].indent - 1);
+        sharedController_.setIndent(entries_[row].id, std::max(0, entries_[row].indent - 1));
     }
-    emit dataChanged(index(rows.first(), 0), index(rows.last(), columnCount() - 1));
+    importEntriesFromSharedController();
 }
 
 void AddressListModel::reportActivationError(const QString& title, const QString& message) {
@@ -5001,8 +5279,11 @@ void AddressListModel::toggleActive(int row) {
 
 bool AddressListModel::toggleGroupCollapse(int row) {
     if (row < 0 || row >= (int)entries_.size() || !entries_[row].isGroup) return false;
-    entries_[row].collapsed = !entries_[row].collapsed;
-    emit dataChanged(index(row, 0), index(row, columnCount() - 1));  // refresh the ▸/▾ marker
+    if (!syncSharedControllerFromEntries()) return false;
+    const auto result = sharedController_.setRecordCollapsed(
+        entries_[row].id, !entries_[row].collapsed);
+    if (!result.success) return false;
+    importEntriesFromSharedController();
     return true;
 }
 
@@ -5066,35 +5347,33 @@ bool AddressListModel::setEntryActive(int row, bool active) {
 
 void AddressListModel::removeEntry(int row) {
     if (row < 0 || row >= (int)entries_.size()) return;
-    beginRemoveRows({}, row, row);
-    entries_.erase(entries_.begin() + row);
-    endRemoveRows();
+    const int id = entries_[row].id;
+    if (!syncSharedControllerFromEntries()) return;
+    if (!sharedController_.removeRecord(id).success) return;
+    importEntriesFromSharedController();
 }
 
 void AddressListModel::removeEntries(QList<int> rows) {
-    // Deleting a group header takes its whole subtree with it (CE: a group carries its
-    // descendants), so children are never left orphaned at a now-invalid indent.
-    std::vector<int> indents;
-    indents.reserve(entries_.size());
-    for (const auto& e : entries_) indents.push_back(e.indent);
-    std::vector<std::size_t> sel;
-    sel.reserve(rows.size());
-    for (int r : rows) if (r >= 0 && r < (int)entries_.size()) sel.push_back((std::size_t)r);
-    auto expanded = ce::expandGroupDeletion(indents, sel);
-    // Delete high-to-low so earlier indices stay valid as rows are removed.
-    for (auto it = expanded.rbegin(); it != expanded.rend(); ++it)
-        removeEntry((int)*it);
+    std::vector<int> ids;
+    ids.reserve(rows.size());
+    for (const int row : rows)
+        if (row >= 0 && row < static_cast<int>(entries_.size()))
+            ids.push_back(entries_[row].id);
+    if (ids.empty() || !syncSharedControllerFromEntries()) return;
+    for (const int id : ids) sharedController_.removeRecord(id);
+    importEntriesFromSharedController();
 }
 
 int AddressListModel::moveEntry(int row, int delta) {
-    int target = row + delta;
-    if (row < 0 || row >= (int)entries_.size() ||
-        target < 0 || target >= (int)entries_.size())
+    if (row < 0 || row >= static_cast<int>(entries_.size()) ||
+        (delta != -1 && delta != 1))
         return row;
-    std::swap(entries_[row], entries_[target]);
-    emit dataChanged(index(std::min(row, target), 0),
-                     index(std::max(row, target), columnCount() - 1));
-    return target;
+    const int id = entries_[row].id;
+    if (!syncSharedControllerFromEntries() ||
+        !sharedController_.moveRecord(id, delta).success)
+        return row;
+    importEntriesFromSharedController();
+    return rowOfId(id);
 }
 
 // Read+format a variable-length value (String/UnicodeString/ByteArray) for display.
@@ -5331,68 +5610,24 @@ bool AddressListModel::dropMimeData(const QMimeData* data, Qt::DropAction action
 
 void AddressListModel::moveEntryBlock(int srcRow, int destRow, int newRootIndent) {
     const int n = (int)entries_.size();
-    if (srcRow < 0 || srcRow >= n) return;
-    // A group header drags its whole subtree; a leaf is a block of one.
-    std::vector<int> indents;
-    indents.reserve(n);
-    for (const auto& e : entries_) indents.push_back(e.indent);
-    auto sub = ce::descendantRange(indents, srcRow);
-    int len = entries_[srcRow].isGroup ? (int)(sub.second - srcRow) : 1;
-    if (len < 1) len = 1;
-    // No-op when dropping inside the moved block (destination unchanged).
-    if (destRow >= srcRow && destRow <= srcRow + len) return;
-    auto perm = ce::moveRangePermutation(n, srcRow, len, destRow);
-    if ((int)perm.size() != n) return;
-    // Re-indent the block before permuting (indents ride along with the entries), so a
-    // drop onto a group nests the whole subtree one level under it.
-    if (newRootIndent >= 0) {
-        int delta = newRootIndent - entries_[srcRow].indent;
-        for (int i = srcRow; i < srcRow + len; ++i) {
-            int ni = entries_[i].indent + delta;
-            entries_[i].indent = ni < 0 ? 0 : ni;
-        }
-    }
-    beginResetModel();
-    std::vector<AddressEntry> reordered;
-    reordered.reserve(n);
-    for (int oldIdx : perm) reordered.push_back(std::move(entries_[oldIdx]));
-    entries_ = std::move(reordered);
-    endResetModel();
+    if (srcRow < 0 || srcRow >= n || destRow < 0 || destRow > n) return;
+    const int id = entries_[srcRow].id;
+    if (!syncSharedControllerFromEntries()) return;
+    if (!sharedController_.moveRecordBlock(
+            id, static_cast<std::size_t>(destRow), newRootIndent).success)
+        return;
+    importEntriesFromSharedController();
 }
 
 void AddressListModel::groupSelectedRows(QList<int> rows, const QString& desc) {
-    const int n = (int)entries_.size();
-    std::vector<int> indents;
-    indents.reserve(n);
-    for (const auto& e : entries_) indents.push_back(e.indent);
-    std::vector<std::size_t> sel;
-    sel.reserve(rows.size());
-    for (int r : rows) if (r >= 0 && r < n) sel.push_back((std::size_t)r);
-    auto plan = ce::groupSelection(indents, sel);
-    if (!plan.ok) return;
-
-    // Each original index appears exactly once in plan.order (plus one -1 for the new
-    // header), so moving out of entries_ never double-moves.
-    beginResetModel();
-    std::vector<AddressEntry> rebuilt;
-    rebuilt.reserve(plan.order.size());
-    for (std::size_t i = 0; i < plan.order.size(); ++i) {
-        const int oldIdx = plan.order[i];
-        if (oldIdx < 0) {
-            AddressEntry g;
-            g.id = allocId();
-            g.description = desc;
-            g.isGroup = true;
-            g.indent = plan.indent[i];
-            rebuilt.push_back(std::move(g));
-        } else {
-            AddressEntry e = std::move(entries_[oldIdx]);
-            e.indent = plan.indent[i];
-            rebuilt.push_back(std::move(e));
-        }
-    }
-    entries_ = std::move(rebuilt);
-    endResetModel();
+    std::vector<int> ids;
+    ids.reserve(rows.size());
+    for (const int row : rows)
+        if (row >= 0 && row < static_cast<int>(entries_.size()))
+            ids.push_back(entries_[row].id);
+    if (ids.empty() || !syncSharedControllerFromEntries()) return;
+    if (!sharedController_.groupRecords(ids, desc.toStdString()).success) return;
+    importEntriesFromSharedController();
 }
 
 // Parse a Type-column display name back to a ValueType. First matches the canonical
@@ -5661,6 +5896,8 @@ bool AddressListModel::setAddress(int id, uintptr_t addr) {
     if (row < 0) return false;
     entries_[row].address = addr;
     entries_[row].addressExpr.clear();   // a plain address clears any pointer expr
+    entries_[row].addressString.clear();
+    entries_[row].offsets.clear();
     emit dataChanged(index(row, 2), index(row, 2));
     return true;
 }
@@ -5669,6 +5906,13 @@ bool AddressListModel::setAddressExpression(int id, const std::string& expr) {
     int row = rowOfId(id);
     if (row < 0) return false;
     entries_[row].addressExpr = QString::fromStdString(expr);
+    if (const auto pointer = ce::parsePointerExpression(expr)) {
+        entries_[row].addressString = QString::fromStdString(pointer->base);
+        entries_[row].offsets = pointer->offsets;
+    } else {
+        entries_[row].addressString = QString::fromStdString(expr);
+        entries_[row].offsets.clear();
+    }
     // Resolve once now so the address column is populated immediately.
     ExpressionParser parser(proc_, nullptr);
     if (auto v = parser.parse(expr)) entries_[row].address = *v;

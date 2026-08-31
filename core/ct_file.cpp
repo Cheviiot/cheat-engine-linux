@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <unordered_map>
 #include <functional>
+#include <cmath>
+#include <limits>
 #include <vector>
 #include <unistd.h>
 
@@ -370,6 +372,14 @@ bool CheatTable::save(const std::string& path) const {
         // (CE reads <ShowAsSigned> and omits it at its default too).
         if (!e.showAsSigned)
             f << "      <ShowAsSigned>0</ShowAsSigned>\n";
+        if (e.bigEndian)
+            f << "      <BigEndian>1</BigEndian>\n";
+        // ValueCodec is a cecore extension. Cheat Engine ignores unknown XML
+        // elements, while this keeps obfuscated-value records lossless when a
+        // table is edited by either frontend and saved as .CT.
+        if (e.codec.active())
+            f << "      <ValueCodec>" << xmlEscape(e.codec.describe())
+              << "</ValueCodec>\n";
         // Directional freeze (Allow Increase/Decrease etc.) — a custom tag CE
         // ignores but our loader restores, so it round-trips through CE XML too.
         if (e.freezeMode != FreezeMode::Normal)
@@ -589,6 +599,10 @@ static void parseCheatEntriesBlock(const std::string& entriesXml, int parentId,
         e.active = (getTag(ownXml, "Activated") == "1");
         e.showAsHex = (getTag(ownXml, "ShowAsHex") == "1");
         e.showAsSigned = (getTag(ownXml, "ShowAsSigned") != "0");  // absent -> signed default
+        e.bigEndian = (getTag(ownXml, "BigEndian") == "1");
+        auto codecSpec = xmlUnescape(getTag(ownXml, "ValueCodec"));
+        if (codecSpec.empty()) codecSpec = xmlUnescape(getTag(ownXml, "Codec"));
+        if (const auto codec = ValueCodec::parse(codecSpec)) e.codec = *codec;
         if (auto fm = getTag(ownXml, "freezeMode"); !fm.empty()) {
             try { e.freezeMode = (FreezeMode)std::stoi(fm); } catch (...) {}
         }
@@ -1202,12 +1216,27 @@ bool CheatTable::saveJson(const std::string& path) const {
         if (!e.isGroup) {
             char addr[32]; snprintf(addr, sizeof(addr), "0x%lx", e.address);
             f << ",\"addr\":\"" << addr << "\"";
+            if (!e.addressString.empty())
+                f << ",\"addressString\":\"" << jsonEscape(e.addressString) << "\"";
+            if (!e.offsets.empty()) {
+                f << ",\"offsets\":[";
+                for (size_t offsetIndex = 0; offsetIndex < e.offsets.size(); ++offsetIndex) {
+                    if (offsetIndex) f << ",";
+                    // Strings avoid JSON's 53-bit integer precision limit.
+                    f << "\"" << e.offsets[offsetIndex] << "\"";
+                }
+                f << "]";
+            }
             f << ",\"type\":" << (int)e.type;
             f << ",\"value\":\"" << jsonEscape(e.value) << "\"";
+            if (e.length > 0) f << ",\"length\":" << e.length;
         }
         if (e.active) f << ",\"active\":true";
         if (e.showAsHex) f << ",\"showAsHex\":true";
         if (!e.showAsSigned) f << ",\"showAsSigned\":false";
+        if (e.bigEndian) f << ",\"bigEndian\":true";
+        if (e.codec.active())
+            f << ",\"codec\":\"" << jsonEscape(e.codec.describe()) << "\"";
         if (e.freezeMode != FreezeMode::Normal)
             f << ",\"freezeMode\":" << (int)e.freezeMode;
         if (e.isGroup) f << ",\"group\":true";
@@ -1222,6 +1251,10 @@ bool CheatTable::saveJson(const std::string& path) const {
         if (!e.setValueHotkeyValue.empty()) f << ",\"setValueHotkeyValue\":\"" << jsonEscape(e.setValueHotkeyValue) << "\"";
         if (!e.decreaseHotkeyKeys.empty()) f << ",\"decreaseHotkey\":\"" << jsonEscape(e.decreaseHotkeyKeys) << "\"";
         if (!e.hotkeyStep.empty()) f << ",\"hotkeyStep\":\"" << jsonEscape(e.hotkeyStep) << "\"";
+        if (!e.activateChildren) f << ",\"activateChildren\":false";
+        if (!e.deactivateChildren) f << ",\"deactivateChildren\":false";
+        if (!e.optionsXml.empty())
+            f << ",\"optionsXml\":\"" << jsonEscape(e.optionsXml) << "\"";
         if (e.parentId >= 0) f << ",\"parent\":" << e.parentId;
         f << "}";
         if (i + 1 < entries.size()) f << ",";
@@ -1300,11 +1333,36 @@ bool CheatTable::loadJson(const std::string& path) {
         e.id = jsonIntField(item, "id");
         e.description = jsonStringField(item, "desc");
         e.address = jsonAddressField(item, "addr");
+        e.addressString = jsonStringField(item, "addressString");
+        if (const auto* offsets = getField(item, "offsets");
+            offsets && offsets->type == JsonValue::Type::Array) {
+            for (const auto& offset : offsets->arrayValue) {
+                try {
+                    if (offset.type == JsonValue::Type::String) {
+                        std::size_t consumed = 0;
+                        const auto parsed = std::stoll(offset.stringValue, &consumed, 0);
+                        if (consumed == offset.stringValue.size()) e.offsets.push_back(parsed);
+                    } else if (offset.type == JsonValue::Type::Number &&
+                               std::isfinite(offset.numberValue) &&
+                               std::trunc(offset.numberValue) == offset.numberValue &&
+                               offset.numberValue >= static_cast<double>(
+                                   std::numeric_limits<std::int64_t>::min()) &&
+                               offset.numberValue <= static_cast<double>(
+                                   std::numeric_limits<std::int64_t>::max())) {
+                        e.offsets.push_back(static_cast<std::int64_t>(offset.numberValue));
+                    }
+                } catch (...) {}
+            }
+        }
         e.type = jsonValueTypeField(item);
         e.value = jsonStringField(item, "value");
+        e.length = jsonIntField(item, "length");
         e.active = jsonBoolField(item, "active");
         e.showAsHex = jsonBoolField(item, "showAsHex");
         e.showAsSigned = getField(item, "showAsSigned") ? jsonBoolField(item, "showAsSigned") : true;
+        e.bigEndian = jsonBoolField(item, "bigEndian");
+        if (const auto codec = ValueCodec::parse(jsonStringField(item, "codec")))
+            e.codec = *codec;
         e.freezeMode = (FreezeMode)jsonIntField(item, "freezeMode", 0);
         e.isGroup = jsonBoolField(item, "group");
         e.collapsed = jsonBoolField(item, "collapsed");
@@ -1318,6 +1376,11 @@ bool CheatTable::loadJson(const std::string& path) {
         e.setValueHotkeyValue = jsonStringField(item, "setValueHotkeyValue");
         e.decreaseHotkeyKeys = jsonStringField(item, "decreaseHotkey");
         e.hotkeyStep = jsonStringField(item, "hotkeyStep");
+        e.activateChildren = getField(item, "activateChildren")
+            ? jsonBoolField(item, "activateChildren") : true;
+        e.deactivateChildren = getField(item, "deactivateChildren")
+            ? jsonBoolField(item, "deactivateChildren") : true;
+        e.optionsXml = jsonStringField(item, "optionsXml");
         e.parentId = jsonIntField(item, "parent", -1);
         entries.push_back(std::move(e));
     }

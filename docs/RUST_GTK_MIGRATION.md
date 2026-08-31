@@ -42,11 +42,19 @@ Completed in the foundation and first vertical slices:
 - shared hierarchy operations with stable IDs: multi-selection grouping,
   subtree-aware deletion and up/down reordering, group collapse state, and
   bounded GTK rendering of collapsed trees;
+- a lossless `AddressRecordState` adapter covering pointer metadata, codecs,
+  endianness, group policy, Lua/Auto Assembler content, hotkeys, dropdowns, and
+  every display/freeze flag; imports are transactional and reject duplicate or
+  invalid stable IDs without disturbing the current list;
+- the legacy Qt hierarchy actions now run through `AddressListController`:
+  grouping, subtree deletion, sibling/block moves, collapse, indent/outdent,
+  and drag/drop all import complete record state, apply the shared operation,
+  and restore Qt-only Auto Assembler disable state by stable ID;
 - transactional `.CT`/native-JSON load and save through the existing
   `CheatTable` parser, preserving pointer expressions, table metadata,
   structures, disassembler comments, hotkeys, dropdowns, entry Lua, Auto
-  Assembler, and table-level Lua; XML `.CT` round trips also retain embedded
-  form definitions;
+  Assembler, table-level Lua, record length, group options, big-endian mode,
+  and value codecs; XML `.CT` round trips also retain embedded form definitions;
 - native GTK file dialogs and address-list actions for opening/saving tables,
   adding empty groups, grouping selected records, moving complete subtrees, and
   collapsing groups;
@@ -64,12 +72,15 @@ The application ID and window title are explicitly development placeholders.
 The current pager deliberately keeps only one bounded page in GTK.  A later
 performance slice can replace the explicit Previous/Next controls with a
 virtualized `gio::ListModel` and bounded LRU cache without changing the C++ page
-contract.  The address-list controller is now the GTK source of truth; the next
-slice moves the legacy Qt model onto that controller, then adds an explicit
-trust prompt and separately reviewed Lua/Auto Assembler activation path.  The
-GTK frontend does not yet open password-protected CETRAINER files, expose a
-loss report, or virtualize address rows beyond its bounded first page.  No
-product identifier should be published before the branding decision.
+contract.  The address-list controller is now the GTK source of truth and the
+Qt model delegates all hierarchy mutations through a lossless adapter.  Qt still
+owns its live reads/writes, freeze timer, and existing Auto Assembler execution;
+moving those `IAddressList` operations is the remaining Phase 2 extraction and
+must preserve Qt's current behavior.  The following slice adds an explicit GTK
+trust prompt and a separately reviewed Lua/Auto Assembler activation path.  The
+GTK frontend does not yet open password-protected CETRAINER files, expose a loss
+report, or virtualize address rows beyond its bounded first page.  No product
+identifier should be published before the branding decision.
 
 ## Goal
 
@@ -388,7 +399,8 @@ recorded in a short decision note before public release.
 7. ~~Add the complete scan request/value-type/comparison surface.~~
 8. Replace the explicit pager with a virtualized bounded-cache GTK model.
 9. Extract the toolkit-neutral address-list controller and adapt Qt to it
-   (controller and GTK adapter complete; Qt adapter remains).
+   (controller, GTK ownership, and Qt hierarchy adapter complete; Qt live
+   `IAddressList` operations remain).
 10. ~~Connect scan/manual addresses to live edit, freeze modes, and removal in GTK.~~
-11. Add grouping/reordering and lossless `.CT` load/save through the shared
-    controller, then gate script activation behind an explicit trust prompt.
+11. Grouping/reordering and lossless modeled-field `.CT`/JSON persistence are
+    complete; next gate script activation behind an explicit trust prompt.

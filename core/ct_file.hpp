@@ -2,6 +2,7 @@
 /// .CT Cheat Table format — XML-based save/load compatible with CE format.
 
 #include "core/types.hpp"
+#include "core/value_codec.hpp"
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,8 @@ struct CheatEntry {
     bool active = false;
     bool showAsHex = false;     // Display the value as hexadecimal (CE <ShowAsHex>)
     bool showAsSigned = true;   // Display integer values signed vs unsigned (CE <ShowAsSigned>)
+    bool bigEndian = false;     // CE <BigEndian>; useful for emulated targets
+    ValueCodec codec;           // cecore extension, preserved as a round-trippable spec
     FreezeMode freezeMode = FreezeMode::Normal;
     std::string autoAsmScript;  // [ENABLE]/[DISABLE] script
     std::string luaScript;      // Lua code

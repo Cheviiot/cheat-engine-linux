@@ -54,6 +54,7 @@
 #include "symbols/dwarf_symbols.hpp"
 #include "scripting/lua_engine.hpp"
 #include "core/address_list.hpp"
+#include "core/address_list_controller.hpp"
 #include "core/simple_address_list.hpp"
 #include "plugins/plugin_loader.hpp"
 
@@ -762,6 +763,8 @@ static void test_cheat_table_json() {
     entry.id = 7;
     entry.description = "Health \"current\"";
     entry.address = 0x1234;
+    entry.addressString = "1234";
+    entry.offsets = {0x10, -0x8};
     entry.type = ValueType::Int32;
     entry.value = "100\n200";
     entry.active = true;
@@ -778,6 +781,8 @@ static void test_cheat_table_json() {
     entry.decreaseHotkeyKeys = "Ctrl+Down";
     entry.hotkeyStep = "5";
     entry.showAsSigned = false;   // non-default (CE <ShowAsSigned>0</ShowAsSigned>) must survive
+    entry.bigEndian = true;
+    entry.codec = *ValueCodec::parse("xor:0x55");
     table.entries.push_back(entry);
 
     StructureDefinition structure;
@@ -829,10 +834,14 @@ static void test_cheat_table_json() {
             loaded.entries[0].id == entry.id &&
             loaded.entries[0].description == entry.description &&
             loaded.entries[0].address == entry.address &&
+            loaded.entries[0].addressString == entry.addressString &&
+            loaded.entries[0].offsets == entry.offsets &&
             loaded.entries[0].type == entry.type &&
             loaded.entries[0].value == entry.value &&
             loaded.entries[0].active == entry.active &&
             loaded.entries[0].showAsSigned == entry.showAsSigned &&
+            loaded.entries[0].bigEndian == entry.bigEndian &&
+            loaded.entries[0].codec.describe() == entry.codec.describe() &&
             loaded.entries[0].autoAsmScript == entry.autoAsmScript &&
             loaded.entries[0].luaScript == entry.luaScript &&
             loaded.entries[0].color == entry.color &&
@@ -10394,6 +10403,103 @@ static void test_group_collapse() {
            d1, d2, d3, d4, d5, delOk ? "OK" : "FAILED");
 }
 
+static void test_address_list_controller_adapter_state() {
+    printf("── Test: Shared address-list controller adapter state ──\n");
+    ce::AddressRecordState group;
+    group.id = 10;
+    group.description = "Player";
+    group.isGroup = true;
+    group.collapsed = true;
+    group.activateChildren = false;
+    group.deactivateChildren = true;
+    group.optionsXml = "<Options moDeactivateChildrenAsWell=\"1\"/>";
+
+    ce::AddressRecordState health;
+    health.id = 11;
+    health.description = "Health";
+    health.address = 0x1234;
+    health.addressExpression = "[[game+20]+8]+10";
+    health.addressString = "game+20";
+    health.offsets = {0x10, 0x8};
+    health.type = ValueType::Int32;
+    health.byteCount = 4;
+    health.currentValue = "100";
+    health.frozenValue = "100";
+    health.readable = true;
+    health.active = true;
+    health.freezeMode = FreezeMode::NeverDecrease;
+    health.showAsHex = true;
+    health.showAsSigned = false;
+    health.bigEndian = true;
+    health.indent = 1;
+    health.color = "#12AB34";
+    health.luaScript = "return 7";
+    health.dropdownList = "100:Full;0:Empty";
+    health.hotkeyKeys = "Ctrl+H";
+    health.increaseHotkeyKeys = "Ctrl+Up";
+    health.decreaseHotkeyKeys = "Ctrl+Down";
+    health.setValueHotkeyKeys = "Ctrl+1";
+    health.setValueHotkeyValue = "100";
+    health.hotkeyStep = "5";
+    health.codec = *ValueCodec::parse("xor:0x55");
+
+    ce::AddressRecordState script;
+    script.id = 12;
+    script.description = "Injection";
+    script.script = "[ENABLE]\nnop\n[DISABLE]\nnop";
+    script.luaScript = "return 'entry lua'";
+    script.currentValue = "(Auto Assembler script)";
+    script.active = true;
+    script.indent = 1;
+
+    ce::AddressRecordState score;
+    score.id = 13;
+    score.description = "Score";
+    score.address = 0x3000;
+    score.currentValue = "9000";
+
+    AddressListController controller;
+    auto rejected = controller.replaceRecords({group, health, script, score});
+    bool trustGateOk = !rejected.success && rejected.errorCode == "active_script_rejected" &&
+                       controller.count() == 0;
+    auto imported = controller.replaceRecords({group, health, script, score}, true);
+    auto roundTrip = controller.exportRecords();
+    bool stateOk = imported.success && roundTrip.size() == 4 &&
+        roundTrip[0].collapsed && !roundTrip[0].activateChildren &&
+        roundTrip[1].addressExpression == health.addressExpression &&
+        roundTrip[1].addressString == health.addressString &&
+        roundTrip[1].offsets == health.offsets && roundTrip[1].active &&
+        roundTrip[1].freezeMode == FreezeMode::NeverDecrease &&
+        roundTrip[1].showAsHex && !roundTrip[1].showAsSigned &&
+        roundTrip[1].bigEndian && roundTrip[1].luaScript == "return 7" &&
+        roundTrip[1].dropdownList == health.dropdownList &&
+        roundTrip[1].hotkeyKeys == health.hotkeyKeys &&
+        roundTrip[1].increaseHotkeyKeys == health.increaseHotkeyKeys &&
+        roundTrip[1].decreaseHotkeyKeys == health.decreaseHotkeyKeys &&
+        roundTrip[1].setValueHotkeyKeys == health.setValueHotkeyKeys &&
+        roundTrip[1].setValueHotkeyValue == health.setValueHotkeyValue &&
+        roundTrip[1].hotkeyStep == "5" &&
+        roundTrip[1].codec.describe() == "xor:0x55" &&
+        roundTrip[2].script == script.script && roundTrip[2].luaScript == script.luaScript;
+
+    auto duplicate = roundTrip;
+    duplicate[3].id = duplicate[2].id;
+    auto duplicateResult = controller.replaceRecords(std::move(duplicate), true);
+    bool atomicOk = !duplicateResult.success && controller.count() == 4 &&
+                    controller.byId(13).has_value();
+
+    auto moved = controller.moveRecordBlock(10, 4);
+    auto order = controller.ids();
+    bool moveOk = moved.success && order == std::vector<int>({13, 10, 11, 12});
+    auto removed = controller.removeRecord(10);
+    bool deleteOk = removed.success && controller.ids() == std::vector<int>({13});
+
+    printf("  lossless state + trust gate + atomic import + subtree move/delete "
+           "(%d%d%d%d%d): %s\n",
+           trustGateOk, stateOk, atomicOk, moveOk, deleteOk,
+           trustGateOk && stateOk && atomicOk && moveOk && deleteOk ? "OK" : "FAILED");
+}
+
 static void test_expression_parser() {
     printf("── Test: Expression Parser ──\n");
     const uintptr_t base  = 0x100000;
@@ -10973,6 +11079,7 @@ int main(int argc, char* argv[]) {
     test_memview_pane_choice();
     test_conditional_jump();
     test_group_collapse();
+    test_address_list_controller_adapter_state();
     test_aob_signature();
     test_string_case_insensitive_scan();
     test_between_reversed_bounds();

@@ -292,6 +292,9 @@ AddressOperationResult AddressListController::addRecord(
     std::size_t byteCount, bool showAsHex) {
     if (byteCount > kMaxRecordValueSize)
         return failure(0, "value_too_large", "The address-list value width is too large.");
+    if (nextId_ >= std::numeric_limits<int>::max())
+        return failure(0, "record_id_exhausted",
+                       "No more stable address-list record ids are available.");
     Record record;
     record.id = nextId_++;
     record.description = description.empty() ? "No description" : description;
@@ -667,6 +670,9 @@ AddressOperationResult AddressListController::groupRecords(
     const auto plan = groupSelection(indents, std::move(selected));
     if (!plan.ok)
         return failure(0, "selection_empty", "Select at least one address-list record.");
+    if (nextId_ >= std::numeric_limits<int>::max())
+        return failure(0, "record_id_exhausted",
+                       "No more stable address-list record ids are available.");
 
     Record group;
     group.id = nextId_++;
@@ -743,6 +749,73 @@ AddressOperationResult AddressListController::moveRecord(int id, int direction) 
     return success(id);
 }
 
+AddressOperationResult AddressListController::moveRecordBlock(
+    int id, std::size_t destination, int newRootIndent) {
+    const int index = indexOf(id);
+    if (index < 0)
+        return failure(id, "record_not_found", "The address-list record no longer exists.");
+    if (records_.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        destination > records_.size())
+        return failure(id, "move_destination_invalid",
+                       "The requested address-list destination is invalid.");
+
+    std::vector<int> indents;
+    indents.reserve(records_.size());
+    for (const auto& record : records_) indents.push_back(record.indent);
+    const auto row = static_cast<std::size_t>(index);
+    const auto descendants = descendantRange(indents, row);
+    const auto blockEnd = records_[row].isGroup ? descendants.second : row + 1;
+    const auto length = static_cast<int>(blockEnd - row);
+    if (destination >= row && destination <= blockEnd) return success(id);
+
+    const auto permutation = moveRangePermutation(
+        static_cast<int>(records_.size()), index, length, static_cast<int>(destination));
+    if (newRootIndent >= 0) {
+        const int delta = newRootIndent - records_[row].indent;
+        for (auto cursor = row; cursor < blockEnd; ++cursor)
+            records_[cursor].indent = std::max(0, records_[cursor].indent + delta);
+    }
+    std::vector<Record> reordered;
+    reordered.reserve(records_.size());
+    for (const int oldIndex : permutation)
+        reordered.push_back(std::move(records_[static_cast<std::size_t>(oldIndex)]));
+    records_ = std::move(reordered);
+    ++generation_;
+    return success(id);
+}
+
+AddressOperationResult AddressListController::replaceRecords(
+    std::vector<AddressRecordState> records, bool allowActiveScripts) {
+    std::unordered_set<int> ids;
+    ids.reserve(records.size());
+    int nextId = 1;
+    for (auto& record : records) {
+        if (record.id <= 0 || record.id >= std::numeric_limits<int>::max() ||
+            !ids.insert(record.id).second)
+            return failure(record.id, "record_id_invalid",
+                           "Every imported address-list record needs a unique positive id.");
+        if (record.byteCount > kMaxRecordValueSize)
+            return failure(record.id, "value_too_large",
+                           "An imported address-list value width is too large.");
+        const int freezeMode = static_cast<int>(record.freezeMode);
+        if (freezeMode < static_cast<int>(FreezeMode::Normal) ||
+            freezeMode > static_cast<int>(FreezeMode::NeverDecrease))
+            return failure(record.id, "invalid_freeze_mode",
+                           "An imported address-list freeze mode is invalid.");
+        if (!allowActiveScripts && record.active &&
+            (!record.script.empty() || !record.luaScript.empty()))
+            return failure(record.id, "active_script_rejected",
+                           "Active scripts require an explicit trusted import path.");
+        record.indent = std::max(0, record.indent);
+        nextId = std::max(nextId, record.id + 1);
+    }
+
+    records_ = std::move(records);
+    nextId_ = nextId;
+    ++generation_;
+    return success(0);
+}
+
 AddressOperationResult AddressListController::setRecordCollapsed(int id, bool collapsed) {
     const int index = indexOf(id);
     if (index < 0)
@@ -803,7 +876,12 @@ TableOperationResult AddressListController::loadTable(const std::string& path) {
             record.id = entry.id;
             nextId = std::max(nextId, entry.id + 1);
         } else {
-            while (runtimeIds.contains(nextId)) ++nextId;
+            while (nextId < std::numeric_limits<int>::max() &&
+                   runtimeIds.contains(nextId))
+                ++nextId;
+            if (nextId >= std::numeric_limits<int>::max())
+                return {.success = false, .errorCode = "record_id_exhausted",
+                        .errorMessage = "The cheat table contains too many record ids."};
             record.id = nextId++;
             runtimeIds.insert(record.id);
         }
@@ -824,6 +902,8 @@ TableOperationResult AddressListController::loadTable(const std::string& path) {
         record.freezeMode = entry.freezeMode;
         record.showAsHex = entry.showAsHex;
         record.showAsSigned = entry.showAsSigned;
+        record.bigEndian = entry.bigEndian;
+        record.codec = entry.codec;
         record.isGroup = entry.isGroup;
         record.collapsed = entry.collapsed;
         record.activateChildren = entry.activateChildren;
@@ -889,6 +969,8 @@ TableOperationResult AddressListController::saveTable(const std::string& path,
         entry.active = record.active;
         entry.showAsHex = record.showAsHex;
         entry.showAsSigned = record.showAsSigned;
+        entry.bigEndian = record.bigEndian;
+        entry.codec = record.codec;
         entry.freezeMode = record.freezeMode;
         entry.autoAsmScript = record.script;
         entry.luaScript = record.luaScript;
@@ -1046,6 +1128,7 @@ int AddressListController::createEntry(uintptr_t address, ValueType type,
 }
 
 int AddressListController::createGroup(const std::string& description) {
+    if (nextId_ >= std::numeric_limits<int>::max()) return -1;
     Record record;
     record.id = nextId_++;
     record.description = description.empty() ? "-- Group --" : description;
@@ -1084,8 +1167,11 @@ bool AddressListController::setAddress(int id, uintptr_t address) {
     auto& record = records_[static_cast<std::size_t>(index)];
     record.address = address;
     record.addressExpression.clear();
+    record.addressString.clear();
+    record.offsets.clear();
     record.active = false;
     record.frozenValue.clear();
+    ++generation_;
     return true;
 }
 
@@ -1094,9 +1180,19 @@ bool AddressListController::setAddressExpression(int id, const std::string& expr
     if (index < 0) return false;
     auto& record = records_[static_cast<std::size_t>(index)];
     record.addressExpression = expression;
+    if (const auto pointer = parsePointerExpression(expression)) {
+        record.addressString = pointer->base;
+        record.offsets = pointer->offsets;
+    } else {
+        record.addressString = expression;
+        record.offsets.clear();
+    }
     record.active = false;
     record.frozenValue.clear();
-    return resolveAddress(record);
+    ++generation_;
+    // Keep a valid expression while detached. It will be resolved on attach or
+    // the next live operation; a missing process is not a schema error.
+    return process_ ? resolveAddress(record) : true;
 }
 
 bool AddressListController::setType(int id, ValueType type) {

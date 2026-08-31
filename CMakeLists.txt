@@ -378,6 +378,15 @@ if(CECORE_BUILD_QT_GUI AND Qt6_FOUND)
     else()
         message(STATUS "Global hotkeys: disabled (X11 not found)")
     endif()
+    if(CECORE_BUILD_TESTS)
+        find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+        if(XVFB_RUN_EXECUTABLE)
+            add_test(NAME qt_address_list_adapter
+                COMMAND "${XVFB_RUN_EXECUTABLE}" -a
+                    "$<TARGET_FILE:cheatengine>" --address-list-adapter-smoke)
+            set_tests_properties(qt_address_list_adapter PROPERTIES TIMEOUT 15)
+        endif()
+    endif()
     message(STATUS "Qt6 found — building GUI")
 
     # Headless offscreen smoke test for the interactive debugger window.
