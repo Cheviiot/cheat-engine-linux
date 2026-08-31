@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 
-use crate::bridge::{DisassemblyRow, Engine, MemoryView, ScanValueType};
+use crate::bridge::{DebugState, DebugStepMode, DisassemblyRow, Engine, MemoryView, ScanValueType};
 
 const PAGE_BYTES: u32 = 512;
 const INSTRUCTION_LIMIT: u32 = 128;
@@ -43,6 +43,13 @@ struct Viewer {
     status: gtk::Label,
     instruction_status: gtk::Label,
     data_inspector: gtk::Label,
+    debug_status: gtk::Label,
+    debug_button: gtk::Button,
+    breakpoint_button: gtk::Button,
+    run_button: gtk::Button,
+    step_into_button: gtk::Button,
+    step_over_button: gtk::Button,
+    step_out_button: gtk::Button,
     follow_button: gtk::Button,
     assemble_button: gtk::Button,
     nop_button: gtk::Button,
@@ -62,6 +69,9 @@ struct Viewer {
     bookmarks: Rc<RefCell<BTreeSet<u64>>>,
     last_search: Rc<RefCell<Option<SearchPattern>>>,
     search_serial: Rc<Cell<u64>>,
+    debug_attached: Rc<Cell<bool>>,
+    debug_stopped: Rc<Cell<bool>>,
+    last_debug_serial: Rc<Cell<u64>>,
     classic_layout: bool,
 }
 
@@ -144,6 +154,7 @@ impl Viewer {
                 &instruction.bytes,
                 &instruction.mnemonic,
                 &instruction.operands,
+                instruction.breakpoint,
             ));
         }
 
@@ -166,6 +177,7 @@ impl Viewer {
         self.instruction_status
             .set_label("Select an instruction; activate it to follow its operand.");
         self.follow_button.set_sensitive(false);
+        self.breakpoint_button.set_sensitive(false);
         self.assemble_button.set_sensitive(false);
         self.nop_button.set_sensitive(false);
         self.copy_button.set_sensitive(false);
@@ -183,8 +195,27 @@ impl Viewer {
         self.update_navigation();
         self.update_bookmark_button();
 
-        if std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some()
+        let memory_debug_smoke = std::env::var_os("CE_GTK_MEMORY_DEBUG_SMOKE").is_some();
+        let debugger_smoke_ready = !memory_debug_smoke
+            || (self.debug_attached.get()
+                && self.debug_stopped.get()
+                && self
+                    .instructions
+                    .borrow()
+                    .iter()
+                    .any(|instruction| instruction.breakpoint));
+        let debugger_controls_ready = if memory_debug_smoke {
+            self.breakpoint_button.is_sensitive()
+                && self.run_button.is_sensitive()
+                && self.step_into_button.is_sensitive()
+                && self.step_over_button.is_sensitive()
+                && self.step_out_button.is_sensitive()
+        } else {
+            !self.breakpoint_button.is_sensitive() && !self.run_button.is_sensitive()
+        };
+        if (std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some() || memory_debug_smoke)
             && self.classic_layout
+            && debugger_smoke_ready
             && !self.bytes.borrow().is_empty()
             && !self.instructions.borrow().is_empty()
             && self.selected_instruction.get().is_some()
@@ -192,6 +223,8 @@ impl Viewer {
             && self.nop_button.is_sensitive()
             && self.copy_button.is_sensitive()
             && self.edit_button.is_sensitive()
+            && self.debug_button.is_sensitive()
+            && debugger_controls_ready
             && self.data_inspector.label().contains("byte=0x")
         {
             MEMORY_VIEW_SMOKE_OK.store(true, Ordering::SeqCst);
@@ -216,6 +249,7 @@ impl Viewer {
             self.nop_button.set_sensitive(false);
             self.copy_button.set_sensitive(false);
             self.add_button.set_sensitive(false);
+            self.breakpoint_button.set_sensitive(false);
             return;
         };
         let text = instruction_text(instruction);
@@ -224,8 +258,13 @@ impl Viewer {
         } else {
             format!(" · target 0x{:016X}", instruction.follow_target)
         };
+        let breakpoint = if instruction.breakpoint {
+            " · breakpoint"
+        } else {
+            ""
+        };
         self.instruction_status.set_label(&format!(
-            "0x{:016X} · {} byte{} · {text}{follow}",
+            "0x{:016X} · {} byte{} · {text}{follow}{breakpoint}",
             instruction.address,
             instruction.size,
             if instruction.size == 1 { "" } else { "s" }
@@ -236,6 +275,8 @@ impl Viewer {
         self.nop_button.set_sensitive(instruction.size > 0);
         self.copy_button.set_sensitive(true);
         self.add_button.set_sensitive(true);
+        self.breakpoint_button
+            .set_sensitive(self.debug_attached.get() && self.debug_stopped.get());
     }
 
     fn follow_selected(&self) {
@@ -865,6 +906,198 @@ impl Viewer {
         entry.grab_focus();
     }
 
+    fn apply_debug_state(&self, state: DebugState, follow_new_stop: bool) {
+        let serial_changed = state.event_serial != self.last_debug_serial.get();
+        self.last_debug_serial.set(state.event_serial);
+        self.debug_attached.set(state.attached);
+        self.debug_stopped.set(state.stopped);
+
+        self.debug_button
+            .set_label(if state.attached { "Detach" } else { "Debugger" });
+        self.debug_button
+            .set_sensitive(!state.exited || state.attached);
+        self.run_button
+            .set_sensitive(state.attached && state.stopped);
+        self.step_into_button
+            .set_sensitive(state.attached && state.stopped);
+        self.step_over_button
+            .set_sensitive(state.attached && state.stopped);
+        self.step_out_button
+            .set_sensitive(state.attached && state.stopped);
+        self.breakpoint_button.set_sensitive(
+            state.attached && state.stopped && self.selected_instruction.get().is_some(),
+        );
+
+        self.debug_status.remove_css_class("error");
+        let event = match state.event_type {
+            1 => "Breakpoint",
+            2 => "Exception",
+            3 => "Step",
+            4 => "Exited",
+            5 => "Signal",
+            _ => "Stopped",
+        };
+        if state.exited {
+            self.debug_status.add_css_class("error");
+            self.debug_status.set_label("Target exited");
+        } else if state.attached && state.stopped {
+            self.debug_status.set_label(&format!(
+                "{event} at 0x{:016X} · TID {} · {} BP",
+                state.rip, state.active_tid, state.breakpoint_count
+            ));
+        } else if state.attached {
+            self.debug_status.set_label(&format!(
+                "Running · {} breakpoint{}",
+                state.breakpoint_count,
+                if state.breakpoint_count == 1 { "" } else { "s" }
+            ));
+        } else {
+            self.debug_status.set_label("Debugger detached");
+        }
+
+        if follow_new_stop
+            && serial_changed
+            && state.attached
+            && state.stopped
+            && state.rip != 0
+            && state.rip != self.current_address.get()
+        {
+            self.navigate(state.rip);
+        }
+    }
+
+    fn toggle_debugger(&self) {
+        let result = {
+            let Ok(mut engine_slot) = self.engine.try_borrow_mut() else {
+                self.debug_status.set_label("Memory engine is busy");
+                return;
+            };
+            let Some(engine) = engine_slot.as_mut() else {
+                self.debug_status.set_label("Memory engine is unavailable");
+                return;
+            };
+            if self.debug_attached.get() {
+                engine.debug_detach()
+            } else {
+                engine.debug_start()
+            }
+        };
+        match result {
+            Ok(state) => {
+                let detached = !state.attached;
+                self.apply_debug_state(state, true);
+                if detached {
+                    self.load(self.current_address.get());
+                }
+            }
+            Err(error) => {
+                self.debug_status.add_css_class("error");
+                self.debug_status
+                    .set_label(&format!("{} ({})", error.message, error.code));
+            }
+        }
+    }
+
+    fn toggle_selected_breakpoint(&self) {
+        let Some(instruction) = self.selected_instruction_row() else {
+            return;
+        };
+        let result = {
+            let Ok(mut engine_slot) = self.engine.try_borrow_mut() else {
+                self.debug_status.set_label("Memory engine is busy");
+                return;
+            };
+            let Some(engine) = engine_slot.as_mut() else {
+                self.debug_status.set_label("Memory engine is unavailable");
+                return;
+            };
+            engine.debug_toggle_breakpoint(instruction.address)
+        };
+        match result {
+            Ok(action) => {
+                self.debug_status.remove_css_class("error");
+                self.debug_status.set_label(&format!(
+                    "Breakpoint {} at 0x{:016X} · {} total",
+                    if action.enabled { "set" } else { "removed" },
+                    action.address,
+                    action.breakpoint_count
+                ));
+                let current = self.current_address.get();
+                self.load(current);
+                let selected_index = self
+                    .instructions
+                    .borrow()
+                    .iter()
+                    .position(|row| row.address == action.address);
+                if let Some(index) = selected_index
+                    && let Some(row) = self.disassembly.row_at_index(index as i32)
+                {
+                    self.disassembly.select_row(Some(&row));
+                }
+            }
+            Err(error) => {
+                self.debug_status.add_css_class("error");
+                self.debug_status
+                    .set_label(&format!("{} ({})", error.message, error.code));
+            }
+        }
+    }
+
+    fn continue_debugger(&self) {
+        let result = {
+            let Ok(mut engine_slot) = self.engine.try_borrow_mut() else {
+                return;
+            };
+            let Some(engine) = engine_slot.as_mut() else {
+                return;
+            };
+            engine.debug_continue()
+        };
+        match result {
+            Ok(state) => self.apply_debug_state(state, false),
+            Err(error) => self
+                .debug_status
+                .set_label(&format!("{} ({})", error.message, error.code)),
+        }
+    }
+
+    fn step_debugger(&self, mode: DebugStepMode) {
+        let result = {
+            let Ok(mut engine_slot) = self.engine.try_borrow_mut() else {
+                return;
+            };
+            let Some(engine) = engine_slot.as_mut() else {
+                return;
+            };
+            engine.debug_step(mode, 0)
+        };
+        match result {
+            Ok(state) => self.apply_debug_state(state, true),
+            Err(error) => self
+                .debug_status
+                .set_label(&format!("{} ({})", error.message, error.code)),
+        }
+    }
+
+    fn poll_debugger(&self) {
+        let result = {
+            let Ok(engine_slot) = self.engine.try_borrow() else {
+                return;
+            };
+            let Some(engine) = engine_slot.as_ref() else {
+                return;
+            };
+            engine.debug_state()
+        };
+        if let Ok(state) = result
+            && (state.event_serial != self.last_debug_serial.get()
+                || state.attached != self.debug_attached.get()
+                || state.stopped != self.debug_stopped.get())
+        {
+            self.apply_debug_state(state, true);
+        }
+    }
+
     fn show_error(&self, message: &str) {
         clear_list(&self.disassembly);
         self.instructions.borrow_mut().clear();
@@ -876,6 +1109,7 @@ impl Viewer {
         self.nop_button.set_sensitive(false);
         self.copy_button.set_sensitive(false);
         self.add_button.set_sensitive(false);
+        self.breakpoint_button.set_sensitive(false);
         self.edit_button.set_sensitive(false);
         self.selected_byte_offset.set(None);
         self.instruction_status
@@ -996,6 +1230,18 @@ pub fn present(
     menu_model.append_submenu(Some("View"), &view_menu);
 
     let debug_menu = gtk::gio::Menu::new();
+    debug_menu.append(
+        Some("Start / detach debugger"),
+        Some("memory.toggle-debugger"),
+    );
+    debug_menu.append(
+        Some("Toggle software breakpoint"),
+        Some("memory.toggle-breakpoint"),
+    );
+    debug_menu.append(Some("Run"), Some("memory.debug-run"));
+    debug_menu.append(Some("Step into"), Some("memory.step-into"));
+    debug_menu.append(Some("Step over"), Some("memory.step-over"));
+    debug_menu.append(Some("Step out"), Some("memory.step-out"));
     debug_menu.append(Some("Follow target"), Some("memory.follow-target"));
     debug_menu.append(
         Some("Assemble instruction…"),
@@ -1042,6 +1288,7 @@ pub fn present(
         .margin_end(6)
         .css_classes(["dim-label"])
         .build();
+    disassembly_header.append(&column_header("", 2, false));
     disassembly_header.append(&column_header("Address", 20, false));
     disassembly_header.append(&column_header("Bytes", 22, false));
     let instruction_header = column_header("Instruction", 24, true);
@@ -1062,6 +1309,41 @@ pub fn present(
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .selectable(true)
         .css_classes(["caption", "dim-label", "monospace"])
+        .build();
+    let debug_button = gtk::Button::builder()
+        .label("Debugger")
+        .tooltip_text("Attach the ptrace debugger and stop the target")
+        .css_classes(["flat"])
+        .build();
+    let breakpoint_button = gtk::Button::builder()
+        .label("Toggle BP")
+        .tooltip_text("Toggle a software breakpoint at the selected instruction (F5)")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let run_button = gtk::Button::builder()
+        .label("Run")
+        .tooltip_text("Continue the stopped target (F9)")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let step_into_button = gtk::Button::builder()
+        .label("Step")
+        .tooltip_text("Step into one instruction (F7)")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let step_over_button = gtk::Button::builder()
+        .label("Step over")
+        .tooltip_text("Step over the selected instruction (F8)")
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let step_out_button = gtk::Button::builder()
+        .label("Step out")
+        .tooltip_text("Continue until the current function returns")
+        .sensitive(false)
+        .css_classes(["flat"])
         .build();
     let follow_button = gtk::Button::builder()
         .label("Follow")
@@ -1114,11 +1396,26 @@ pub fn present(
         .margin_start(4)
         .margin_end(4)
         .build();
+    debug_toolbar.append(&breakpoint_button);
+    debug_toolbar.append(&run_button);
+    debug_toolbar.append(&step_into_button);
+    debug_toolbar.append(&step_over_button);
+    debug_toolbar.append(&step_out_button);
+    debug_toolbar.append(&debug_button);
+    debug_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     debug_toolbar.append(&assemble_button);
     debug_toolbar.append(&nop_button);
     debug_toolbar.append(&follow_button);
     debug_toolbar.append(&copy_button);
     debug_toolbar.append(&add_button);
+    let debug_status = gtk::Label::builder()
+        .label("Debugger detached")
+        .xalign(1.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .css_classes(["caption", "dim-label", "monospace"])
+        .build();
+    debug_toolbar.append(&debug_status);
     let disassembly_panel = gtk::Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
@@ -1241,6 +1538,13 @@ pub fn present(
         status,
         instruction_status,
         data_inspector,
+        debug_status,
+        debug_button: debug_button.clone(),
+        breakpoint_button: breakpoint_button.clone(),
+        run_button: run_button.clone(),
+        step_into_button: step_into_button.clone(),
+        step_over_button: step_over_button.clone(),
+        step_out_button: step_out_button.clone(),
         follow_button: follow_button.clone(),
         assemble_button: assemble_button.clone(),
         nop_button: nop_button.clone(),
@@ -1260,6 +1564,9 @@ pub fn present(
         bookmarks: Rc::new(RefCell::new(BTreeSet::new())),
         last_search: Rc::new(RefCell::new(None)),
         search_serial: Rc::new(Cell::new(0)),
+        debug_attached: Rc::new(Cell::new(false)),
+        debug_stopped: Rc::new(Cell::new(false)),
+        last_debug_serial: Rc::new(Cell::new(0)),
         classic_layout: menu_model.n_items() == 5 && debug_toolbar.first_child().is_some(),
     };
     viewer.rebuild_bookmarks();
@@ -1354,6 +1661,30 @@ pub fn present(
         let viewer = viewer.clone();
         move |_| viewer.present_edit_dialog()
     });
+    debug_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.toggle_debugger()
+    });
+    breakpoint_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.toggle_selected_breakpoint()
+    });
+    run_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.continue_debugger()
+    });
+    step_into_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.step_debugger(DebugStepMode::Into)
+    });
+    step_over_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.step_debugger(DebugStepMode::Over)
+    });
+    step_out_button.connect_clicked({
+        let viewer = viewer.clone();
+        move |_| viewer.step_debugger(DebugStepMode::Out)
+    });
     find_button.connect_clicked({
         let viewer = viewer.clone();
         move |_| viewer.present_find_dialog()
@@ -1385,6 +1716,12 @@ pub fn present(
     add_button_action(&action_group, "page-next", &next_page_button);
     add_button_action(&action_group, "refresh-view", &refresh_button);
     add_button_action(&action_group, "toggle-bookmark", &bookmark_button);
+    add_button_action(&action_group, "toggle-debugger", &debug_button);
+    add_button_action(&action_group, "toggle-breakpoint", &breakpoint_button);
+    add_button_action(&action_group, "debug-run", &run_button);
+    add_button_action(&action_group, "step-into", &step_into_button);
+    add_button_action(&action_group, "step-over", &step_over_button);
+    add_button_action(&action_group, "step-out", &step_out_button);
     add_button_action(&action_group, "follow-target", &follow_button);
     add_button_action(&action_group, "assemble-instruction", &assemble_button);
     add_button_action(&action_group, "nop-instruction", &nop_button);
@@ -1440,14 +1777,59 @@ pub fn present(
                     viewer.repeat_search(false);
                     adw::glib::Propagation::Stop
                 }
+                gtk::gdk::Key::F5 => {
+                    viewer.toggle_selected_breakpoint();
+                    adw::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::F7 => {
+                    viewer.step_debugger(DebugStepMode::Into);
+                    adw::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::F8 => {
+                    viewer.step_debugger(DebugStepMode::Over);
+                    adw::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::F9 => {
+                    viewer.continue_debugger();
+                    adw::glib::Propagation::Stop
+                }
                 _ => adw::glib::Propagation::Proceed,
             }
         }
     });
     window.add_controller(key_controller);
 
+    window.connect_close_request({
+        let viewer = viewer.clone();
+        move |_| {
+            if viewer.debug_attached.get()
+                && let Ok(mut engine_slot) = viewer.engine.try_borrow_mut()
+                && let Some(engine) = engine_slot.as_mut()
+            {
+                let _ = engine.debug_detach();
+            }
+            adw::glib::Propagation::Proceed
+        }
+    });
+
+    adw::glib::timeout_add_local(std::time::Duration::from_millis(50), {
+        let viewer = viewer.clone();
+        move || {
+            if !viewer.window.is_visible() {
+                return adw::glib::ControlFlow::Break;
+            }
+            viewer.poll_debugger();
+            adw::glib::ControlFlow::Continue
+        }
+    });
+
     window.present();
     viewer.load(initial_address);
+    viewer.poll_debugger();
+    if std::env::var_os("CE_GTK_MEMORY_DEBUG_SMOKE").is_some() {
+        viewer.toggle_debugger();
+        viewer.toggle_selected_breakpoint();
+    }
 }
 
 fn parse_address(text: &str) -> Result<u64, String> {
@@ -1599,7 +1981,26 @@ fn column_header(title: &str, width_chars: i32, expand: bool) -> gtk::Label {
         .build()
 }
 
-fn disassembly_row(address: u64, bytes: &str, mnemonic: &str, operands: &str) -> gtk::Box {
+fn disassembly_row(
+    address: u64,
+    bytes: &str,
+    mnemonic: &str,
+    operands: &str,
+    breakpoint: bool,
+) -> gtk::Box {
+    let marker = gtk::Label::builder()
+        .label(if breakpoint { "●" } else { " " })
+        .width_chars(2)
+        .xalign(0.5)
+        .tooltip_text(if breakpoint {
+            "Software breakpoint enabled"
+        } else {
+            ""
+        })
+        .build();
+    if breakpoint {
+        marker.add_css_class("error");
+    }
     let address = gtk::Label::builder()
         .label(format!("0x{address:016X}"))
         .xalign(0.0)
@@ -1637,6 +2038,7 @@ fn disassembly_row(address: u64, bytes: &str, mnemonic: &str, operands: &str) ->
         .margin_end(6)
         .valign(Align::Center)
         .build();
+    row.append(&marker);
     row.append(&address);
     row.append(&bytes);
     row.append(&instruction);

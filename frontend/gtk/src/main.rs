@@ -33,11 +33,15 @@ fn main() -> adw::glib::ExitCode {
     let memory_view_smoke = arguments
         .iter()
         .any(|argument| argument == "--memory-view-smoke");
+    let memory_debug_smoke = arguments
+        .iter()
+        .any(|argument| argument == "--memory-debug-smoke");
     if startup_smoke
         || lua_console_smoke
         || address_list_smoke
         || main_layout_smoke
         || memory_view_smoke
+        || memory_debug_smoke
     {
         application.connect_activate(move |application| {
             if startup_smoke && let Some(window) = application.active_window() {
@@ -46,6 +50,8 @@ fn main() -> adw::glib::ExitCode {
             let application = application.clone();
             let timeout = if address_list_smoke {
                 1800
+            } else if memory_debug_smoke {
+                1500
             } else if memory_view_smoke {
                 900
             } else {
@@ -66,8 +72,8 @@ fn main() -> adw::glib::ExitCode {
     } else if main_layout_smoke && !application::main_layout_smoke_ok() {
         eprintln!("main window does not preserve the process/results/controls/address-list layout");
         adw::glib::ExitCode::FAILURE
-    } else if memory_view_smoke && !memory_view::smoke_ok() {
-        eprintln!("GTK Memory View did not render live bytes and disassembly");
+    } else if (memory_view_smoke || memory_debug_smoke) && !memory_view::smoke_ok() {
+        eprintln!("GTK Memory View did not complete its live memory/debugger smoke");
         adw::glib::ExitCode::FAILURE
     } else {
         exit_code

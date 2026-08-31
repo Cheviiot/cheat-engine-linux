@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -128,7 +129,19 @@ pub fn main_layout_smoke_ok() -> bool {
 fn build_window(application: &adw::Application) {
     let mut engine = Engine::new();
     let address_list_smoke = std::env::var_os("CE_GTK_ADDRESS_LIST_SMOKE").is_some();
-    let memory_view_smoke = std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some();
+    let memory_debug_smoke = std::env::var_os("CE_GTK_MEMORY_DEBUG_SMOKE").is_some();
+    let memory_view_smoke =
+        memory_debug_smoke || std::env::var_os("CE_GTK_MEMORY_VIEW_SMOKE").is_some();
+    let debug_smoke_child: Rc<RefCell<Option<Child>>> =
+        Rc::new(RefCell::new(memory_debug_smoke.then(|| {
+            Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start GTK debugger smoke target")
+        })));
     if address_list_smoke {
         for index in 0..600_u64 {
             engine
@@ -143,10 +156,14 @@ fn build_window(application: &adw::Application) {
         }
     }
     let memory_view_smoke_session = if memory_view_smoke {
+        let pid = debug_smoke_child
+            .borrow()
+            .as_ref()
+            .map_or_else(|| std::process::id() as i32, |child| child.id() as i32);
         Some(
             engine
-                .attach(std::process::id() as i32, "GTK memory-view smoke")
-                .expect("attach the memory-view smoke fixture to itself"),
+                .attach(pid, "GTK memory-view smoke")
+                .expect("attach the memory-view smoke fixture"),
         )
     } else {
         None
@@ -181,6 +198,17 @@ fn build_window(application: &adw::Application) {
         lua_console_backlog: Rc::new(RefCell::new(String::new())),
         lua_console_history: Rc::new(RefCell::new(Vec::new())),
     };
+    if memory_debug_smoke {
+        application.connect_shutdown({
+            let debug_smoke_child = debug_smoke_child.clone();
+            move |_| {
+                if let Some(mut child) = debug_smoke_child.borrow_mut().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        });
+    }
 
     let header = adw::HeaderBar::new();
     let window_title = adw::WindowTitle::builder()

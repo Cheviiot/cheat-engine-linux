@@ -8,6 +8,7 @@
 #include "core/target_profile.hpp"
 #include "core/value_transform.hpp"
 #include "core/version.hpp"
+#include "debug/debug_session.hpp"
 #include "platform/linux/linux_process.hpp"
 #include "scanner/memory_scanner.hpp"
 #include "scripting/lua_engine.hpp"
@@ -54,6 +55,7 @@ constexpr std::uint32_t kMaxMemorySearchPageBytes = 8u << 20;
 constexpr std::size_t kMaxMemoryWriteSize = 4096;
 constexpr std::size_t kMaxAssemblySourceSize = 4096;
 constexpr std::size_t kMaxAssemblyOutputSize = 4096;
+constexpr std::size_t kMaxSoftwareBreakpoints = 4096;
 constexpr std::uint32_t kMaxAddressPageSize = 256;
 constexpr std::size_t kMaxScanValueSize = 1u << 20;
 constexpr std::size_t kMaxScanTextSize = 1u << 20;
@@ -914,15 +916,34 @@ struct EngineFacade::ScriptRuntime {
     }
 };
 
+struct EngineFacade::DebugRuntime {
+    struct SoftwareBreakpoint {
+        int id = 0;
+        std::uint8_t original_byte = 0;
+    };
+
+    std::unique_ptr<ce::DebugSession> session;
+    std::unordered_map<std::uintptr_t, SoftwareBreakpoint> software_breakpoints;
+    mutable std::mutex mutex;
+    std::uint64_t event_serial = 0;
+    std::uintptr_t event_address = 0;
+    pid_t event_tid = 0;
+    int event_signal = 0;
+    std::uint8_t event_type = 0;
+    bool exited = false;
+};
+
 EngineFacade::EngineFacade()
     : address_list_(std::make_unique<ce::AddressListController>()),
-      script_runtime_(std::make_unique<ScriptRuntime>()) {
+      script_runtime_(std::make_unique<ScriptRuntime>()),
+      debug_runtime_(std::make_unique<DebugRuntime>()) {
     script_runtime_->resetLua(nullptr, address_list_.get());
 }
 
 EngineFacade::~EngineFacade() {
     cancel_scan();
     join_scan_worker();
+    stop_debug_session();
     std::string ignoredCode;
     std::string ignoredMessage;
     deactivate_all_scripts(ignoredCode, ignoredMessage);
@@ -1002,6 +1023,7 @@ AttachResult EngineFacade::attach(std::int32_t pid, rust::Str display_name) {
                 result.error_message = scriptErrorMessage;
                 return result;
             }
+            stop_debug_session();
             script_runtime_->resetLua(nullptr, address_list_.get());
             clear_scan_state();
             process_ = std::move(candidate);
@@ -1030,6 +1052,7 @@ AddressActionResult EngineFacade::detach() {
     cancel_scan();
     join_scan_worker();
     clear_scan_state();
+    stop_debug_session();
     std::string scriptErrorCode;
     std::string scriptErrorMessage;
     if (!deactivate_all_scripts(scriptErrorCode, scriptErrorMessage)) {
@@ -1403,6 +1426,25 @@ MemoryViewResult EngineFacade::memory_view(std::uint64_t address,
     }
     bytes.resize(*read);
 
+    // Keep the viewer faithful to the target's real instruction stream. ptrace
+    // software breakpoints replace one byte with INT3; expose the captured
+    // original byte to disassembly/hex while marking the row separately.
+    std::unordered_map<std::uintptr_t, std::uint8_t> activeBreakpoints;
+    if (debug_runtime_) {
+        std::lock_guard lock(debug_runtime_->mutex);
+        for (const auto& [breakpointAddress, breakpoint] :
+             debug_runtime_->software_breakpoints) {
+            activeBreakpoints.emplace(
+                breakpointAddress, breakpoint.original_byte);
+        }
+    }
+    for (const auto& [breakpointAddress, originalByte] : activeBreakpoints) {
+        if (breakpointAddress >= target &&
+            breakpointAddress - target < bytes.size()) {
+            bytes[breakpointAddress - target] = originalByte;
+        }
+    }
+
     const bool code32 = process_->runs32BitCode();
     result.arch = code32 ? "x86-32" : "x86-64";
     result.region = sanitize_utf8(memory_region_description(*region));
@@ -1422,6 +1464,7 @@ MemoryViewResult EngineFacade::memory_view(std::uint64_t address,
                 .operands = instruction.operands,
                 .size = instruction.size,
                 .follow_target = instruction_follow_target(instruction),
+                .breakpoint = activeBreakpoints.contains(instruction.address),
             });
         }
     } catch (const std::exception& error) {
@@ -1776,6 +1819,279 @@ AssembleResult EngineFacade::assemble_preview(std::uint64_t address, rust::Str s
             std::string(error.what());
         return result;
     }
+}
+
+DebugStateResult EngineFacade::debug_state() const {
+    DebugStateResult result;
+    result.accepted = true;
+    result.attached = false;
+    result.stopped = false;
+    result.exited = false;
+    result.active_tid = 0;
+    result.rip = 0;
+    result.signal = 0;
+    result.event_type = 0;
+    result.event_serial = 0;
+    result.breakpoint_count = 0;
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!debug_runtime_) return result;
+    auto* session = debug_runtime_->session.get();
+    if (session) {
+        result.attached = session->isAttached();
+        result.stopped = result.attached && session->isStopped();
+        result.active_tid = result.attached
+            ? static_cast<std::int32_t>(session->activeThread()) : 0;
+        if (result.stopped)
+            result.rip = static_cast<std::uint64_t>(session->getStopContext().rip);
+    }
+    {
+        std::lock_guard lock(debug_runtime_->mutex);
+        result.exited = debug_runtime_->exited;
+        result.signal = debug_runtime_->event_signal;
+        result.event_type = debug_runtime_->event_type;
+        result.event_serial = debug_runtime_->event_serial;
+        result.breakpoint_count = static_cast<std::uint32_t>(std::min<std::size_t>(
+            debug_runtime_->software_breakpoints.size(),
+            std::numeric_limits<std::uint32_t>::max()));
+        if (result.rip == 0)
+            result.rip = static_cast<std::uint64_t>(debug_runtime_->event_address);
+        if (result.active_tid == 0)
+            result.active_tid = static_cast<std::int32_t>(debug_runtime_->event_tid);
+    }
+    return result;
+}
+
+DebugStateResult EngineFacade::debug_start() {
+    if (!process_) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before starting the debugger.";
+        return result;
+    }
+    if (debug_runtime_->session && debug_runtime_->session->isAttached())
+        return debug_state();
+
+    stop_debug_session();
+    auto candidate = std::make_unique<ce::DebugSession>();
+    candidate->setEventCallback([this](const ce::DebugEvent& event) {
+        if (!debug_runtime_) return;
+        std::lock_guard lock(debug_runtime_->mutex);
+        ++debug_runtime_->event_serial;
+        debug_runtime_->event_address = event.address != 0
+            ? event.address : event.context.rip;
+        debug_runtime_->event_tid = event.tid;
+        debug_runtime_->event_signal = event.signal;
+        debug_runtime_->exited = event.type == ce::DebugEventType::ProcessExited;
+        if (debug_runtime_->exited)
+            debug_runtime_->software_breakpoints.clear();
+        switch (event.type) {
+            case ce::DebugEventType::BreakpointHit:
+                debug_runtime_->event_type = 1;
+                break;
+            case ce::DebugEventType::ExceptionBreakpointHit:
+                debug_runtime_->event_type = 2;
+                break;
+            case ce::DebugEventType::SingleStep:
+                debug_runtime_->event_type = 3;
+                break;
+            case ce::DebugEventType::ProcessExited:
+                debug_runtime_->event_type = 4;
+                break;
+            case ce::DebugEventType::SignalReceived:
+                debug_runtime_->event_type = 5;
+                break;
+        }
+    });
+    if (!candidate->attach(process_->pid(), process_.get())) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "debug_attach_failed";
+        result.error_message =
+            "Linux denied the ptrace debugger attach, or the process exited.";
+        return result;
+    }
+    debug_runtime_->session = std::move(candidate);
+    {
+        std::lock_guard lock(debug_runtime_->mutex);
+        ++debug_runtime_->event_serial;
+        debug_runtime_->event_address =
+            debug_runtime_->session->getStopContext().rip;
+        debug_runtime_->event_tid = debug_runtime_->session->activeThread();
+        debug_runtime_->event_signal = 0;
+        debug_runtime_->event_type = 0;
+        debug_runtime_->exited = false;
+    }
+    return debug_state();
+}
+
+DebugStateResult EngineFacade::debug_continue() {
+    if (!debug_runtime_->session || !debug_runtime_->session->isAttached()) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "debug_not_attached";
+        result.error_message = "Start the debugger before continuing the target.";
+        return result;
+    }
+    if (!debug_runtime_->session->isStopped()) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "debug_not_stopped";
+        result.error_message = "The debugged process is already running.";
+        return result;
+    }
+    debug_runtime_->session->continueExecution();
+    return debug_state();
+}
+
+DebugStateResult EngineFacade::debug_step(std::uint8_t mode,
+                                           std::uint64_t target_address) {
+    if (!debug_runtime_->session || !debug_runtime_->session->isAttached()) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "debug_not_attached";
+        result.error_message = "Start the debugger before stepping the target.";
+        return result;
+    }
+    if (!debug_runtime_->session->isStopped()) {
+        auto result = debug_state();
+        result.accepted = false;
+        result.error_code = "debug_not_stopped";
+        result.error_message = "Wait for the target to stop before stepping.";
+        return result;
+    }
+    ce::StepMode stepMode;
+    switch (mode) {
+        case 0: stepMode = ce::StepMode::Into; break;
+        case 1: stepMode = ce::StepMode::Over; break;
+        case 2: stepMode = ce::StepMode::Out; break;
+        case 3:
+            if (target_address == 0) {
+                auto result = debug_state();
+                result.accepted = false;
+                result.error_code = "invalid_step_target";
+                result.error_message = "Run to cursor needs a non-zero target address.";
+                return result;
+            }
+            if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+                if (target_address > std::numeric_limits<std::uintptr_t>::max()) {
+                    auto result = debug_state();
+                    result.accepted = false;
+                    result.error_code = "address_out_of_range";
+                    result.error_message =
+                        "The run-to-cursor address does not fit this host architecture.";
+                    return result;
+                }
+            }
+            stepMode = ce::StepMode::RunToCursor;
+            break;
+        default: {
+            auto result = debug_state();
+            result.accepted = false;
+            result.error_code = "invalid_step_mode";
+            result.error_message = "The requested debugger step mode is not supported.";
+            return result;
+        }
+    }
+    debug_runtime_->session->step(
+        stepMode, static_cast<std::uintptr_t>(target_address));
+    return debug_state();
+}
+
+DebugStateResult EngineFacade::debug_detach() {
+    stop_debug_session();
+    return debug_state();
+}
+
+BreakpointActionResult EngineFacade::debug_toggle_breakpoint(std::uint64_t address) {
+    BreakpointActionResult result;
+    result.accepted = false;
+    result.address = address;
+    result.enabled = false;
+    result.breakpoint_count = 0;
+    result.error_code = "";
+    result.error_message = "";
+
+    if (!process_) {
+        result.error_code = "no_session";
+        result.error_message = "Attach to a process before setting a breakpoint.";
+        return result;
+    }
+    if (!debug_runtime_->session || !debug_runtime_->session->isAttached()) {
+        result.error_code = "debug_not_attached";
+        result.error_message = "Start the debugger before setting a breakpoint.";
+        return result;
+    }
+    if (!debug_runtime_->session->isStopped()) {
+        result.error_code = "debug_not_stopped";
+        result.error_message = "Stop the debugged process before changing breakpoints.";
+        return result;
+    }
+    if constexpr (sizeof(std::uintptr_t) < sizeof(std::uint64_t)) {
+        if (address > std::numeric_limits<std::uintptr_t>::max()) {
+            result.error_code = "address_out_of_range";
+            result.error_message = "The breakpoint address does not fit this host architecture.";
+            return result;
+        }
+    }
+    const auto target = static_cast<std::uintptr_t>(address);
+    const auto region = process_->queryRegion(target);
+    if (!region || !(region->protection & ce::MemProt::Read) ||
+        !(region->protection & ce::MemProt::Exec)) {
+        result.error_code = "breakpoint_address_not_executable";
+        result.error_message = "Software execute breakpoints require a readable executable page.";
+        return result;
+    }
+
+    int existingId = 0;
+    {
+        std::lock_guard lock(debug_runtime_->mutex);
+        const auto existing = debug_runtime_->software_breakpoints.find(target);
+        if (existing != debug_runtime_->software_breakpoints.end())
+            existingId = existing->second.id;
+    }
+    if (existingId > 0) {
+        debug_runtime_->session->removeSoftwareBreakpoint(existingId);
+        std::lock_guard lock(debug_runtime_->mutex);
+        debug_runtime_->software_breakpoints.erase(target);
+        result.accepted = true;
+        result.breakpoint_count = static_cast<std::uint32_t>(
+            debug_runtime_->software_breakpoints.size());
+        return result;
+    }
+
+    {
+        std::lock_guard lock(debug_runtime_->mutex);
+        if (debug_runtime_->software_breakpoints.size() >= kMaxSoftwareBreakpoints) {
+            result.error_code = "breakpoint_limit";
+            result.error_message = "Software breakpoints are limited to 4096 per session.";
+            return result;
+        }
+    }
+    std::uint8_t originalByte = 0;
+    const auto read = process_->read(target, &originalByte, sizeof originalByte);
+    if (!read || *read != sizeof originalByte) {
+        result.error_code = "breakpoint_read_failed";
+        result.error_message = "Could not capture the original instruction byte.";
+        return result;
+    }
+    const int id = debug_runtime_->session->setSoftwareBreakpoint(target);
+    if (id <= 0) {
+        result.error_code = "breakpoint_set_failed";
+        result.error_message = "ptrace could not plant the software breakpoint.";
+        return result;
+    }
+    {
+        std::lock_guard lock(debug_runtime_->mutex);
+        debug_runtime_->software_breakpoints[target] = {id, originalByte};
+        result.breakpoint_count = static_cast<std::uint32_t>(
+            debug_runtime_->software_breakpoints.size());
+    }
+    result.accepted = true;
+    result.enabled = true;
+    return result;
 }
 
 void EngineFacade::cancel_scan() noexcept {
@@ -2862,6 +3178,26 @@ void EngineFacade::clear_scan_state() noexcept {
     scan_running_.store(false, std::memory_order_release);
     scan_cancel_requested_.store(false, std::memory_order_release);
     scan_generation_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void EngineFacade::stop_debug_session() noexcept {
+    if (!debug_runtime_) return;
+    try {
+        auto session = std::move(debug_runtime_->session);
+        if (session && session->isAttached()) session->detach();
+        session.reset();
+    } catch (...) {
+        // Destruction and target replacement must still clear borrowed state;
+        // DebugSession's own destructor performs the same best-effort cleanup.
+    }
+    std::lock_guard lock(debug_runtime_->mutex);
+    debug_runtime_->software_breakpoints.clear();
+    ++debug_runtime_->event_serial;
+    debug_runtime_->event_address = 0;
+    debug_runtime_->event_tid = 0;
+    debug_runtime_->event_signal = 0;
+    debug_runtime_->event_type = 0;
+    debug_runtime_->exited = false;
 }
 
 std::unique_ptr<EngineFacade> create_engine_facade() {

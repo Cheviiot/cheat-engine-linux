@@ -51,6 +51,13 @@ Completed in the foundation and first vertical slices:
   pass restores the source viewer's File/Search/View/Debug/Tools command map,
   a separate compact action toolbar, dense table-like disassembly rows, and a
   flat split-pane silhouette without introducing any unwired placeholder action;
+  the first real debugger slice now owns one shared `DebugSession` per facade,
+  exposes attach/detach, continue, step into/over/out, and bounded software
+  breakpoint toggling through the CXX bridge, restores patched bytes during
+  detach and destruction, and masks active `INT3` bytes in Memory View so the
+  original instruction remains readable; GTK marks active breakpoints in a
+  dedicated gutter and follows newly stopped instruction pointers while a
+  child-process smoke test proves the complete attach/set/run/hit/detach path;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -515,5 +522,8 @@ recorded in a short decision note before public release.
     page-protection restoration.~~
 15. ~~Add target-bitness-aware GTK assembler preview, old/new byte confirmation,
     instruction-boundary NOP padding, explicit longer-instruction warnings, and
-    confirmed NOP replacement.~~ Next integrate breakpoints and debugger state,
-    continue Lua GUI/form parity, and complete the branding review.
+    confirmed NOP replacement.~~
+16. ~~Integrate shared debugger state, Run/Step controls, software breakpoint
+    markers, byte restoration, child-process contract tests, and a live GTK
+    debugger smoke test.~~ Next continue Lua GUI/form parity, expand debugger
+    event views and hardware breakpoints, and complete the branding review.

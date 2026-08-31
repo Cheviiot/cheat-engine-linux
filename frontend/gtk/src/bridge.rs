@@ -100,6 +100,7 @@ mod ffi {
         operands: String,
         size: u8,
         follow_target: u64,
+        breakpoint: bool,
     }
 
     struct MemoryViewResult {
@@ -140,6 +141,30 @@ mod ffi {
         arch: String,
         statements: u32,
         bytes: Vec<u8>,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct DebugStateResult {
+        accepted: bool,
+        attached: bool,
+        stopped: bool,
+        exited: bool,
+        active_tid: i32,
+        rip: u64,
+        signal: i32,
+        event_type: u8,
+        event_serial: u64,
+        breakpoint_count: u32,
+        error_code: String,
+        error_message: String,
+    }
+
+    struct BreakpointActionResult {
+        accepted: bool,
+        address: u64,
+        enabled: bool,
+        breakpoint_count: u32,
         error_code: String,
         error_message: String,
     }
@@ -301,6 +326,19 @@ mod ffi {
             allow_protection_change: bool,
         ) -> MemoryWriteResult;
         fn assemble_preview(self: &EngineFacade, address: u64, source: &str) -> AssembleResult;
+        fn debug_start(self: Pin<&mut EngineFacade>) -> DebugStateResult;
+        fn debug_state(self: &EngineFacade) -> DebugStateResult;
+        fn debug_continue(self: Pin<&mut EngineFacade>) -> DebugStateResult;
+        fn debug_step(
+            self: Pin<&mut EngineFacade>,
+            mode: u8,
+            target_address: u64,
+        ) -> DebugStateResult;
+        fn debug_detach(self: Pin<&mut EngineFacade>) -> DebugStateResult;
+        fn debug_toggle_breakpoint(
+            self: Pin<&mut EngineFacade>,
+            address: u64,
+        ) -> BreakpointActionResult;
         fn cancel_scan(self: Pin<&mut EngineFacade>);
         fn visible_address_rows(
             self: Pin<&mut EngineFacade>,
@@ -700,6 +738,7 @@ pub struct DisassemblyRow {
     pub operands: String,
     pub size: u8,
     pub follow_target: u64,
+    pub breakpoint: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -734,6 +773,34 @@ pub struct AssemblyPreview {
     pub arch: String,
     pub statements: u32,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugState {
+    pub attached: bool,
+    pub stopped: bool,
+    pub exited: bool,
+    pub active_tid: i32,
+    pub rip: u64,
+    pub signal: i32,
+    pub event_type: u8,
+    pub event_serial: u64,
+    pub breakpoint_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BreakpointAction {
+    pub address: u64,
+    pub enabled: bool,
+    pub breakpoint_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DebugStepMode {
+    Into = 0,
+    Over = 1,
+    Out = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1126,6 +1193,7 @@ impl Engine {
                     operands: row.operands,
                     size: row.size,
                     follow_target: row.follow_target,
+                    breakpoint: row.breakpoint,
                 })
                 .collect(),
         })
@@ -1197,6 +1265,48 @@ impl Engine {
             arch: result.arch,
             statements: result.statements,
             bytes: result.bytes,
+        })
+    }
+
+    pub fn debug_start(&mut self) -> Result<DebugState, AddressError> {
+        debug_state_result(self.inner.pin_mut().debug_start())
+    }
+
+    pub fn debug_state(&self) -> Result<DebugState, AddressError> {
+        debug_state_result(self.inner.debug_state())
+    }
+
+    pub fn debug_continue(&mut self) -> Result<DebugState, AddressError> {
+        debug_state_result(self.inner.pin_mut().debug_continue())
+    }
+
+    pub fn debug_step(
+        &mut self,
+        mode: DebugStepMode,
+        target_address: u64,
+    ) -> Result<DebugState, AddressError> {
+        debug_state_result(self.inner.pin_mut().debug_step(mode as u8, target_address))
+    }
+
+    pub fn debug_detach(&mut self) -> Result<DebugState, AddressError> {
+        debug_state_result(self.inner.pin_mut().debug_detach())
+    }
+
+    pub fn debug_toggle_breakpoint(
+        &mut self,
+        address: u64,
+    ) -> Result<BreakpointAction, AddressError> {
+        let result = self.inner.pin_mut().debug_toggle_breakpoint(address);
+        if !result.accepted {
+            return Err(AddressError {
+                code: result.error_code,
+                message: result.error_message,
+            });
+        }
+        Ok(BreakpointAction {
+            address: result.address,
+            enabled: result.enabled,
+            breakpoint_count: result.breakpoint_count,
         })
     }
 
@@ -1450,6 +1560,26 @@ fn address_action(result: ffi::AddressActionResult) -> Result<i32, AddressError>
     }
 }
 
+fn debug_state_result(result: ffi::DebugStateResult) -> Result<DebugState, AddressError> {
+    if !result.accepted {
+        return Err(AddressError {
+            code: result.error_code,
+            message: result.error_message,
+        });
+    }
+    Ok(DebugState {
+        attached: result.attached,
+        stopped: result.stopped,
+        exited: result.exited,
+        active_tid: result.active_tid,
+        rip: result.rip,
+        signal: result.signal,
+        event_type: result.event_type,
+        event_serial: result.event_serial,
+        breakpoint_count: result.breakpoint_count,
+    })
+}
+
 fn table_action(result: ffi::TableActionResult) -> Result<TableAction, AddressError> {
     if result.accepted {
         Ok(TableAction {
@@ -1491,12 +1621,22 @@ impl Default for Engine {
 mod tests {
     use std::cell::UnsafeCell;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType, TableScriptKind,
+        DebugStepMode, Engine, FreezeMode, ScanComparison, ScanRequest, ScanStatus, ScanValueType,
+        TableScriptKind,
     };
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     fn temporary_table_path(extension: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1634,7 +1774,7 @@ mod tests {
         fixture[173..181].copy_from_slice(&marker);
         let base = fixture.as_ptr() as u64;
         let expected = base + 173;
-        let mut engine = attached_engine();
+        let engine = attached_engine();
 
         let mut cursor = base;
         let mut found = None;
@@ -1799,6 +1939,168 @@ mod tests {
 
         let session = result.expect("parent should be allowed to read child memory");
         assert_eq!(session.name, "sleep child");
+    }
+
+    #[test]
+    fn debugger_requires_a_memory_session() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .debug_start()
+                .expect_err("debugger without a process must fail")
+                .code,
+            "no_session"
+        );
+        assert_eq!(
+            engine
+                .debug_toggle_breakpoint(0x1000)
+                .expect_err("breakpoint without a process must fail")
+                .code,
+            "no_session"
+        );
+    }
+
+    #[test]
+    fn debugger_hits_and_restores_a_child_software_breakpoint() {
+        let child = Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start busy debugger target");
+        let child = ChildGuard(child);
+        let mut engine = Engine::new();
+        engine
+            .attach(child.0.id() as i32, "debugger child")
+            .expect("open child memory");
+
+        let started = engine.debug_start().expect("attach ptrace debugger");
+        assert!(started.attached && started.stopped);
+        assert_ne!(started.rip, 0);
+
+        let stepped = engine
+            .debug_step(DebugStepMode::Into, 0)
+            .expect("single-step child");
+        assert!(stepped.attached && stepped.stopped);
+        assert_eq!(stepped.event_type, 3);
+        assert_ne!(stepped.rip, 0);
+
+        let before = engine
+            .memory_view(stepped.rip, 64, 16)
+            .expect("read stopped instruction");
+        assert!(!before.bytes.is_empty());
+        assert!(!before.instructions.is_empty());
+        let original_byte = before.bytes[0];
+
+        let enabled = engine
+            .debug_toggle_breakpoint(stepped.rip)
+            .expect("plant software breakpoint");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.breakpoint_count, 1);
+        let masked = engine
+            .memory_view(stepped.rip, 64, 16)
+            .expect("render breakpoint without exposing int3");
+        assert_eq!(masked.bytes[0], original_byte);
+        assert!(masked.instructions[0].breakpoint);
+
+        let removed = engine
+            .debug_toggle_breakpoint(stepped.rip)
+            .expect("remove software breakpoint");
+        assert!(!removed.enabled);
+        assert_eq!(removed.breakpoint_count, 0);
+        assert!(
+            !engine
+                .memory_view(stepped.rip, 64, 16)
+                .expect("render restored instruction")
+                .instructions[0]
+                .breakpoint
+        );
+
+        engine
+            .debug_toggle_breakpoint(stepped.rip)
+            .expect("re-arm software breakpoint");
+        let running = engine.debug_continue().expect("continue debugger target");
+        assert!(running.attached && !running.stopped);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let hit = loop {
+            let state = engine.debug_state().expect("poll debugger state");
+            if state.stopped && state.event_type == 1 {
+                break state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "software breakpoint did not fire"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(hit.rip, stepped.rip);
+
+        let detached = engine.debug_detach().expect("detach debugger");
+        assert!(!detached.attached);
+        assert_eq!(detached.breakpoint_count, 0);
+        let restored = engine
+            .memory_view(stepped.rip, 64, 16)
+            .expect("read byte after debugger detach");
+        assert_eq!(restored.bytes[0], original_byte);
+        assert!(!restored.instructions[0].breakpoint);
+    }
+
+    #[test]
+    fn debugger_cleanup_runs_on_process_detach_and_engine_drop() {
+        let child = Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start debugger cleanup target");
+        let mut child = ChildGuard(child);
+
+        let (address, original_byte) = {
+            let mut engine = Engine::new();
+            engine
+                .attach(child.0.id() as i32, "debugger drop child")
+                .expect("open child memory");
+            let started = engine.debug_start().expect("start debugger");
+            let view = engine
+                .memory_view(started.rip, 32, 8)
+                .expect("read original instruction");
+            engine
+                .debug_toggle_breakpoint(started.rip)
+                .expect("plant breakpoint before engine drop");
+            (started.rip, view.bytes[0])
+        };
+
+        assert!(child.0.try_wait().expect("query child state").is_none());
+        let mut engine = Engine::new();
+        engine
+            .attach(child.0.id() as i32, "debugger detach child")
+            .expect("reattach after facade destruction");
+        let after_drop = engine
+            .memory_view(address, 32, 8)
+            .expect("read instruction restored by facade destruction");
+        assert_eq!(after_drop.bytes[0], original_byte);
+        assert!(!after_drop.instructions[0].breakpoint);
+
+        engine.debug_start().expect("restart debugger");
+        engine
+            .debug_toggle_breakpoint(address)
+            .expect("plant breakpoint before process detach");
+        engine
+            .detach()
+            .expect("detach process with active debugger");
+        assert!(child.0.try_wait().expect("query child state").is_none());
+
+        engine
+            .attach(child.0.id() as i32, "debugger final child")
+            .expect("reattach after process detach");
+        let after_detach = engine
+            .memory_view(address, 32, 8)
+            .expect("read instruction restored by process detach");
+        assert_eq!(after_detach.bytes[0], original_byte);
+        assert!(!after_detach.instructions[0].breakpoint);
     }
 
     #[test]

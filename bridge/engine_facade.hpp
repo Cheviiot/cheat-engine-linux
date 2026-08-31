@@ -31,6 +31,8 @@ struct MemoryViewResult;
 struct MemorySearchResult;
 struct MemoryWriteResult;
 struct AssembleResult;
+struct DebugStateResult;
+struct BreakpointActionResult;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
@@ -74,6 +76,12 @@ public:
                                    rust::Slice<const std::uint8_t> bytes,
                                    bool allow_protection_change);
     AssembleResult assemble_preview(std::uint64_t address, rust::Str source) const;
+    DebugStateResult debug_start();
+    DebugStateResult debug_state() const;
+    DebugStateResult debug_continue();
+    DebugStateResult debug_step(std::uint8_t mode, std::uint64_t target_address);
+    DebugStateResult debug_detach();
+    BreakpointActionResult debug_toggle_breakpoint(std::uint64_t address);
     void cancel_scan() noexcept;
     AddressPage address_rows(std::uint64_t start, std::uint32_t limit,
                              bool refresh_values);
@@ -117,9 +125,11 @@ public:
 
 private:
     struct ScriptRuntime;
+    struct DebugRuntime;
 
     void join_scan_worker() noexcept;
     void clear_scan_state() noexcept;
+    void stop_debug_session() noexcept;
     bool deactivate_scripts(const std::vector<int>& ids, std::string& errorCode,
                             std::string& errorMessage) noexcept;
     bool deactivate_all_scripts(std::string& errorCode,
@@ -133,6 +143,7 @@ private:
     std::unique_ptr<ce::ScanConfig> undo_scan_config_;
     std::unique_ptr<ce::AddressListController> address_list_;
     std::unique_ptr<ScriptRuntime> script_runtime_;
+    std::unique_ptr<DebugRuntime> debug_runtime_;
     bool scan_display_hex_ = false;
     bool undo_scan_display_hex_ = false;
     std::thread scan_worker_;

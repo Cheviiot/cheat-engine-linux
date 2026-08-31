@@ -610,6 +610,14 @@ if(CECORE_BUILD_GTK_GUI)
                         "$<TARGET_FILE:ce-gtk>" --memory-view-smoke)
                 set_tests_properties(gtk_memory_view_smoke PROPERTIES TIMEOUT 15)
 
+                add_test(NAME gtk_memory_debug_smoke
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
+                        "CE_GTK_MEMORY_DEBUG_SMOKE=1"
+                        "${XVFB_RUN_EXECUTABLE}" -a
+                        "$<TARGET_FILE:ce-gtk>" --memory-debug-smoke)
+                set_tests_properties(gtk_memory_debug_smoke PROPERTIES TIMEOUT 15)
+
                 add_test(NAME gtk_lua_console_smoke
                     COMMAND ${CMAKE_COMMAND} -E env
                         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:cecore>"
@@ -625,6 +633,18 @@ if(CECORE_BUILD_GTK_GUI)
                         "${XVFB_RUN_EXECUTABLE}" -a
                         "$<TARGET_FILE:ce-gtk>" --address-list-smoke)
                 set_tests_properties(gtk_address_list_smoke PROPERTIES TIMEOUT 15)
+
+                # Every smoke binary deliberately uses the same development
+                # GApplication ID. Serialize only these tests so a parallel
+                # CTest run cannot forward activation to another smoke case.
+                set_tests_properties(
+                    gtk_startup_smoke
+                    gtk_main_layout_smoke
+                    gtk_memory_view_smoke
+                    gtk_memory_debug_smoke
+                    gtk_lua_console_smoke
+                    gtk_address_list_smoke
+                    PROPERTIES RESOURCE_LOCK gtk_application_session)
             endif()
         endif()
         message(STATUS "GTK4/libadwaita and Cargo found — building Rust GUI")
