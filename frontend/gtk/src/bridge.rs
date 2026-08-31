@@ -99,6 +99,7 @@ mod ffi {
         mnemonic: String,
         operands: String,
         size: u8,
+        follow_target: u64,
     }
 
     struct MemoryViewResult {
@@ -653,6 +654,7 @@ pub struct DisassemblyRow {
     pub mnemonic: String,
     pub operands: String,
     pub size: u8,
+    pub follow_target: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1054,6 +1056,7 @@ impl Engine {
                     mnemonic: row.mnemonic,
                     operands: row.operands,
                     size: row.size,
+                    follow_target: row.follow_target,
                 })
                 .collect(),
         })
@@ -1448,7 +1451,10 @@ mod tests {
 
     #[test]
     fn memory_view_reads_and_disassembles_a_bounded_page() {
-        let code = Box::new([0x90_u8, 0xC3, 0xCC, 0x48, 0x31, 0xC0, 0xC3, 0x90]);
+        let code = Box::new([
+            0xE8_u8, 0x05, 0x00, 0x00, 0x00, // call address + 10
+            0x90, 0xC3, 0xCC, 0x90, 0x90, 0xC3,
+        ]);
         let address = code.as_ptr() as u64;
         let mut engine = Engine::new();
         engine
@@ -1464,8 +1470,9 @@ mod tests {
         assert!(view.arch == "x86-64" || view.arch == "x86-32");
         assert!(!view.region.is_empty());
         assert_eq!(view.instructions[0].address, address);
-        assert_eq!(view.instructions[0].mnemonic, "nop");
-        assert_eq!(view.instructions[1].mnemonic, "ret");
+        assert_eq!(view.instructions[0].mnemonic, "call");
+        assert_eq!(view.instructions[0].follow_target, address + 10);
+        assert_eq!(view.instructions[1].mnemonic, "nop");
 
         let bounded = engine
             .memory_view(address, u32::MAX, u32::MAX)

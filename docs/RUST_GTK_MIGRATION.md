@@ -32,7 +32,10 @@ Completed in the foundation and first vertical slices:
   model: disassembly above, a 16-byte-wide hexadecimal/ASCII dump below, address
   navigation and 512-byte paging around them; reads are capped at 4 KiB and 256
   instructions, and scan hits plus address records open directly at their
-  corresponding memory location;
+  corresponding memory location; the interactive pass adds independent Back/
+  Forward history, direct-branch and RIP-relative Follow, row selection and
+  copying, one-click address-table insertion, per-window bookmarks, Page Up/
+  Page Down navigation, and a cursor-driven byte/integer/float inspector;
 - asynchronous first/next scans backed by the existing `MemoryScanner`, with
   progress, cancellation, one-level undo, result count, type-aware value
   formatting, write-error state, and a generation-aware virtual `gtk::ListView`;
@@ -487,6 +490,9 @@ recorded in a short decision note before public release.
     loading, and a structured compatibility/loss report with lossy-save
     confirmation.~~
 12. ~~Restore the classic main-window geometry and add the first bounded GTK
-    Memory View with disassembly/hex panes and direct address navigation.~~ Next
-    deepen debugger/memory-browser interactions, continue Lua GUI/form parity,
-    and complete the branding review.
+    Memory View with disassembly/hex panes and direct address navigation.~~
+13. ~~Make GTK Memory View interactive with Back/Forward history, bounded page
+    navigation, operand following, instruction copy/add actions, bookmarks, and
+    a hex-cursor scalar inspector.~~ Next add bounded memory search/edit and
+    assembler/debugger integration, continue Lua GUI/form parity, and complete
+    the branding review.

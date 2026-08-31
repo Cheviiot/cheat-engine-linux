@@ -117,6 +117,23 @@ std::string instruction_bytes(const std::vector<std::uint8_t>& bytes) {
     return result;
 }
 
+std::uint64_t instruction_follow_target(const ce::Instruction& instruction) {
+    const auto& mnemonic = instruction.mnemonic;
+    const bool isBranch = mnemonic == "call" || mnemonic == "jmp" ||
+        (mnemonic.size() > 1 && mnemonic.front() == 'j');
+    if (isBranch && instruction.operands.find('[') == std::string::npos) {
+        const auto marker = instruction.operands.find("0x");
+        if (marker != std::string::npos) {
+            try {
+                return std::stoull(instruction.operands.substr(marker + 2), nullptr, 16);
+            } catch (const std::exception&) {
+                // Keep the row usable even if Capstone returned an unexpected operand.
+            }
+        }
+    }
+    return static_cast<std::uint64_t>(instruction.ripTarget);
+}
+
 std::string memory_region_description(const ce::MemoryRegion& region) {
     std::string protection;
     protection.push_back(region.protection & ce::MemProt::Read ? 'r' : '-');
@@ -1391,6 +1408,7 @@ MemoryViewResult EngineFacade::memory_view(std::uint64_t address,
                 .mnemonic = instruction.mnemonic,
                 .operands = instruction.operands,
                 .size = instruction.size,
+                .follow_target = instruction_follow_target(instruction),
             });
         }
     } catch (const std::exception& error) {
