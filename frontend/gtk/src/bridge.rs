@@ -131,6 +131,14 @@ mod ffi {
         error_message: String,
     }
 
+    struct TableCompatibilityIssueRow {
+        code: String,
+        title: String,
+        detail: String,
+        count: u64,
+        preserved: bool,
+    }
+
     struct TableActionResult {
         accepted: bool,
         record_count: u64,
@@ -139,6 +147,7 @@ mod ffi {
         contains_lua: bool,
         error_code: String,
         error_message: String,
+        compatibility_issues: Vec<TableCompatibilityIssueRow>,
     }
 
     struct TableScriptRow {
@@ -282,6 +291,10 @@ mod ffi {
             path: &str,
             password: &str,
         ) -> TableActionResult;
+        fn table_compatibility_issues(
+            self: &EngineFacade,
+            json_destination: bool,
+        ) -> Vec<TableCompatibilityIssueRow>;
         fn save_table(self: &EngineFacade, path: &str, json: bool) -> TableActionResult;
         fn table_scripts(self: &EngineFacade, start: u64, limit: u32) -> TableScriptPage;
         fn table_script_text(
@@ -683,6 +696,16 @@ pub struct TableAction {
     pub contains_scripts: bool,
     pub contains_auto_assembler: bool,
     pub contains_lua: bool,
+    pub compatibility_issues: Vec<TableCompatibilityIssue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableCompatibilityIssue {
+    pub code: String,
+    pub title: String,
+    pub detail: String,
+    pub count: u64,
+    pub preserved: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1055,6 +1078,17 @@ impl Engine {
         table_action(self.inner.save_table(path, json))
     }
 
+    pub fn table_compatibility_issues(
+        &self,
+        json_destination: bool,
+    ) -> Vec<TableCompatibilityIssue> {
+        self.inner
+            .table_compatibility_issues(json_destination)
+            .into_iter()
+            .map(table_compatibility_issue)
+            .collect()
+    }
+
     pub fn table_scripts(&self, start: u64, limit: u32) -> TableScriptPage {
         let page = self.inner.table_scripts(start, limit);
         TableScriptPage {
@@ -1202,12 +1236,27 @@ fn table_action(result: ffi::TableActionResult) -> Result<TableAction, AddressEr
             contains_scripts: result.contains_scripts,
             contains_auto_assembler: result.contains_auto_assembler,
             contains_lua: result.contains_lua,
+            compatibility_issues: result
+                .compatibility_issues
+                .into_iter()
+                .map(table_compatibility_issue)
+                .collect(),
         })
     } else {
         Err(AddressError {
             code: result.error_code,
             message: result.error_message,
         })
+    }
+}
+
+fn table_compatibility_issue(issue: ffi::TableCompatibilityIssueRow) -> TableCompatibilityIssue {
+    TableCompatibilityIssue {
+        code: issue.code,
+        title: issue.title,
+        detail: issue.detail,
+        count: issue.count,
+        preserved: issue.preserved,
     }
 }
 
@@ -2002,6 +2051,105 @@ mod tests {
         assert_eq!(rows[0].description, "Secret Gold");
 
         std::fs::remove_file(path).expect("remove protected table fixture");
+    }
+
+    #[test]
+    fn table_compatibility_report_distinguishes_preserved_and_lossy_data() {
+        let source = temporary_table_path("compatibility.CT");
+        let saved_ct = temporary_table_path("compatibility-roundtrip.CT");
+        let saved_json = temporary_table_path("compatibility.json");
+        std::fs::write(
+            &source,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<CheatTable>
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID><Description>"Advanced group"</Description><GroupHeader>1</GroupHeader>
+      <Options moActivateChildrenAsWell="1" moDeactivateChildrenAsWell="1" moRecursiveSetValue="1"/>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>2</ID><Description>"Styled value"</Description><VariableType>4 Bytes</VariableType>
+      <Address>1234</Address><Color>FF00FF</Color><DropDownList>0:Off
+1:On</DropDownList><Hotkeys>Ctrl+H</Hotkeys>
+    </CheatEntry>
+  </CheatEntries>
+  <Forms><Form><Name>TrainerForm</Name><Data>AABBCC</Data></Form></Forms>
+</CheatTable>"#,
+        )
+        .expect("write compatibility fixture");
+
+        let mut engine = Engine::new();
+        let loaded = engine
+            .load_table(source.to_str().expect("UTF-8 temp path"))
+            .expect("load compatibility fixture");
+        let issue = |code: &str| {
+            loaded
+                .compatibility_issues
+                .iter()
+                .find(|issue| issue.code == code)
+                .unwrap_or_else(|| panic!("missing compatibility issue {code}"))
+        };
+        assert!(issue("embedded_forms").preserved);
+        assert!(issue("advanced_group_options").preserved);
+        assert!(issue("record_colors").preserved);
+        assert!(issue("dropdown_lists").preserved);
+        assert_eq!(issue("hotkeys").count, 1);
+        assert!(
+            loaded
+                .compatibility_issues
+                .iter()
+                .all(|issue| issue.preserved)
+        );
+
+        let ct_preflight = engine.table_compatibility_issues(false);
+        assert!(
+            ct_preflight
+                .iter()
+                .find(|issue| issue.code == "embedded_forms")
+                .expect("CT forms report")
+                .preserved
+        );
+        let json_preflight = engine.table_compatibility_issues(true);
+        let json_loss = json_preflight
+            .iter()
+            .find(|issue| issue.code == "embedded_forms_json_loss")
+            .expect("JSON forms loss report");
+        assert!(!json_loss.preserved);
+        assert_eq!(json_loss.count, 1);
+
+        let ct_action = engine
+            .save_table(saved_ct.to_str().expect("UTF-8 temp path"), false)
+            .expect("save lossless CT");
+        assert!(
+            ct_action
+                .compatibility_issues
+                .iter()
+                .all(|issue| issue.preserved)
+        );
+        assert!(
+            std::fs::read_to_string(&saved_ct)
+                .expect("read saved CT")
+                .contains("<Forms><Form><Name>TrainerForm</Name>")
+        );
+
+        let json_action = engine
+            .save_table(saved_json.to_str().expect("UTF-8 temp path"), true)
+            .expect("save JSON with acknowledged loss");
+        assert!(
+            json_action
+                .compatibility_issues
+                .iter()
+                .any(|issue| issue.code == "embedded_forms_json_loss" && !issue.preserved)
+        );
+        assert!(
+            !std::fs::read_to_string(&saved_json)
+                .expect("read saved JSON")
+                .contains("TrainerForm")
+        );
+
+        std::fs::remove_file(source).expect("remove compatibility fixture");
+        std::fs::remove_file(saved_ct).expect("remove CT round trip");
+        std::fs::remove_file(saved_json).expect("remove JSON round trip");
     }
 
     #[test]

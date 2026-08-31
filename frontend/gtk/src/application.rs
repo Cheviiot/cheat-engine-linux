@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -16,7 +16,8 @@ use crate::address_list_model::{
 };
 use crate::bridge::{
     AddressRecord, AttachError, Engine, FreezeMode, LuaExecution, Process, ProtectionMatch,
-    ScanComparison, ScanRequest, ScanValueType, Session, TableAction, TableScript, TableScriptKind,
+    ScanComparison, ScanRequest, ScanValueType, Session, TableAction, TableCompatibilityIssue,
+    TableScript, TableScriptKind,
 };
 use crate::process_dialog;
 use crate::scan_result_model::{
@@ -48,6 +49,7 @@ struct SessionState {
     table_lua_trusted: Rc<Cell<bool>>,
     table_contains_auto_assembler: Rc<Cell<bool>>,
     table_contains_lua: Rc<Cell<bool>>,
+    table_compatibility_issues: Rc<RefCell<Vec<TableCompatibilityIssue>>>,
     lua_runtime_generation: Rc<Cell<u64>>,
     lua_console_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     lua_console_output: Rc<RefCell<Option<gtk::TextView>>>,
@@ -95,6 +97,7 @@ struct SessionWidgets {
     address_summary: gtk::Label,
     group_selected_button: gtk::Button,
     script_trust_button: gtk::Button,
+    compatibility_report_button: gtk::Button,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +150,7 @@ fn build_window(application: &adw::Application) {
         table_lua_trusted: Rc::new(Cell::new(false)),
         table_contains_auto_assembler: Rc::new(Cell::new(false)),
         table_contains_lua: Rc::new(Cell::new(false)),
+        table_compatibility_issues: Rc::new(RefCell::new(Vec::new())),
         lua_runtime_generation: Rc::new(Cell::new(lua_runtime_generation)),
         lua_console_dialog: Rc::new(RefCell::new(None)),
         lua_console_output: Rc::new(RefCell::new(None)),
@@ -442,12 +446,19 @@ fn build_window(application: &adw::Application) {
         .icon_name("security-high-symbolic")
         .visible(false)
         .build();
+    let compatibility_report_button = gtk::Button::builder()
+        .label("Table report")
+        .icon_name("dialog-information-symbolic")
+        .tooltip_text("Review preserved-but-unavailable features and known format losses")
+        .visible(false)
+        .build();
     let address_structure_actions = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(12)
         .build();
     address_structure_actions.append(&add_group_button);
     address_structure_actions.append(&group_selected_button);
+    address_structure_actions.append(&compatibility_report_button);
     address_structure_actions.append(&script_trust_button);
     let address_summary = gtk::Label::builder()
         .label("Add scan results here to edit or freeze their live values.")
@@ -559,6 +570,7 @@ fn build_window(application: &adw::Application) {
         address_summary,
         group_selected_button,
         script_trust_button,
+        compatibility_report_button,
     };
 
     configure_scan_result_factory(&scan_result_factory, &state, &widgets);
@@ -698,9 +710,16 @@ fn build_window(application: &adw::Application) {
                 contains_scripts: true,
                 contains_auto_assembler: state.table_contains_auto_assembler.get(),
                 contains_lua: state.table_contains_lua.get(),
+                compatibility_issues: Vec::new(),
             };
             present_script_trust_dialog(&window, &state, &widgets, &action);
         }
+    });
+
+    widgets.compatibility_report_button.connect_clicked({
+        let window = window.clone();
+        let state = state.clone();
+        move |_| present_table_compatibility_report(&window, &state)
     });
 
     lua_console_button.connect_clicked({
@@ -1679,7 +1698,9 @@ fn complete_table_load(
         .table_contains_auto_assembler
         .set(action.contains_auto_assembler);
     state.table_contains_lua.set(action.contains_lua);
+    *state.table_compatibility_issues.borrow_mut() = action.compatibility_issues.clone();
     update_script_trust_button(state, widgets);
+    update_table_compatibility_button(state, widgets);
     state.selected_address_ids.borrow_mut().clear();
     reload_address_list(state, widgets, state.attached.get());
     let script_notice = if action.contains_scripts {
@@ -1687,15 +1708,117 @@ fn complete_table_load(
     } else {
         ""
     };
+    let compatibility_notice = if action.compatibility_issues.is_empty() {
+        ""
+    } else {
+        " Review the table compatibility report for features not yet exposed by GTK."
+    };
     widgets.address_summary.set_label(&format!(
-        "Opened {} record{}.{}",
+        "Opened {} record{}.{}{}",
         action.record_count,
         if action.record_count == 1 { "" } else { "s" },
-        script_notice
+        script_notice,
+        compatibility_notice
     ));
     if action.contains_scripts {
         present_script_trust_dialog(window, state, widgets, &action);
     }
+}
+
+fn update_table_compatibility_button(state: &SessionState, widgets: &SessionWidgets) {
+    let issues = state.table_compatibility_issues.borrow();
+    widgets
+        .compatibility_report_button
+        .set_visible(!issues.is_empty());
+    if issues.is_empty() {
+        return;
+    }
+    let losses = issues.iter().filter(|issue| !issue.preserved).count();
+    if losses == 0 {
+        widgets
+            .compatibility_report_button
+            .set_label(&format!("Compatibility ({})", issues.len()));
+        widgets
+            .compatibility_report_button
+            .set_icon_name("dialog-information-symbolic");
+        widgets.compatibility_report_button.set_tooltip_text(Some(
+            "Review features preserved in the table but not yet exposed by GTK",
+        ));
+    } else {
+        widgets
+            .compatibility_report_button
+            .set_label(&format!("Loss report ({losses})"));
+        widgets
+            .compatibility_report_button
+            .set_icon_name("dialog-warning-symbolic");
+        widgets
+            .compatibility_report_button
+            .set_tooltip_text(Some("Review known data loss for the selected table format"));
+    }
+}
+
+fn present_table_compatibility_report(window: &adw::ApplicationWindow, state: &SessionState) {
+    let issues = state.table_compatibility_issues.borrow().clone();
+    if issues.is_empty() {
+        return;
+    }
+    let has_loss = issues.iter().any(|issue| !issue.preserved);
+    let scrolled = build_compatibility_issue_list(&issues);
+    let dialog = adw::AlertDialog::builder()
+        .heading(if has_loss {
+            "Known table-format data loss"
+        } else {
+            "Table compatibility report"
+        })
+        .body(if has_loss {
+            "Items marked with a warning are not represented by the selected format. Other listed data is retained, but its GTK feature is not available yet."
+        } else {
+            "No known modeled data was dropped. These features remain available for a table round trip, but their GTK tools are not available yet."
+        })
+        .extra_child(&scrolled)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.present(Some(window));
+}
+
+fn build_compatibility_issue_list(issues: &[TableCompatibilityIssue]) -> gtk::ScrolledWindow {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for issue in issues {
+        let title = if issue.count == 1 {
+            issue.title.clone()
+        } else {
+            format!("{} ({})", issue.title, issue.count)
+        };
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(&issue.detail)
+            .subtitle_lines(3)
+            .build();
+        row.add_prefix(
+            &gtk::Image::builder()
+                .icon_name(if issue.preserved {
+                    "emblem-ok-symbolic"
+                } else {
+                    "dialog-warning-symbolic"
+                })
+                .tooltip_text(if issue.preserved {
+                    "Preserved on round trip"
+                } else {
+                    "Known format loss"
+                })
+                .build(),
+        );
+        list.append(&row);
+    }
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build()
 }
 
 fn present_protected_table_password_dialog(
@@ -2562,7 +2685,9 @@ fn present_save_table_dialog(
         .modal(true)
         .initial_name("table.CT")
         .build();
-    dialog.save(Some(window), gtk::gio::Cancellable::NONE, {
+    let window = window.clone();
+    dialog.save(Some(&window), gtk::gio::Cancellable::NONE, {
+        let window = window.clone();
         let state = state.clone();
         let widgets = widgets.clone();
         move |result| {
@@ -2582,26 +2707,97 @@ fn present_save_table_dialog(
                 return;
             };
             let json = path_text.to_ascii_lowercase().ends_with(".json");
-            let result = state
+            let issues = state
                 .engine
                 .borrow()
                 .as_ref()
                 .expect("engine remains present while saving a table")
-                .save_table(path_text, json);
-            match result {
-                Ok(action) => widgets.address_summary.set_label(&format!(
-                    "Saved {} record{} to {}.",
-                    action.record_count,
-                    if action.record_count == 1 { "" } else { "s" },
-                    path.display()
-                )),
-                Err(error) => widgets.address_summary.set_label(&format!(
-                    "Could not save the cheat table: {} ({})",
-                    error.message, error.code
-                )),
+                .table_compatibility_issues(json);
+            if issues.iter().any(|issue| !issue.preserved) {
+                present_lossy_table_save_confirmation(
+                    &window, &state, &widgets, path, json, issues,
+                );
+            } else {
+                perform_table_save(&state, &widgets, &path, json);
             }
         }
     });
+}
+
+fn present_lossy_table_save_confirmation(
+    window: &adw::ApplicationWindow,
+    state: &SessionState,
+    widgets: &SessionWidgets,
+    path: PathBuf,
+    json: bool,
+    issues: Vec<TableCompatibilityIssue>,
+) {
+    let losses = issues
+        .iter()
+        .filter(|issue| !issue.preserved)
+        .cloned()
+        .collect::<Vec<_>>();
+    let scrolled = build_compatibility_issue_list(&losses);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Save with known data loss?")
+        .body(format!(
+            "The selected format cannot represent every modeled feature in this table. Continuing writes {}, while the current in-memory table remains unchanged.",
+            path.display()
+        ))
+        .extra_child(&scrolled)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save anyway");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(Some("save"), {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        move |_, _| perform_table_save(&state, &widgets, &path, json)
+    });
+    dialog.present(Some(window));
+}
+
+fn perform_table_save(state: &SessionState, widgets: &SessionWidgets, path: &Path, json: bool) {
+    let Some(path_text) = path.to_str() else {
+        widgets
+            .address_summary
+            .set_label("This destination path is not valid UTF-8.");
+        return;
+    };
+    let result = state
+        .engine
+        .borrow()
+        .as_ref()
+        .expect("engine remains present while saving a table")
+        .save_table(path_text, json);
+    match result {
+        Ok(action) => {
+            let known_losses = action
+                .compatibility_issues
+                .iter()
+                .filter(|issue| !issue.preserved)
+                .count();
+            *state.table_compatibility_issues.borrow_mut() = action.compatibility_issues;
+            update_table_compatibility_button(state, widgets);
+            widgets.address_summary.set_label(&format!(
+                "Saved {} record{} to {}.{}",
+                action.record_count,
+                if action.record_count == 1 { "" } else { "s" },
+                path.display(),
+                if known_losses == 0 {
+                    ""
+                } else {
+                    " The output has known format loss; review the loss report."
+                }
+            ));
+        }
+        Err(error) => widgets.address_summary.set_label(&format!(
+            "Could not save the cheat table: {} ({})",
+            error.message, error.code
+        )),
+    }
 }
 
 fn append_lua_console_output(state: &SessionState, message: &str) {

@@ -103,6 +103,17 @@ struct AddressOperationResult {
     std::string errorMessage;
 };
 
+struct TableCompatibilityIssue {
+    std::string code;
+    std::string title;
+    std::string detail;
+    std::size_t count = 0;
+    /// True means the modeled data survives a round trip even though the GTK
+    /// frontend may not expose or activate it yet. False identifies a known
+    /// format conversion loss.
+    bool preserved = true;
+};
+
 struct TableOperationResult {
     bool success = false;
     std::size_t recordCount = 0;
@@ -111,6 +122,7 @@ struct TableOperationResult {
     bool containsLua = false;
     std::string errorCode;
     std::string errorMessage;
+    std::vector<TableCompatibilityIssue> compatibilityIssues;
 };
 
 enum class TableScriptKind : std::uint8_t {
@@ -185,6 +197,8 @@ public:
     /// to the currently loaded table.
     TableOperationResult loadTableData(CheatTable table);
     TableOperationResult saveTable(const std::string& path, bool json) const;
+    std::vector<TableCompatibilityIssue> tableCompatibilityIssues(
+        bool jsonDestination = false) const;
     std::size_t scriptPayloadCount() const noexcept;
     std::vector<TableScriptSummary> scriptPayloads(std::size_t start,
                                                    std::size_t limit) const;

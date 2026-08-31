@@ -101,11 +101,18 @@ Completed in the foundation and first vertical slices:
   CETRAINER input now opens through a masked GTK password prompt, decrypts and
   parses before replacing the current table, and leaves the old session untouched
   after cancellation, a wrong password, or a corrupt payload;
+- a bounded structured table compatibility report aggregates embedded forms,
+  structures, disassembler annotations, hotkeys, dropdowns, colors, advanced
+  group options, and read-only value types; every item distinguishes preserved
+  round-trip data from known format loss, the report remains reachable from the
+  address-list actions, and a lossy JSON export of embedded forms requires a
+  separate destructive confirmation before writing;
 - bridge tests that exercise real self-process writes, normal and directional
   freeze, stale scan generations, detach safety, and float/UTF-8/UTF-16/AOB
   codecs, plus group/subtree semantics, `.CT` hierarchy round trips, atomic
   failure behavior, transactional protected-table password failure/success,
-  script non-execution before trust, complete script enumeration/paging, hard payload limits with lossless
+  preserved-versus-lossy compatibility reports and JSON preflight, script
+  non-execution before trust, complete script enumeration/paging, hard payload limits with lossless
   multi-page reconstruction, review without execution/trust, separately gated
   Lua execution, output/instruction limits, Lua-state reset, real trusted AA
   enable/disable, trust revocation, reattach/detach cleanup, and deletion cleanup;
@@ -129,9 +136,8 @@ a bounded read-only review UI plus separately explicit-trust Auto Assembler and
 Lua paths, an interactive bounded console, and toolkit-neutral periodic address/
 Lua timer scheduling. Imported Lua is intentionally per-payload rather than
 automatic, and VM instruction ceilings do not interrupt a blocking native
-binding. Broader Lua GUI/form parity remains advanced work. The GTK frontend
-does not yet expose a table-format loss report. No product identifier should be
-published before the branding decision.
+binding. Broader Lua GUI/form parity remains advanced work. No product identifier
+should be published before the branding decision.
 
 ## Goal
 
@@ -466,6 +472,6 @@ recorded in a short decision note before public release.
 11. ~~Grouping/reordering, lossless modeled-field `.CT`/JSON persistence, GTK
     trust/review, trusted Auto Assembler activation/cleanup, and separately
     consented per-payload Lua execution with bounded input/VM/output, periodic
-    scheduling, Lua console/timer parity, and transactional protected-table
-    password loading.~~ Next continue Lua GUI/form parity, add the GTK loss
-    report, and complete branding review.
+    scheduling, Lua console/timer parity, transactional protected-table password
+    loading, and a structured compatibility/loss report with lossy-save
+    confirmation.~~ Next continue Lua GUI/form parity and complete branding review.

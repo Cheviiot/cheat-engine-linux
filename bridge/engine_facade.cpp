@@ -49,6 +49,8 @@ constexpr std::size_t kMaxAddressDescriptionSize = 1024;
 constexpr std::size_t kMaxAddressGroupSelection = 4096;
 constexpr std::size_t kMaxTablePathSize = 4096;
 constexpr std::size_t kMaxTablePasswordSize = 4096;
+constexpr std::size_t kMaxTableCompatibilityIssues = 16;
+constexpr std::size_t kMaxTableCompatibilityTextSize = 2048;
 constexpr std::uint32_t kMaxTableScriptPageSize = 256;
 constexpr std::uint32_t kMaxTableScriptTextSize = 64u << 10;
 constexpr std::size_t kMaxTableScriptDescriptionSize = 1024;
@@ -750,6 +752,27 @@ std::string format_scan_value(const ce::ScanConfig& config, bool display_hex,
             return output;
         }
     }
+}
+
+rust::Vec<TableCompatibilityIssueRow> table_compatibility_rows(
+    const std::vector<ce::TableCompatibilityIssue>& issues) {
+    rust::Vec<TableCompatibilityIssueRow> rows;
+    const auto limit = std::min(issues.size(), kMaxTableCompatibilityIssues);
+    rows.reserve(limit);
+    for (std::size_t index = 0; index < limit; ++index) {
+        const auto& issue = issues[index];
+        rows.push_back(TableCompatibilityIssueRow{
+            .code = bounded_utf8(sanitize_utf8(issue.code),
+                                 kMaxTableCompatibilityTextSize),
+            .title = bounded_utf8(sanitize_utf8(issue.title),
+                                  kMaxTableCompatibilityTextSize),
+            .detail = bounded_utf8(sanitize_utf8(issue.detail),
+                                   kMaxTableCompatibilityTextSize),
+            .count = static_cast<std::uint64_t>(issue.count),
+            .preserved = issue.preserved,
+        });
+    }
+    return rows;
 }
 
 } // namespace
@@ -1774,6 +1797,7 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
             .contains_lua = false,
             .error_code = "invalid_path",
             .error_message = "The cheat-table path is invalid or too long.",
+            .compatibility_issues = {},
         };
     }
     if (ce::detectTableFormat(file) == ce::TableFormat::Protected) {
@@ -1785,6 +1809,7 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
             .contains_lua = false,
             .error_code = "protected_table",
             .error_message = "This CETRAINER file requires its password.",
+            .compatibility_issues = {},
         };
     }
     std::string scriptErrorCode;
@@ -1798,6 +1823,7 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
             .contains_lua = false,
             .error_code = scriptErrorCode,
             .error_message = scriptErrorMessage,
+            .compatibility_issues = {},
         };
     }
     const auto result = address_list_->loadTable(file);
@@ -1816,6 +1842,8 @@ TableActionResult EngineFacade::load_table(rust::Str path) {
         .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
+        .compatibility_issues = table_compatibility_rows(
+            result.compatibilityIssues),
     };
 }
 
@@ -1833,6 +1861,7 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
             .contains_lua = false,
             .error_code = "invalid_path",
             .error_message = "The cheat-table path is invalid or too long.",
+            .compatibility_issues = {},
         };
     }
     if (password.size() > kMaxTablePasswordSize ||
@@ -1846,6 +1875,7 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
             .contains_lua = false,
             .error_code = "invalid_password",
             .error_message = "The table password is invalid or too long.",
+            .compatibility_issues = {},
         };
     }
     if (ce::detectTableFormat(file) != ce::TableFormat::Protected) {
@@ -1858,6 +1888,7 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
             .contains_lua = false,
             .error_code = "protected_table_invalid",
             .error_message = "The selected file is not a supported protected CETRAINER table.",
+            .compatibility_issues = {},
         };
     }
 
@@ -1878,6 +1909,7 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
             .contains_lua = false,
             .error_code = "protected_table_decrypt_failed",
             .error_message = "The table could not be decrypted. Check the password or file integrity.",
+            .compatibility_issues = {},
         };
     }
 
@@ -1894,6 +1926,7 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
             .contains_lua = false,
             .error_code = scriptErrorCode,
             .error_message = scriptErrorMessage,
+            .compatibility_issues = {},
         };
     }
 
@@ -1913,7 +1946,15 @@ TableActionResult EngineFacade::load_protected_table(rust::Str path,
         .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
+        .compatibility_issues = table_compatibility_rows(
+            result.compatibilityIssues),
     };
+}
+
+rust::Vec<TableCompatibilityIssueRow> EngineFacade::table_compatibility_issues(
+    bool jsonDestination) const {
+    return table_compatibility_rows(
+        address_list_->tableCompatibilityIssues(jsonDestination));
 }
 
 TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
@@ -1927,6 +1968,7 @@ TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
             .contains_lua = false,
             .error_code = "invalid_path",
             .error_message = "The cheat-table path is invalid or too long.",
+            .compatibility_issues = {},
         };
     }
     const auto result = address_list_->saveTable(file, json);
@@ -1938,6 +1980,8 @@ TableActionResult EngineFacade::save_table(rust::Str path, bool json) const {
         .contains_lua = result.containsLua,
         .error_code = result.errorCode,
         .error_message = result.errorMessage,
+        .compatibility_issues = table_compatibility_rows(
+            result.compatibilityIssues),
     };
 }
 

@@ -30,6 +30,7 @@ struct ScanPage;
 struct AddressRow;
 struct AddressPage;
 struct AddressActionResult;
+struct TableCompatibilityIssueRow;
 struct TableActionResult;
 struct TableScriptRow;
 struct TableScriptPage;
@@ -81,6 +82,8 @@ public:
     AddressActionResult set_address_collapsed(std::int32_t id, bool collapsed);
     TableActionResult load_table(rust::Str path);
     TableActionResult load_protected_table(rust::Str path, rust::Str password);
+    rust::Vec<TableCompatibilityIssueRow> table_compatibility_issues(
+        bool json_destination) const;
     TableActionResult save_table(rust::Str path, bool json) const;
     TableScriptPage table_scripts(std::uint64_t start,
                                   std::uint32_t limit) const;

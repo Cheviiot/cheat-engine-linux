@@ -867,28 +867,34 @@ AddressOperationResult AddressListController::commitExecutedScriptState(
 TableOperationResult AddressListController::loadTable(const std::string& path) {
     if (path.empty())
         return {.success = false, .errorCode = "path_empty",
-                .errorMessage = "Choose a cheat-table file."};
+                .errorMessage = "Choose a cheat-table file.",
+                .compatibilityIssues = {}};
     const auto format = detectTableFormat(path);
     if (format == TableFormat::Protected)
         return {.success = false, .errorCode = "protected_table",
-                .errorMessage = "This CETRAINER file requires its password."};
+                .errorMessage = "This CETRAINER file requires its password.",
+                .compatibilityIssues = {}};
     std::ifstream input(path, std::ios::binary);
     if (!input)
         return {.success = false, .errorCode = "table_unreadable",
-                .errorMessage = "The cheat-table file could not be opened."};
+                .errorMessage = "The cheat-table file could not be opened.",
+                .compatibilityIssues = {}};
     input.close();
 
     CheatTable parsed;
     try {
         if (!parsed.loadAuto(path))
             return {.success = false, .errorCode = "invalid_table",
-                    .errorMessage = "The file is not a supported or valid cheat table."};
+                    .errorMessage = "The file is not a supported or valid cheat table.",
+                    .compatibilityIssues = {}};
     } catch (const std::exception& error) {
         return {.success = false, .errorCode = "invalid_table",
-                .errorMessage = std::string("The cheat table could not be parsed: ") + error.what()};
+                .errorMessage = std::string("The cheat table could not be parsed: ") + error.what(),
+                .compatibilityIssues = {}};
     } catch (...) {
         return {.success = false, .errorCode = "invalid_table",
-                .errorMessage = "The cheat table could not be parsed."};
+                .errorMessage = "The cheat table could not be parsed.",
+                .compatibilityIssues = {}};
     }
 
     return loadTableData(std::move(parsed));
@@ -919,7 +925,8 @@ TableOperationResult AddressListController::loadTableData(CheatTable parsed) {
                 ++nextId;
             if (nextId >= std::numeric_limits<int>::max())
                 return {.success = false, .errorCode = "record_id_exhausted",
-                        .errorMessage = "The cheat table contains too many record ids."};
+                        .errorMessage = "The cheat table contains too many record ids.",
+                        .compatibilityIssues = {}};
             record.id = nextId++;
             runtimeIds.insert(record.id);
         }
@@ -977,14 +984,84 @@ TableOperationResult AddressListController::loadTableData(CheatTable parsed) {
             .containsScripts = containsScripts,
             .containsAutoAssembler = containsAutoAssembler,
             .containsLua = containsLua,
-            .errorCode = {}, .errorMessage = {}};
+            .errorCode = {}, .errorMessage = {},
+            .compatibilityIssues = tableCompatibilityIssues(false)};
+}
+
+std::vector<TableCompatibilityIssue> AddressListController::tableCompatibilityIssues(
+    bool jsonDestination) const {
+    std::vector<TableCompatibilityIssue> issues;
+    issues.reserve(8);
+    const auto append = [&issues](std::string code, std::string title,
+                                  std::string detail, std::size_t count,
+                                  bool preserved = true) {
+        if (count == 0) return;
+        issues.push_back(TableCompatibilityIssue{
+            .code = std::move(code),
+            .title = std::move(title),
+            .detail = std::move(detail),
+            .count = count,
+            .preserved = preserved,
+        });
+    };
+
+    if (!tableMetadata_.rawFormsXml.empty()) {
+        append(jsonDestination ? "embedded_forms_json_loss" : "embedded_forms",
+               "Embedded trainer forms",
+               jsonDestination
+                   ? "Native JSON does not represent the embedded <Forms> block; it will be omitted. Save as .CT to keep it."
+                   : "The form definition is preserved when saving .CT, but GTK cannot render or edit it yet.",
+               1, !jsonDestination);
+    }
+    append("structures", "Structure definitions",
+           "Definitions are preserved on save, but GTK does not expose the structure dissector yet.",
+           tableMetadata_.structures.size());
+    append("disassembler_annotations", "Disassembler comments and labels",
+           "Annotations are preserved on save, but GTK does not display them until the memory browser moves.",
+           tableMetadata_.disassemblerComments.size());
+
+    std::size_t hotkeys = 0;
+    std::size_t dropdowns = 0;
+    std::size_t colors = 0;
+    std::size_t advancedGroupOptions = 0;
+    std::size_t readOnlyTypes = 0;
+    for (const auto& record : records_) {
+        hotkeys += !record.hotkeyKeys.empty();
+        hotkeys += !record.increaseHotkeyKeys.empty();
+        hotkeys += !record.decreaseHotkeyKeys.empty();
+        hotkeys += !record.setValueHotkeyKeys.empty();
+        dropdowns += !record.dropdownList.empty();
+        colors += !record.color.empty();
+        advancedGroupOptions += !record.optionsXml.empty();
+        readOnlyTypes += record.type == ValueType::Binary ||
+                         record.type == ValueType::All ||
+                         record.type == ValueType::Grouped ||
+                         record.type == ValueType::Custom;
+    }
+    append("hotkeys", "Record hotkeys",
+           "Bindings are preserved on save, but GTK does not register table hotkeys yet.",
+           hotkeys);
+    append("dropdown_lists", "Value dropdown lists",
+           "Choices are preserved on save, but GTK currently shows the ordinary value editor.",
+           dropdowns);
+    append("record_colors", "Record colors",
+           "Colors are preserved on save, but the virtual GTK list does not display them yet.",
+           colors);
+    append("advanced_group_options", "Advanced group options",
+           "Raw options are preserved; GTK currently applies only activate/deactivate-child behavior.",
+           advancedGroupOptions);
+    append("read_only_value_types", "Read-only record value types",
+           "These records are preserved and readable as bytes, but GTK cannot write their value type yet.",
+           readOnlyTypes);
+    return issues;
 }
 
 TableOperationResult AddressListController::saveTable(const std::string& path,
                                                        bool json) const {
     if (path.empty())
         return {.success = false, .errorCode = "path_empty",
-                .errorMessage = "Choose a destination for the cheat table."};
+                .errorMessage = "Choose a destination for the cheat table.",
+                .compatibilityIssues = {}};
     CheatTable table = tableMetadata_;
     table.entries.clear();
     table.entries.reserve(records_.size());
@@ -1050,14 +1127,16 @@ TableOperationResult AddressListController::saveTable(const std::string& path,
                 .containsAutoAssembler = tableContainsAutoAssembler(table),
                 .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
-                .errorMessage = std::string("The cheat table could not be saved: ") + error.what()};
+                .errorMessage = std::string("The cheat table could not be saved: ") + error.what(),
+                .compatibilityIssues = {}};
     } catch (...) {
         return {.success = false, .recordCount = records_.size(),
                 .containsScripts = tableContainsScripts(table),
                 .containsAutoAssembler = tableContainsAutoAssembler(table),
                 .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
-                .errorMessage = "The cheat table could not be saved."};
+                .errorMessage = "The cheat table could not be saved.",
+                .compatibilityIssues = {}};
     }
     if (!saved)
         return {.success = false, .recordCount = records_.size(),
@@ -1065,12 +1144,14 @@ TableOperationResult AddressListController::saveTable(const std::string& path,
                 .containsAutoAssembler = tableContainsAutoAssembler(table),
                 .containsLua = tableContainsLua(table),
                 .errorCode = "table_write_failed",
-                .errorMessage = "The cheat-table file could not be written."};
+                .errorMessage = "The cheat-table file could not be written.",
+                .compatibilityIssues = {}};
     return {.success = true, .recordCount = records_.size(),
             .containsScripts = tableContainsScripts(table),
             .containsAutoAssembler = tableContainsAutoAssembler(table),
             .containsLua = tableContainsLua(table),
-            .errorCode = {}, .errorMessage = {}};
+            .errorCode = {}, .errorMessage = {},
+            .compatibilityIssues = tableCompatibilityIssues(json)};
 }
 
 std::size_t AddressListController::scriptPayloadCount() const noexcept {
